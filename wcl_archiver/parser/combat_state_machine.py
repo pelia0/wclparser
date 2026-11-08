@@ -20,7 +20,7 @@ class CombatStateMachine:
         for a in actors:
             aid = int(a["id"])
             actor_map[aid] = a
-            if a.get("petOwner") is not None:
+            if int(a.get("petOwner") or 0) > 0:
                 pet_owner_map[aid] = int(a["petOwner"])
 
         ability_map: Dict[int, Dict[str, Any]] = {
@@ -93,8 +93,8 @@ class CombatStateMachine:
                         "ability_id": ability_id,
                         "target_id": tgt_id,
                         "active_buffs": sorted(active_buffs[owner_id].keys()),
-                        "resource_type": int(res0.get("type", 0)),
-                        "resource_amount": int(res0.get("amount", 0)),
+                        "resource_type": int(res0.get("type", 0) or 0),
+                        "resource_amount": int(res0.get("amount", 0) or 0),
                     }
                 )
 
@@ -171,7 +171,7 @@ class CombatStateMachine:
                     }
                 )
 
-            if "x" in ev and "y" in ev and src_id:
+            if ev.get("x") is not None and ev.get("y") is not None and src_id:
                 x_val = int(ev["x"])
                 y_val = int(ev["y"])
                 hp = int(ev.get("hitPoints", 100) or 100)

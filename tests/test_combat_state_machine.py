@@ -112,3 +112,59 @@ def test_combat_state_machine_dynamic_summon_healing_and_remaining_buffs():
     uptimes = summary["buff_uptimes"]["3"]
     pws = next(a for a in uptimes if a["ability_id"] == 17)
     assert pws["uptime_pct"] == 90.0
+
+
+def test_combat_state_machine_handles_null_coordinates_resources_and_zero_pet_owner():
+    fight_meta = {
+        "report_code": "nullTest123",
+        "fight_id": 1,
+        "start_time": 1000,
+        "end_time": 5000,
+        "encounter_id": 100,
+        "name": "Test Nulls",
+    }
+    actors = [
+        {"id": 10, "name": "PlayerOne", "type": "Player", "subType": "Warrior", "petOwner": 0},
+    ]
+    abilities = [
+        {"gameID": 1001, "name": "Mortal Strike", "type": 1},
+    ]
+    raw_events = [
+        {
+            "timestamp": 2000,
+            "type": "cast",
+            "sourceID": 10,
+            "targetID": 999,
+            "abilityGameID": 1001,
+            "x": None,
+            "y": None,
+            "classResources": [{"type": None, "amount": None}],
+        },
+        {
+            "timestamp": 2500,
+            "type": "damage",
+            "sourceID": 10,
+            "targetID": 999,
+            "abilityGameID": 1001,
+            "amount": 100000,
+            "x": None,
+            "y": None,
+        },
+    ]
+
+    summary, norm_events, replay = CombatStateMachine.analyze_fight(
+        fight_meta, actors, abilities, raw_events
+    )
+
+    # Actor with petOwner=0 should remain owner 10, not 0
+    assert summary["damage_done"][0]["actor_id"] == 10
+    casts = summary["cast_timeline"]["10"]
+    assert len(casts) == 1
+    assert casts[0]["resource_type"] == 0
+    assert casts[0]["resource_amount"] == 0
+
+    # Null coordinates should not populate replay frames and normalized x, y should default to 0
+    assert len(replay["frames"]) == 0
+    assert norm_events[0]["x"] == 0
+    assert norm_events[0]["y"] == 0
+
