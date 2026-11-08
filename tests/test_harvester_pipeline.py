@@ -232,3 +232,79 @@ async def test_protocol_client_rankings_and_unarchive_fail(tmp_path: Path):
         zone_id=9, encounter_id=11492, partition=5, class_name="null_encounter", spec_name="Any", page=1
     )
     assert rankings_null == []
+
+
+@pytest.mark.asyncio
+async def test_protocol_client_graphql_fallback_when_web_endpoints_blocked(tmp_path: Path):
+    def mock_wcl(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/oauth/token":
+            return httpx.Response(200, json={"access_token": "tok_gql"})
+        if path.startswith("/reports/fights-and-participants") or path.startswith("/reports/events/summary"):
+            return httpx.Response(403, text="Cloudflare block")
+        if path == "/api/v2/client":
+            body = request.read().decode("utf-8")
+            if "masterData" in body:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "reportData": {
+                                "report": {
+                                    "fights": [
+                                        {
+                                            "id": 3,
+                                            "startTime": 1000,
+                                            "endTime": 4000,
+                                            "encounterID": 11492,
+                                            "name": "Maw of Souls",
+                                            "keystoneLevel": 25,
+                                            "keystoneAffixes": [10, 6],
+                                            "difficulty": 10,
+                                            "maps": [{"id": 1492}],
+                                        }
+                                    ],
+                                    "masterData": {
+                                        "abilities": [{"gameID": 100780, "name": "Tiger Palm", "type": 1}],
+                                        "actors": [
+                                            {"id": 1, "name": "Pellia", "type": "Player", "subType": "Monk"},
+                                            {"id": 99, "name": "Ymiron", "type": "NPC", "subType": "Boss"},
+                                        ],
+                                    },
+                                }
+                            }
+                        }
+                    },
+                )
+            if "events(" in body:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "reportData": {
+                                "report": {
+                                    "events": {
+                                        "data": [
+                                            {"timestamp": 1200, "type": "cast", "sourceID": 1, "targetID": 99, "abilityGameID": 100780}
+                                        ],
+                                        "nextPageTimestamp": None,
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(mock_wcl)
+    auth = WCLAuthManager(tmp_path / "auth.json", transport=transport)
+    await auth.login_with_credentials(email="", password="", client_id="cid", client_secret="csec")
+    client = WCLProtocolClient(auth_manager=auth, transport=transport)
+
+    master = await client.fetch_report_master_and_fights("gqlRep123")
+    assert master["fights"][0]["id"] == 3
+    assert master["friendlies"][0]["name"] == "Pellia"
+
+    events = await client.fetch_all_fight_events("gqlRep123", 3, 1000, 4000)
+    assert len(events) == 1
+    assert events[0]["abilityGameID"] == 100780

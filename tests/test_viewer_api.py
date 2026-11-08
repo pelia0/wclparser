@@ -156,3 +156,9 @@ def test_web_ui_root_serves_english_html(tmp_path: Path):
     assert "WCL Legion 7.3.5 Archiver" in resp.text
     assert "Log Explorer" in resp.text
 
+    st = client.get("/api/harvester/status").json()
+    assert st["queued_fights"] == 0
+    assert st["packed_fights"] == 0
+    stop_st = client.post("/api/harvester/stop").json()
+    assert stop_st["running"] is False
+

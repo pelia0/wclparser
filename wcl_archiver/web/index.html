@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>WCL Legion 7.3.5 Archiver &amp; Offline Viewer</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=2" />
 </head>
 <body>
   <header class="topbar">
@@ -75,22 +75,46 @@
 
     <!-- VIEW 3: AUTH & HARVESTER -->
     <section id="view-auth" class="view">
-      <div class="card">
-        <h2>WarcraftLogs Subscriber Account Setup</h2>
+      <div class="card" style="margin-bottom: 16px;">
+        <h2>1. WarcraftLogs Subscriber Account Setup</h2>
+        <p style="color: #94a3b8; font-size: 13px; margin-top: 0;">
+          <strong>Recommended:</strong> Use <strong>API v2 Client ID &amp; Secret</strong> (create free at
+          <a href="https://www.warcraftlogs.com/api/clients" target="_blank" style="color: #60a5fa;">warcraftlogs.com/api/clients</a>)
+          and/or paste your browser <strong>wcl_session</strong> cookie (DevTools &rarr; Application &rarr; Cookies) if Cloudflare blocks direct password login.
+        </p>
         <div class="form-grid">
           <label>WCL Email: <input type="email" id="auth-email" placeholder="you@example.com" /></label>
           <label>WCL Password: <input type="password" id="auth-password" placeholder="••••••••" /></label>
-          <label>API v2 Client ID (Optional): <input type="text" id="auth-client-id" /></label>
-          <label>API v2 Client Secret (Optional): <input type="password" id="auth-client-secret" /></label>
-          <label>Or Direct wcl_session Cookie: <input type="text" id="auth-cookie" /></label>
+          <label>API v2 Client ID (Recommended): <input type="text" id="auth-client-id" placeholder="From warcraftlogs.com/api/clients" /></label>
+          <label>API v2 Client Secret (Recommended): <input type="password" id="auth-client-secret" placeholder="Client Secret" /></label>
+          <label>Or Direct wcl_session Cookie (Bypasses Cloudflare): <input type="text" id="auth-cookie" placeholder="Paste wcl_session cookie value" /></label>
+          <label>Optional XSRF-TOKEN Cookie: <input type="text" id="auth-xsrf" placeholder="Optional XSRF-TOKEN value" /></label>
         </div>
         <button id="btn-save-auth" class="btn-primary">Sign In &amp; Save Session</button>
+        <div id="auth-feedback-banner" style="margin-top: 12px; padding: 10px 12px; border-radius: 6px; display: none;"></div>
         <pre id="auth-status-box"></pre>
+      </div>
+
+      <div class="card">
+        <h2>2. Harvester Control &amp; Bulk Extraction (Zstd Level 22 .wclz)</h2>
+        <div class="filter-bar">
+          <label>Pages per Spec (1 page = Top 100):
+            <input type="number" id="harvest-pages" value="1" min="1" max="20" style="width: 80px;" />
+          </label>
+          <button id="btn-harvest-mplus" class="btn-primary">Start Mythic+ Season 5 (7.3.5) Harvest</button>
+          <button id="btn-harvest-raids" class="btn-primary">Start All 5 Legion Raids Harvest</button>
+          <button id="btn-harvest-stop" class="nav-btn">Stop Harvester</button>
+        </div>
+        <div class="filter-bar" style="margin-top: 12px;">
+          <input type="text" id="import-report-input" placeholder="Paste WCL Report URL or Code (e.g. aBcDeFg123)" style="min-width: 340px;" />
+          <button id="btn-import-report" class="btn-primary">Import Single Report Now</button>
+        </div>
+        <pre id="harvester-status-box">Loading harvester status...</pre>
       </div>
     </section>
   </main>
 
-  <script src="/replay2d.js"></script>
-  <script src="/app.js"></script>
+  <script src="/replay2d.js?v=2"></script>
+  <script src="/app.js?v=2"></script>
 </body>
 </html>

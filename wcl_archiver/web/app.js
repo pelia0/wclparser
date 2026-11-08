@@ -23,10 +23,16 @@ async function initApp() {
 
   document.getElementById("btn-search").addEventListener("click", loadFightsList);
   document.getElementById("btn-save-auth").addEventListener("click", submitAuth);
+  document.getElementById("btn-harvest-mplus").addEventListener("click", () => startHarvest("mplus_s5"));
+  document.getElementById("btn-harvest-raids").addEventListener("click", () => startHarvest("raids"));
+  document.getElementById("btn-harvest-stop").addEventListener("click", stopHarvest);
+  document.getElementById("btn-import-report").addEventListener("click", importSingleReport);
 
   await loadCatalog();
   await refreshAuthStatus();
+  await refreshHarvesterStatus();
   await loadFightsList();
+  setInterval(refreshHarvesterStatus, 3000);
 }
 
 function switchView(viewName) {
@@ -67,28 +73,103 @@ async function loadCatalog() {
   });
 }
 
-async function refreshAuthStatus() {
-  const res = await fetch("/api/auth/status");
-  const st = await res.json();
+function renderAuthState(st) {
   const badge = document.getElementById("auth-badge");
   badge.textContent = st.authenticated ? `Authenticated (${st.email})` : "Not Authenticated";
+  badge.style.color = st.authenticated ? "#4ade80" : "#f87171";
+
+  const banner = document.getElementById("auth-feedback-banner");
+  if (banner) {
+    if (st.last_error) {
+      banner.style.display = "block";
+      banner.style.background = "#3b181e";
+      banner.style.border = "1px solid #ef4444";
+      banner.style.color = "#fca5a5";
+      banner.textContent = st.last_error;
+    } else if (st.authenticated && st.status_message) {
+      banner.style.display = "block";
+      banner.style.background = "#123524";
+      banner.style.border = "1px solid #22c55e";
+      banner.style.color = "#86efac";
+      banner.textContent = st.status_message;
+    } else {
+      banner.style.display = "none";
+    }
+  }
   document.getElementById("auth-status-box").textContent = JSON.stringify(st, null, 2);
 }
 
+async function refreshAuthStatus() {
+  const res = await fetch("/api/auth/status");
+  const st = await res.json();
+  renderAuthState(st);
+}
+
 async function submitAuth() {
+  const btn = document.getElementById("btn-save-auth");
+  const statusBox = document.getElementById("auth-status-box");
+  btn.disabled = true;
+  btn.textContent = "Signing in to WarcraftLogs...";
+  statusBox.textContent = "Connecting to WarcraftLogs...";
+
+  const xsrfEl = document.getElementById("auth-xsrf");
   const payload = {
-    email: document.getElementById("auth-email").value,
+    email: document.getElementById("auth-email").value.trim(),
     password: document.getElementById("auth-password").value,
-    client_id: document.getElementById("auth-client-id").value,
-    client_secret: document.getElementById("auth-client-secret").value,
-    wcl_session_cookie: document.getElementById("auth-cookie").value,
+    client_id: document.getElementById("auth-client-id").value.trim(),
+    client_secret: document.getElementById("auth-client-secret").value.trim(),
+    wcl_session_cookie: document.getElementById("auth-cookie").value.trim(),
+    xsrf_token: xsrfEl ? xsrfEl.value.trim() : "",
   };
-  await fetch("/api/auth/login", {
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const st = await res.json();
+    renderAuthState(st);
+  } catch (err) {
+    statusBox.textContent = "Error: " + String(err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Sign In & Save Session";
+  }
+}
+
+async function refreshHarvesterStatus() {
+  const box = document.getElementById("harvester-status-box");
+  if (!box) return;
+  const res = await fetch("/api/harvester/status");
+  const st = await res.json();
+  box.textContent = JSON.stringify(st, null, 2);
+}
+
+async function startHarvest(mode) {
+  const pages = Number(document.getElementById("harvest-pages").value || 1);
+  await fetch("/api/harvester/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ mode, pages_per_spec: pages }),
   });
-  await refreshAuthStatus();
+  await refreshHarvesterStatus();
+}
+
+async function stopHarvest() {
+  await fetch("/api/harvester/stop", { method: "POST" });
+  await refreshHarvesterStatus();
+}
+
+async function importSingleReport() {
+  const report = document.getElementById("import-report-input").value.trim();
+  if (!report) return;
+  await fetch("/api/harvester/import-report", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ report, content_type: "mplus" }),
+  });
+  await refreshHarvesterStatus();
+  await loadFightsList();
 }
 
 async function loadFightsList() {

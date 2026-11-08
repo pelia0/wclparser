@@ -126,3 +126,35 @@ async def test_wcl_auth_manager_csrf_cookie_fallback_and_invalid_response_resets
     # 2. Failed login with "Invalid" in response resets auth state to False
     status2 = await auth.login_with_credentials(email="user@test.com", password="badpass")
     assert status2["authenticated"] is False
+    assert "Invalid WarcraftLogs email or password" in status2["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_wcl_auth_manager_oauth_only_and_cloudflare_diagnostic(tmp_path: Path):
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login":
+            return httpx.Response(403, text="<html><title>Just a moment...</title></html>")
+        if request.url.path == "/oauth/token" and request.method == "POST":
+            return httpx.Response(200, json={"access_token": "v2_tok_999", "expires_in": 3600})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(mock_handler)
+    auth = WCLAuthManager(session_file=tmp_path / "oauth_only.json", transport=transport)
+
+    # Cloudflare 403 on password login alone sets clear last_error
+    st_cf = await auth.login_with_credentials(email="a@b.com", password="pw")
+    assert st_cf["authenticated"] is False
+    assert "Cloudflare" in st_cf["last_error"]
+
+    # OAuth2 Client ID + Secret authenticates even without password login
+    st_oauth = await auth.login_with_credentials(
+        email="", password="", client_id="my_client_id", client_secret="my_secret"
+    )
+    assert st_oauth["authenticated"] is True
+    assert st_oauth["has_oauth_token"] is True
+    assert st_oauth["last_error"] == ""
+
+    # Cookie parser handles full Cookie header or raw value
+    parsed = WCLAuthManager.parse_cookie_input("wcl_session=abc123; XSRF-TOKEN=xsrf456")
+    assert parsed["wcl_session"] == "abc123"
+    assert parsed["XSRF-TOKEN"] == "xsrf456"
