@@ -74,6 +74,7 @@ class WCLAuthManager:
         client_id: str = "",
         client_secret: str = "",
     ) -> Dict[str, Any]:
+        self._state["authenticated"] = False
         async with httpx.AsyncClient(
             base_url=self.BASE_URL,
             follow_redirects=True,
@@ -82,7 +83,11 @@ class WCLAuthManager:
         ) as client:
             login_page = await client.get("/login")
             csrf_match = CSRF_META_RE.search(login_page.text)
-            csrf_token = csrf_match.group(1) if csrf_match else ""
+            csrf_token = (
+                csrf_match.group(1)
+                if csrf_match
+                else unquote(client.cookies.get("XSRF-TOKEN", ""))
+            )
 
             resp = await client.post(
                 "/login",
@@ -90,7 +95,11 @@ class WCLAuthManager:
                 headers={"Referer": f"{self.BASE_URL}/login"},
             )
             cookies = dict(client.cookies.items())
-            if resp.status_code < 400 and ("wcl_session" in cookies or "logout" in resp.text.lower() or "logged in" in resp.text.lower()):
+            if (
+                resp.status_code < 400
+                and "invalid" not in resp.text.lower()
+                and ("wcl_session" in cookies or "logout" in resp.text.lower() or "logged in" in resp.text.lower())
+            ):
                 self._state["authenticated"] = True
                 self._state["email"] = email
                 self._state["cookies"] = cookies

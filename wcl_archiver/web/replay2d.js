@@ -27,13 +27,22 @@ class Replay2DPlayer {
     this.actors = {};
     (summaryData.actors || []).forEach(a => { this.actors[a.id] = a; });
     if (this.frames.length > 0) {
-      const xs = this.frames.map(f => f.x);
-      const ys = this.frames.map(f => f.y);
+      let minX = this.frames[0].x;
+      let maxX = this.frames[0].x;
+      let minY = this.frames[0].y;
+      let maxY = this.frames[0].y;
+      for (let i = 1; i < this.frames.length; i++) {
+        const f = this.frames[i];
+        if (f.x < minX) minX = f.x;
+        if (f.x > maxX) maxX = f.x;
+        if (f.y < minY) minY = f.y;
+        if (f.y > maxY) maxY = f.y;
+      }
       this.bounds = {
-        minX: Math.min(...xs) - 500,
-        maxX: Math.max(...xs) + 500,
-        minY: Math.min(...ys) - 500,
-        maxY: Math.max(...ys) + 500,
+        minX: minX - 500,
+        maxX: maxX + 500,
+        minY: minY - 500,
+        maxY: maxY + 500,
       };
     }
     this.currentMs = 0;

@@ -42,14 +42,24 @@ async function loadCatalog() {
   const res = await fetch("/api/meta/catalog");
   const cat = await res.json();
   const encSel = document.getElementById("filter-encounter");
-  cat.mplus_dungeons.forEach(d => {
+  (cat.mplus_dungeons || []).forEach(d => {
     const opt = document.createElement("option");
     opt.value = d.id;
     opt.textContent = d.name;
     encSel.appendChild(opt);
   });
+  Object.values(cat.raids || {}).forEach(raid => {
+    const raidName = raid.name || raid.slug;
+    Object.entries(raid.bosses || {}).forEach(([bossId, bossSlug]) => {
+      const opt = document.createElement("option");
+      opt.value = bossId;
+      const bossName = bossSlug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      opt.textContent = `${raidName} - ${bossName}`;
+      encSel.appendChild(opt);
+    });
+  });
   const specSel = document.getElementById("filter-spec");
-  cat.specs.forEach(s => {
+  (cat.specs || []).forEach(s => {
     const opt = document.createElement("option");
     opt.value = s.spec;
     opt.textContent = `${s.class} - ${s.spec}`;
@@ -103,9 +113,10 @@ async function loadFightsList() {
     const durS = Math.round((f.duration_ms || 0) / 1000);
     const parts = (f.participants || []).map(p => `${p.player_name} (${p.spec_name})`).join(", ");
     const sizeKb = f.compressed_bytes ? `${(f.compressed_bytes / 1024).toFixed(1)} KB` : "Queued";
+    const keyDiff = f.keystone_level ? '+' + f.keystone_level : 'Diff ' + f.difficulty;
     tr.innerHTML = `
       <td>${f.encounter_slug}</td>
-      <td>+${f.keystone_level || f.difficulty}</td>
+      <td>${keyDiff}</td>
       <td>${Math.floor(durS / 60)}m ${durS % 60}s</td>
       <td>${parts}</td>
       <td>${sizeKb}</td>
@@ -124,8 +135,11 @@ async function openSingleFight(fightUid) {
   }
   currentFightSummary = await res.json();
   document.getElementById("nav-fight-btn").disabled = false;
+  const keyDiff = currentFightSummary.keystone_level
+    ? '+' + currentFightSummary.keystone_level
+    : 'Diff ' + (currentFightSummary.difficulty || 0);
   document.getElementById("fight-header-info").textContent =
-    `${currentFightSummary.name} (+${currentFightSummary.keystone_level}) — Report ${currentFightSummary.report_code} #${currentFightSummary.fight_id}`;
+    `${currentFightSummary.name} (${keyDiff}) — Report ${currentFightSummary.report_code} #${currentFightSummary.fight_id}`;
   switchView("fight");
   renderFightTab("damage");
 }

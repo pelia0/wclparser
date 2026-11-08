@@ -174,7 +174,8 @@ class CombatStateMachine:
             if ev.get("x") is not None and ev.get("y") is not None and src_id:
                 x_val = int(ev["x"])
                 y_val = int(ev["y"])
-                hp = int(ev.get("hitPoints", 100) or 100)
+                raw_hp = ev.get("hitPoints")
+                hp = int(raw_hp) if raw_hp is not None else 100
                 max_hp = max(1, int(ev.get("maxHitPoints", 100) or 100))
                 hp_pct = int((hp * 10000) // max_hp)
                 prev = last_pos.get(src_id)

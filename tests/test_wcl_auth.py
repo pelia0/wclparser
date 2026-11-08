@@ -86,3 +86,43 @@ def test_wcl_auth_manager_corrupted_session_file_handled_gracefully(tmp_path: Pa
     status = auth.get_auth_status()
     assert status["authenticated"] is False
     assert status["email"] == ""
+
+
+@pytest.mark.asyncio
+async def test_wcl_auth_manager_csrf_cookie_fallback_and_invalid_response_resets_auth(tmp_path: Path):
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login" and request.method == "GET":
+            # No meta tag, only cookie
+            return httpx.Response(
+                200,
+                text="<html><body>Login Page Without Meta Tag</body></html>",
+                headers={"set-cookie": "XSRF-TOKEN=cookie_token_999; Path=/"},
+            )
+        if request.url.path == "/login" and request.method == "POST":
+            body = request.read().decode("utf-8")
+            if "badpass" in body:
+                return httpx.Response(
+                    200,
+                    text="Invalid username or password.",
+                    headers={"set-cookie": "wcl_session=temp_guest_sess; Path=/"},
+                )
+            if "_token=cookie_token_999" in body:
+                return httpx.Response(
+                    200,
+                    text="Logged in successfully",
+                    headers={"set-cookie": "wcl_session=valid_session_ok; Path=/"},
+                )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(mock_handler)
+    session_file = tmp_path / "fallback_session.json"
+    auth = WCLAuthManager(session_file=session_file, transport=transport)
+
+    # 1. Successful login using cookie fallback
+    status1 = await auth.login_with_credentials(email="user@test.com", password="goodpassword")
+    assert status1["authenticated"] is True
+    assert status1["has_session_cookie"] is True
+
+    # 2. Failed login with "Invalid" in response resets auth state to False
+    status2 = await auth.login_with_credentials(email="user@test.com", password="badpass")
+    assert status2["authenticated"] is False

@@ -100,11 +100,9 @@ class WCLProtocolClient:
             if resp.status_code != 200:
                 return []
             payload = resp.json()
-            rankings = (
-                payload.get("data", {})
-                .get("worldData", {})
-                .get("encounter", {})
-                .get("fightRankings", {})
-                .get("rankings", [])
-            )
+            data = payload.get("data") or {}
+            world_data = data.get("worldData") or {}
+            encounter = world_data.get("encounter") or {}
+            fight_rankings = encounter.get("fightRankings") or {}
+            rankings = fight_rankings.get("rankings") or []
             return rankings

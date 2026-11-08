@@ -69,11 +69,13 @@ class WCLZWriter:
             "map_id": int(replay_stream.get("map_id", 0)),
             "pulls": replay_stream.get("pulls", []),
             "count": len(frames),
-            "t": encode_delta_ints([int(f.get("t", 0)) for f in frames]),
-            "actor": encode_delta_ints([int(f.get("actor", 0)) for f in frames]),
-            "x": encode_delta_ints([int(f.get("x", 0)) for f in frames]),
-            "y": encode_delta_ints([int(f.get("y", 0)) for f in frames]),
-            "hp_pct": encode_delta_ints([int(f.get("hp_pct", 10000)) for f in frames]),
+            "t": encode_delta_ints([int(f.get("t", 0) or 0) for f in frames]),
+            "actor": encode_delta_ints([int(f.get("actor", 0) or 0) for f in frames]),
+            "x": encode_delta_ints([int(f.get("x", 0) or 0) for f in frames]),
+            "y": encode_delta_ints([int(f.get("y", 0) or 0) for f in frames]),
+            "hp_pct": encode_delta_ints(
+                [int(f.get("hp_pct", 0) if f.get("hp_pct") is not None else 10000) for f in frames]
+            ),
         }
         return msgpack.packb(payload, use_bin_type=True)
 
@@ -147,6 +149,8 @@ class WCLZReader:
     def read_header(file_path: Path) -> Dict[str, int]:
         with open(file_path, "rb") as f:
             buf = f.read(HEADER_SIZE)
+        if len(buf) < HEADER_SIZE:
+            raise ValueError(f"Truncated WCLZ header in {file_path}")
         (
             magic,
             version,

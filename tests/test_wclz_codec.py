@@ -111,3 +111,27 @@ def test_wclz_invalid_magic(tmp_path: Path):
     bad_file.write_bytes(b"NOPE" + b"\x00" * 72)
     with pytest.raises(ValueError, match="Invalid WCLZ magic"):
         WCLZReader.read_header(bad_file)
+
+
+def test_wclz_truncated_header_and_null_replay_fields(tmp_path: Path):
+    trunc_file = tmp_path / "truncated.wclz"
+    trunc_file.write_bytes(b"WCLZ\x01\x00")
+    with pytest.raises(ValueError, match="Truncated WCLZ header"):
+        WCLZReader.read_header(trunc_file)
+
+    # Replay frame with 0 hp_pct and null/none coordinates
+    wclz_path = tmp_path / "null_replay.wclz"
+    summary = {"duration_ms": 1000}
+    events = []
+    replay = {
+        "map_id": 100,
+        "frames": [
+            {"t": None, "actor": None, "x": None, "y": None, "hp_pct": 0},
+            {"t": 500, "actor": 2, "x": 10, "y": 20, "hp_pct": None},
+        ],
+    }
+    WCLZWriter.write_fight(wclz_path, summary, events, replay, zstd_level=1)
+    read_rep = WCLZReader.read_replay_only(wclz_path)
+    assert len(read_rep["frames"]) == 2
+    assert read_rep["frames"][0] == {"t": 0, "actor": 0, "x": 0, "y": 0, "hp_pct": 0}
+    assert read_rep["frames"][1] == {"t": 500, "actor": 2, "x": 10, "y": 20, "hp_pct": 10000}

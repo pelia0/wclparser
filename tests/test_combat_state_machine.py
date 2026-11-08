@@ -70,6 +70,9 @@ def test_combat_state_machine_pet_merging_auras_casts_deaths_and_2d_replay():
 
     assert replay["map_id"] == 1492
     assert len(replay["frames"]) >= 2
+    zero_hp_frames = [f for f in replay["frames"] if f["actor"] == 99 and f["x"] == -41050]
+    assert len(zero_hp_frames) == 1
+    assert zero_hp_frames[0]["hp_pct"] == 0
 
 
 def test_combat_state_machine_dynamic_summon_healing_and_remaining_buffs():

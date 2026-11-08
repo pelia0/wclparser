@@ -1,7 +1,8 @@
+from contextlib import contextmanager
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 class IndexDB:
@@ -10,12 +11,17 @@ class IndexDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -240,7 +246,7 @@ class IndexDB:
         with self._connect() as conn:
             fight_rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
             for f in fight_rows:
-                f["affixes"] = json.loads(f.pop("affixes_json", "[]"))
+                f["affixes"] = json.loads(f.pop("affixes_json", "[]") or "[]")
                 p_rows = conn.execute(
                     "SELECT * FROM fight_participants WHERE fight_uid = ?",
                     (f["fight_uid"],),
@@ -255,11 +261,17 @@ class MasterDictDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
-        return conn
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:

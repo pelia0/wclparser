@@ -186,6 +186,8 @@ async def test_protocol_client_rankings_and_unarchive_fail(tmp_path: Path):
             req_json = request.read().decode("utf-8")
             if "fail" in req_json:
                 return httpx.Response(500)
+            if "null_encounter" in req_json:
+                return httpx.Response(200, json={"data": {"worldData": {"encounter": None}}})
             return httpx.Response(
                 200,
                 json={
@@ -224,3 +226,9 @@ async def test_protocol_client_rankings_and_unarchive_fail(tmp_path: Path):
         zone_id=9, encounter_id=11492, partition=5, class_name="fail", spec_name="fail", page=1
     )
     assert rankings_fail == []
+
+    # rankings with null encounter returns empty list without AttributeError
+    rankings_null = await client.fetch_rankings_fight_refs(
+        zone_id=9, encounter_id=11492, partition=5, class_name="null_encounter", spec_name="Any", page=1
+    )
+    assert rankings_null == []
