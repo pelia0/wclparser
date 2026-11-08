@@ -1,46 +1,48 @@
-# Специфікація системи: WCL Legion Archiver & Offline Viewer (`D:\wowlogsparser`)
+# System Specification: WCL Legion Archiver & Offline Viewer (`D:\wowlogsparser`)
 
-**Дата:** 2026-11-08  
-**Статус:** На рев'ю користувача  
-**Цільова директорія проєкту:** `D:\wowlogsparser`
+**Date:** 2026-11-08  
+**Status:** Approved  
+**Project Directory:** `D:\wowlogsparser`  
+**Language Policy:** Everything in the project (source code, UI labels, documentation, logs, database fields, and comments) MUST be 100% in English.
 
 ---
 
-## 1. Мета та ключові вимоги
+## 1. Purpose & Core Requirements
 
-Розробити автономну систему для одноразового повного вивантаження, надщільного стиснення та локального офлайн-перегляду логів **WarcraftLogs** для доповнення **World of Warcraft: Legion (7.3.5)** за час дії активної підписки WCL:
+Build a self-contained system for one-off bulk extraction, maximum-ratio compression, and local offline viewing of **WarcraftLogs** combat logs for **World of Warcraft: Legion (7.3.5)** within an active WCL subscription window:
 
-1. **Охоплення контенту:**
-   - **Mythic+ Сезон 5 (Patch 7.3.2 / 7.3.5, WCL Zone 9, Partition 5)** — останній актуальний сезон Легіону **без препатчу BfA 8.0** (усі 13 підземель Легіону, вибірка топ-забігів по кожному підземеллю та по кожному з 36 спеків).
-   - **Усі 5 рейдів Легіону (без препатчу BfA):**
+1. **Content Scope:**
+   - **Mythic+ Season 5 (Patch 7.3.2 / 7.3.5, WCL Zone 9, Partition 5)** — the final genuine Legion 7.3.5 season **excluding the BfA 8.0 pre-patch** (all 13 Legion dungeons, harvesting top runs per dungeon overall and across all 36 specializations).
+   - **All 5 Legion Raids (excluding BfA 8.0 pre-patch partitions):**
      - *The Emerald Nightmare* (Zone 10)
      - *Trial of Valor* (Zone 12)
      - *The Nighthold* (Zone 11)
      - *Tomb of Sargeras* (Zone 13)
-     - *Antorus, the Burning Throne* (Zone 17, Partitions 1–2 до препатчу 8.0)
-2. **Повнота даних кожного бою:**
-   - Метадані звіту та бою (час, рівень ключа, афікси, бос, складність, вайп/кіл, тривалість).
-   - Повний `CombatantInfo` кожного учасника (таланти, екіпірування, легендарки, тринкети, ilvl, стати, трейти та реліквії артефакту).
-   - Повні посекундні сирі події (`Raw Events`) за весь бій включно з ресурсами (`includeResources=true`) та координатами `(x, y, facing)` для 2D-реплею.
-3. **Жорстка вимога до збереження та доступу:**
-   - **Кожен бій зберігається в окремому незалежному файлі `.wclz`.**
-   - **Жодного розпакування всього архіву при перегляді:** при відкритті конкретного бою в інтерфейсі з диска читається і розпаковується в оперативну пам'ять **виключно файл цього одного бою (~300–700 КБ)** за ~10–15 мс. Жодні інші файли не зачіпаються, і на диск не створюються тимчасові розпаковані копії.
-   - **Максимальне стиснення (40x–55x відносно сирого JSON):** сирий JSON ніколи не зберігається на диск; події на льоту перетворюються у бінарні колонки з дельта-кодуванням і стискаються алгоритмом `Zstandard Ultra (Level 22)` зі спільним навченим словником (`legion_wcl.zdict`).
+     - *Antorus, the Burning Throne* (Zone 17, Partitions 1–2 prior to 8.0 pre-patch)
+2. **Full Data Depth per Fight:**
+   - Report and fight metadata (duration, keystone level, affixes, boss ID, difficulty, kill/wipe status, dungeon pulls, phases).
+   - Complete `CombatantInfo` per participant (7-row talent grid, equipped items, legendaries, trinkets, item level, secondary stats, artifact traits, and relics).
+   - Full millisecond-resolution `Raw Events` across the entire fight including class resources (`includeResources=true`) and unit coordinates `(x, y, facing)` for 2D map replay.
+3. **Strict Storage & Access Isolation Requirement:**
+   - **Every individual fight is stored in its own standalone `.wclz` file (`1 fight = 1 file`).**
+   - **Zero bulk archive unpacking on view:** opening a specific fight in the Viewer UI reads and decompresses in RAM **exclusively that single fight's `.wclz` file (~300–700 KB)** in ~10–15 ms. No other fight files are touched, and no temporary uncompressed files are written to disk.
+   - **Maximum Compression (40x–55x vs raw JSON):** raw JSON is never written to disk; events are transposed in memory into columnar arrays with delta/varint encoding and compressed with `Zstandard Ultra (Level 22)` (with optional shared `Zstd` dictionary support).
 
 ---
 
-## 2. Архітектура сховища та формат файлу `.wclz`
+## 2. Storage Architecture & `.wclz` Binary Format
 
-### 2.1. Файлова структура на диску
+### 2.1. On-Disk Directory Layout
 
 ```text
 D:\wowlogsparser\
-├── config.yaml                          # Налаштування сесії WCL, API ключів, лімітів, шляхів
+├── .gitignore
+├── requirements.txt
+├── start.bat
 ├── data\
-│   ├── index.db                         # SQLite (WAL): індекс усіх боїв, гравців, спеків, талантів та черга завантаження
-│   ├── master_dict.db                   # SQLite: глобальний довідник спелів (spellID -> назва, іконка), NPC, предметів, карт
-│   ├── dictionaries\
-│   │   └── legion_wcl_v1.zdict          # Навчений словник Zstd (112 КБ) для максимального стиснення окремих .wclz файлів
+│   ├── auth_session.json                # Local WCL session cookies & OAuth tokens (gitignored)
+│   ├── index.db                         # SQLite (WAL): searchable fight index, participants, specs, talents, queue state
+│   ├── master_dict.db                   # SQLite: global dictionary of spells (spellID -> name, school, icon), items, maps
 │   ├── mplus_s5\
 │   │   ├── 11458_black-rook-hold\
 │   │   ├── 11677_cathedral-of-eternal-night\
@@ -51,192 +53,98 @@ D:\wowlogsparser\
 │   │   ├── 11492_maw-of-souls\
 │   │   │   ├── k28_14m12s_aBcDeFg123_f2.wclz
 │   │   │   └── k27_15m04s_xYz9876543_f1.wclz
-│   │   ├── 11458_neltharions-lair\
+│   │   ├── 11465_neltharions-lair\
 │   │   ├── 11651_return-to-karazhan-lower\
 │   │   ├── 11652_return-to-karazhan-upper\
 │   │   ├── 11753_seat-of-the-triumvirate\
 │   │   ├── 11516_the-arcway\
 │   │   └── 11493_vault-of-the-wardens\
 │   └── raids\
-│       ├── 10_emerald-nightmare\
-│       ├── 12_trial-of-valor\
-│       ├── 11_the-nighthold\
-│       ├── 13_tomb-of-sargeras\
-│       └── 17_antorus-the-burning-throne\
-│           ├── 2076_garothi-worldbreaker_mythic\
-│           └── 2092_argus-the-unmaker_mythic\
+│       ├── zone_10\
+│       ├── zone_12\
+│       ├── zone_11\
+│       ├── zone_13\
+│       └── zone_17\
+│           ├── 2076_garothi-worldbreaker\
+│           └── 2092_argus-the-unmaker\
 ```
 
-### 2.2. Бінарний формат одного файлу бою (`.wclz`)
+### 2.2. Single-Fight `.wclz` Binary Layout
 
-Кожен файл `.wclz` містить дані **рівно одного бою (`fight`)** і складається з заголовка фіксованого розміру та **3 незалежних стиснутих секцій (`Zstd frames`)**. Це дозволяє інтерфейсу читати навіть окрему частину одного бою за потреби:
+Each `.wclz` file stores **exactly one fight** and consists of a fixed 76-byte header followed by **3 independently compressed `Zstd` frames**, allowing the UI to read only the required slice of a single fight:
 
 ```text
 +-----------------------------------------------------------------------+
-| HEADER (64 байти, нестиснутий)                                        |
+| HEADER (76 bytes, uncompressed)                                       |
 | - Magic: "WCLZ" (4B) | Version: 1 (2B) | Flags (2B) | DictID (4B)     |
 | - EventCount (4B) | DurationMs (4B)                                   |
-| - Offset & CompressedSize для Секції 1 (Summary & Builds) (16B)       |
-| - Offset & CompressedSize для Секції 2 (Columnar Events) (16B)        |
-| - Offset & CompressedSize для Секції 3 (2D Replay Trajectories) (12B) |
+| - Sec1Offset & Sec1Size (16B) — Summary, Builds & Precomputed Tables  |
+| - Sec2Offset & Sec2Size (16B) — Columnar Combat Events                |
+| - Sec3Offset & Sec3Size (16B) — 2D Replay Spatial & HP Stream         |
+| - Checksum64 (8B, xxHash64 over compressed frames)                    |
 +-----------------------------------------------------------------------+
-| СЕКЦІЯ 1: Fight Summary, Actors & Precomputed Tables (Zstd Frame 1)   |
-| - Локальна таблиця акторів бою (гравці, пети, моби та їхні індекси)   |
-| - Повний CombatantInfo (таланти, шмот, реліквії, трейти, стати)       |
-| - Готові агрегати для миттєвого рендеру Summary/Damage/Healing/Deaths |
+| SECTION 1: Fight Summary, Actors & Precomputed Tables (Zstd Frame 1)  |
+| - Fight metadata, actor roster, ability table                         |
+| - Full CombatantInfo (talents, gear, legendaries, artifact traits)    |
+| - Precomputed Damage Done, Healing Done, Casts, Buff Uptimes, Deaths  |
 +-----------------------------------------------------------------------+
-| СЕКЦІЯ 2: Columnar Combat Events (Zstd Frame 2 + legion_wcl.zdict)    |
-| - Події транспоновані у колонки (Struct-of-Arrays):                   |
-|   * dt_ms[]: Delta-varint таймстемпів (t[i] - t[i-1])                 |
-|   * event_type[]: uint8 коди типів подій (CAST, DMG, HEAL, AURA...)   |
-|   * source_idx[], target_idx[], target_instance[]: uint8/uint16       |
-|   * ability_local_idx[]: uint16 індекс у локальній таблиці спелів бою |
-|   * hit_type[], flags[]: uint8 бітові маски                           |
-|   * amount[], unmitigated[], absorbed[], overkill[]: varint / int32   |
-|   * resource_type[], resource_amount[], resource_max[]: uint8 / varint|
+| SECTION 2: Columnar Combat Events (Zstd Frame 2, Level 22)            |
+| - Events transposed into homogeneous integer columns (Struct-of-Arrays|
+|   encoded with ZigZag + Delta + Varint):                              |
+|   * timestamp, sourceID, targetID, targetInstance, abilityGameID,     |
+|     hitType, amount, unmitigatedAmount, absorbed, overkill,           |
+|     hitPoints, maxHitPoints, resourceType, resourceAmount,            |
+|     resourceMax, x, y, facing                                         |
 +-----------------------------------------------------------------------+
-| СЕКЦІЯ 3: 2D Replay Spatial & HP Stream (Zstd Frame 3)                |
-| - Оптимізований потік позицій та здоров'я для 60 FPS плеєра:          |
-|   * actor_id[], dt_ms[], dx[], dy[] (Delta + RLE для нерухомих фаз)   |
-|   * facing[] (uint8 кут 0..255), hp_pct_delta[]                       |
-|   * M+ Pull/Trash Pack маркери та межі кімнат карти                   |
+| SECTION 3: 2D Replay Spatial & HP Trajectory Stream (Zstd Frame 3)    |
+| - Deduplicated movement & HP stream for 60 FPS HTML5 Canvas replay:   |
+|   * t[], actor[], x[], y[], hp_pct[] encoded with Delta-Varint        |
+|   * Map ID and M+ dungeon pull boundaries                             |
 +-----------------------------------------------------------------------+
 ```
 
-**Чому така структура дає максимальне стиснення і миттєву швидкість:**
-1. Відсутність текстових ключів та локальна індексація спелів зменшують обсяг ще до стиснення у **6–8 разів**.
-2. Дельта-кодування таймстемпів (`dt_ms`) і координат (`dx, dy`) перетворює великі 32-бітні числа на малі значення поблизу нуля (`0, 1, -2`), які `Zstd Level 22` зі словником пакує ще у **6–8 разів**.
-3. Разом це дає **40x–55x стиснення** порівняно з сирим JSON WCL, а розпакування одного бою займає **~10 мс** у RAM.
+---
+
+## 3. Authentication & Core Parser Engine (`AuthManager` + `WCLProtocolClient` + `CombatStateMachine`)
+
+### 3.0. Authentication & Subscription Session Manager (`WCLAuthManager`)
+1. **Login UI & Session Storage:**
+   - On startup, the user enters their WarcraftLogs **Email** and **Password** (plus optional v2 `Client ID` / `Client Secret` or direct browser `wcl_session` cookie) in the **Account & Harvester** tab of the web interface.
+   - `WCLAuthManager` fetches `/login`, extracts the CSRF `<meta name="csrf-token">`, submits credentials to `POST /login`, captures `wcl_session` and `XSRF-TOKEN` cookies, and persists them locally in `D:\wowlogsparser\data\auth_session.json`.
+2. **Subscription & Unarchive Readiness:**
+   - Automatically attaches `X-CSRF-TOKEN` / `X-XSRF-TOKEN` and subscriber cookies to `POST /reports/unarchive/{code}` requests so archived Legion logs can be restored on demand.
+
+### 3.1. Layer 1: WCL Network & Protocol Parser (`WCLProtocolClient`)
+1. **Rankings & Leaderboard Parser:**
+   - Queries WCL rankings for **M+ Season 5 (`zone=9, partition=5`)** across all 13 dungeons and all 36 specs, plus **all 5 Legion Raids (`zones=10, 11, 12, 13, 17`)**.
+   - Deduplicates `(report_code, fight_id)` pairs in `index.db` so a single M+ or Raid fight appearing on multiple spec leaderboards is downloaded **only once**.
+2. **Zero-Wait Unarchive Warmer:**
+   - Maintains a pre-warmed buffer of 25–40 reports by sending `POST /reports/unarchive/{code}` ahead of the download queue.
+3. **Report Master & Paginated Event Stream Parser:**
+   - Parses `/reports/fights-and-participants/{code}/0` for fight boundaries, actors, pet owners, dungeon pulls, and abilities.
+   - Paginates `/reports/events/summary/{code}/{fight_id}/{cursor}/{end_time}?includeResources=true` via `nextPageTimestamp` until 100% of raw events are retrieved.
+
+### 3.2. Layer 2: Analytical Combat Event Parser (`CombatStateMachine`)
+Processes all raw events of a fight in a single linear pass $O(N)$ before packing into `.wclz`:
+1. **Pet & Guardian Attribution:** Resolves static `petOwner` and dynamic `summon` events so pet/guardian damage and casts (e.g., SEF clones, Xuen, Doomguard, Infernal, Dreadstalkers, totems) are attributed to the owner player.
+2. **Aura Interval State Machine:** Combines initial `combatantinfo` auras with `applybuff` / `refreshbuff` / `applybuffstack` / `removebuff` events into exact `[start_ms, end_ms]` intervals, computing Uptime % and capturing active buff snapshots at the millisecond of every cast.
+3. **Cast & Channel Timeline Tracker:** Records chronological player casts alongside active buff snapshots and resource levels.
+4. **Damage & Healing Attribution:** Computes effective damage (`amount - overkill`), crit counts, DPS/HPS, and healing/absorb breakdowns.
+5. **Interrupts & Pre-Death Analyzer:** Extracts all interrupts (`extraAbilityGameID`) and constructs a 15-second incoming damage/healing window prior to every player death.
+6. **Spatial Trajectory Builder:** Extracts deduplicated `(t, actor, x, y, hp_pct)` frames for the 2D replay stream.
 
 ---
 
-## 3. Авторизація та Ядро Парсера (`Auth Manager` + `WCL Protocol Parser` + `Combat State Machine`)
+## 4. Offline Viewer Web UI & 60 FPS 2D Replay
 
-### 3.0. Авторизація та підключення акаунта з підпискою (`Auth & Session Manager`)
-
-Введення логіну та пароля відбувається **на самому старті — прямо в інтерфейсі програми (вкладка «Акаунт та Збір логів»)** або через локальний конфіг `.env` перед запуском збору:
-
-1. **Екран входу в інтерфейсі (`Login & Subscription Setup`):**
-   - При першому запуску `D:\wowlogsparser` у веб-інтерфейсі відкривається панель авторизації WarcraftLogs:
-     - **Спосіб 1 (Прямий логін і пароль):** ти вводиш свій **Email (логін)** та **Пароль** від WarcraftLogs (та за бажанням `Client ID` / `Client Secret` для GraphQL API v2 з `warcraftlogs.com/api/clients`). Бекенд виконує офіційний вхід на `warcraftlogs.com/login`, отримує сесійні токени (`wcl_session`, `XSRF-TOKEN`) і зберігає їх локально в `D:\wowlogsparser\data\auth_session.json` (файл додано в `.gitignore`, щоб ніколи не потрапив у Git).
-     - **Спосіб 2 (Інтерактивний вхід через видиме вікно браузера / Імпорт сесії):** якщо ти входиш у WCL через Battle.net / Discord / Google або сайт вимагає підтвердження в браузері, кнопка **«Увійти через вікно браузера»** відкриває звичайне вікно входу WarcraftLogs; щойно ти залогінився, програма автоматично зчитує сесійні cookies і закриває вікно.
-2. **Перевірка статусу підписки (`Subscription & Unarchive Check`):**
-   - Одразу після входу парсер перевіряє на тестовому архівному звіті Легіону, чи активна підписка і чи дозволено розморожування (`Unarchive`), та виводить статус у шапці інтерфейсу:
-     - `Статус: Авторизовано | Підписка WCL: Активна (Unarchive працює) | API v2 Quota: 3600/3600`.
-3. **Автоматичне підтримання сесії (`Session Keep-Alive`):**
-   - Під час багатогодинного вивантаження парсер автоматично оновлює `XSRF-TOKEN` та сесійні cookies з кожним запитом. Якщо сесія протермінується, парсер ставить чергу на паузу (без втрати прогресу) і просить оновити вхід.
-
----
-
-### 3.1. Рівень 1: Парсер WarcraftLogs (Web / Internal JSON / GraphQL v2)
-
-Оскільки публічний GraphQL API v2 має жорсткий ліміт (`3600 поінтів/год`), чого недостатньо для швидкого дампу всього сезону, парсер комбінує GraphQL v2 та внутрішні JSON-ендпоінти веб-клієнта WCL через авторизовану сесію підписки:
-
-1. **Парсер рейтингів і матриці лідербордів (`Rankings & Leaderboard Parser`):**
-   - Обходить таблиці лідербордів для **M+ Сезону 5 (`zone=9, partition=5`)** по кожному з 13 підземель (загальний ладдер ключів + окремо по кожному з 36 спеків) та для **5 Рейдів Легіону (`zones=10, 11, 12, 13, 17`)** по кожному босу (`difficulty=5` Mythic та `difficulty=4` Heroic) по всіх 36 спеках (ігноруючи партиції препатчу BfA 8.0).
-   - Витягує та дедуплікує в `index.db` унікальні пари `(report_code, fight_id)`, зберігаючи метадані з лідерборду: рівень ключа (`keystoneLevel`), набір афіксів (`affixes[]`), час проходження (`duration`), склад групи та посилання на звіт.
-
-2. **Менеджер авто-розморожування архівних логів (`Unarchive Protocol Handler`):**
-   - Визначає статус звіту (`archived: true`).
-   - Використовує cookies підписки (`wcl_session`, `XSRF-TOKEN`) для автоматичного надсилання запиту `POST /reports/unarchive/{report_code}` у фоновому буфері на 25–40 звітів наперед.
-   - Опитує готовність звіту кожні 2–3 секунди і передає розморожений `report_code` у парсер подій без жодного простою.
-
-3. **Парсер структури звіту та учасників (`MasterData & Fights Parser`):**
-   - Парсить метадані звіту (`/reports/fights-and-participants/{code}/0` або GraphQL `reportData.report`):
-     - Розбирає список усіх боїв звіту (`fights[]`: `id`, `start_time`, `end_time`, `boss`, `name`, `difficulty`, `kill`, `keystoneLevel`, `affixes`, `maps[]`, `phases[]`, `dungeonPulls[]`).
-     - Будує дерево акторів (`friendlies[]`, `enemies[]`, `friendlyPets[]`, `enemyPets[]`) та прив'язує кожного пета/самона (`petOwner`) до його власника-гравця чи боса.
-     - Парсить таблицю здібностей (`abilities[]`: `gameID`, `name`, `type`/школа магії, `icon`) і доповнює глобальний довідник `master_dict.db`.
-
-4. **Парсер потоків сирих подій (`Paginated Raw Event Stream Parser`):**
-   - Ітерує по часових вікнах бою від `start_time` до `end_time` через курсор `nextPageTimestamp` (з параметрами `includeResources=true`, `translate=true`), доки всі 100% подій бою не будуть вивантажені в пам'ять.
-   - Нормалізує всі типи подій WCL:
-     - `combatantinfo` (стартові аури, таланти `[[tier, col, spellID]]`, екіпірування `[slot, itemID, ilvl, bonusIDs, gems, permanentEnchant]`, трейти артефакту `[[spellID, rank]]`, реліквії, базові стати: Str/Agi/Int/Stam, Crit/Haste/Mastery/Vers/Leech/Avoidance/Armor),
-     - `begincast`, `cast`, `interrupt`, `dispel`, `steal`,
-     - `damage`, `heal`, `absorbed`, `damage-split`,
-     - `applybuff`, `applybuffstack`, `refreshbuff`, `removebuff`, `removebuffstack`,
-     - `applydebuff`, `applydebuffstack`, `refreshdebuff`, `removedebuff`, `removedebuffstack`,
-     - `resourcechange`, `energize`, `drain`, `leech`,
-     - `summon`, `create`, `instakill`, `death`, `resurrect`, `aurabroken`,
-     - `encounterstart`, `encounterend`, `dungeonpull`, `mapchange`, `worldmarkerplaced`, `worldmarkerremoved`.
-
----
-
-### 3.2. Рівень 2: Бойовий парсер-аналізатор (`Combat Event State Machine`)
-
-Сирі події з WCL — це лише плоский потік повідомлень. Перед пакуванням у `.wclz` бойовий парсер проганяє всі події бою через **скінченний автомат станів (State Machine)** за один лінійний прохід $O(N)$ і виконує 6 ключових перетворень:
-
-1. **Резолвінг власників петів та гвардіанів (`Pet & Guardian Attribution`):**
-   - Автоматично прив'язує динамічно викликаних юнітів (клон *Storm, Earth, and Fire*, *Invoke Xuen*, *Doomguard*, *Infernal*, *Dreadstalkers*, *Water Elemental*, тотеми, пастки тощо) через події `summon` та таблицю `friendlyPets` до гравця-власника.
-   - Зберігає як власне ID пета (щоб бачити його окремо на 2D-карті), так і `owner_idx` (щоб його урон/касти коректно плюсувалися в таблицю Damage Done власника).
-
-2. **Реконструкція інтервалів бафів і дебафів (`Aura Interval State Machine`):**
-   - Поєднує стартові аури з `combatantinfo` та події `apply*` / `refresh*` / `apply*stack` / `remove*` у точні часові відрізки `[start_ms, end_ms, stacks, ability_id, source_id, target_id]`.
-   - Автоматично закриває активні аури у момент `death` юніта або `fight_end`, коректно рахуючи Uptime (%) та зберігаючи стан активних бафів гравця в кожну мілісекунду бою (щоб на таймлайні ротації було видно, які бафи/проки висіли в момент кожного касту).
-
-3. **Реконструкція життєвого циклу кастів, ченнелів та GCD (`Cast & Channel Tracker`):**
-   - Зв'язує `begincast` із парним `cast` (успішне завершення), `interrupt` (збиття касту) або передчасним скасуванням (рух/стоп-каст).
-   - Визначає підтримувані закляття (Channels: *Fists of Fury*, *Drain Soul*, *Mind Flay*, *Arcane Missiles*, *Eye Beam* тощо) за тіками періодичного урону/хілу та наступним кастом, фіксуючи точну тривалість ченнелу та факти кліпінгу (раннього переривання іншим спелом).
-
-4. **Точний підрахунок Damage / Healing / Absorbs / Overkill:**
-   - Розділяє чистий ефективний урон (`amount`), оверкіл (`overkill`), поглинений урон (`absorbed`) та необрізаний урон (`unmitigatedAmount`).
-   - Атрибутує події `absorbed` конкретному щиту хілера/танка (*Power Word: Shield*, *Life Cocoon*, *Ignore Pain* тощо) для точного розрахунку HPS.
-   - Відділяє урон у пріоритетну ціль (Boss / Priority Target Damage) від кліву та паддінгу.
-
-5. **Сегментація M+ забігу на пули та фази (`Pull & Phase Segmenter`):**
-   - Для Mythic+ автоматично розбиває весь ключ на окремі пули (`Pull #1`, `Pull #2`, ..., `Boss: Helya`) за подіями входу мобів у бій, `dungeonPulls` та паузами між паками.
-   - Для кожного паку визначає склад мобів (уключно з `targetInstance` для однакових мобів у паку), час пулу та координати центру паку.
-   - Для кожної смерті гравця (`death`) формує зріз останніх 15 секунд перед смертю (вхідні удари, отриманий хіл, активні дефенсиви та доступні сейви, які гравець не натиснув).
-
-6. **Побудова потоку позицій, здоров'я та ресурсів (`Spatial & Resource Trajectory Builder`):**
-   - Витягує з усіх подій семпли `(timestamp, actor_id, instance_id, x, y, facing, hp, max_hp, classResources[])`.
-   - Відсікає дублікати нерухомих координат (коли `dx == 0` і `dy == 0`), будує дельта-потік для 2D-реплею (Секція 3 файлу `.wclz`) та криві ресурсів (Energy, Chi, Mana, Insanity, Maelstrom, Fury, Rage, Runic Power, Astral Power, Holy Power, Combo Points, Soul Shards).
-
----
-
-## 4. Локальний інтерфейс перегляду (`Viewer UI`)
-
-Працює повністю офлайн як локальний веб-додаток (`FastAPI` бекенд + `React + TypeScript + Tailwind + Canvas/WebGL` фронтенд):
-
-### 4.1. Головний екран пошуку (`Log Explorer`)
-- Перемикач режиму: **Mythic+ Season 5** / **Legion Raids** + дашборд прогресу завантаження та розміру бази на диску.
-- Фільтри:
-  - Підземелля (13 данжів) або Рейд і Бос,
-  - Рівень ключа (напр. `+20..+30`) або Складність рейду (`Mythic` / `Heroic`),
-  - Афікси M+ (`Tyrannical`, `Fortified`, `Bolstering`, `Raging`, `Explosive`, `Bursting` тощо),
-  - Клас, Спек, наявність конкретного Таланту, Легендарки або Тринкета в учасника.
-- Результати пошуку: швидка таблиця з іконками спеків групи, рівнем ключа/часом, датою, DPS/HPS та кнопкою миттєвого відкриття бою.
-
-### 4.2. Аналітичні вкладки бою (аналог WarcraftLogs)
-Підтримують виділення довільного часового відрізка `t1..t2` на графіку (або вибір конкретного пулу мобів / фази боса) та фільтр по конкретному гравцю чи мобу:
-1. **Summary & Builds:** Склад групи, таланти (7 тирів), повний список предметів (ilvl, зачарування, сокети, легендарки, сет-бонуси), трейти й реліквії артефакту, базові стати.
-2. **Damage Done & Enemy Damage Taken:** Загальний DPS, розбивка по кожній здібності (кількість хітів/критів, середній хит/крит, % урону, графік по секундах), фільтр урону по пріоритетній цілі.
-3. **Healing Done & Absorbs:** Ефективний хіл, оверхіл, абсорби, розбивка по спелах та цілях.
-4. **Casts & Rotation Timeline (Cast Sequence):**
-   - Хронологічна стрічка кожного натиснутого спела гравця з точністю до мілісекунд (з відображенням GCD, ченнелів, кліпів ченнелів та одночасних проків/бафів).
-   - Таблиця частоти кастів (Casts / CPM).
-5. **Buffs & Debuffs (Uptimes):** Відсоток аптайму кожної аури та горизонтальні часові діаграми (Gantt-смужки), де видно точні вікна дії бурстів, дот, дефенсивів і бладласту.
-6. **Resources:** Посекундні графіки ресурсів гравця (Mana, Energy, Combo Points, Chi, Rage, Runic Power, Insanity, Maelstrom, Astral Power, Fury/Pain, Holy Power, Soul Shards).
-7. **Interrupts, Dispels & Deaths:**
-   - Таблиця всіх кастів мобів: які були збиті (і ким), а які пройшли.
-   - Детальний розбір кожної смерті (останні 15 секунд перед смертю: вхідний урон, отриманий хіл, активні сейви та наявні кулдауни).
-
-### 4.3. Візуальний 2D-реплей (`2D Map Replay`)
-- Читає **Секцію 3** з `.wclz` файлу обраного бою (~10 мс).
-- Рендерить карту підземелля/боса на HTML5 Canvas (60 FPS) із масштабуванням (Zoom/Pan):
-  - Іконки всіх гравців (за кольором класу/ролі) та мобів/босів.
-  - Плавна інтерполяція руху між координатами `(x, y)`, вектор погляду (`facing`), HP-бари та поточний каст над юнітом.
-  - Візуалізація пулів у M+: виділення активного паку мобів, що знаходяться в бою, та траєкторії маршруту групи по данжу.
-  - Синхронізована шкала часу внизу екрана (Play/Pause, `0.25x` – `8x`, клік по події смерті чи касту переміщує плеєр у відповідну секунду).
-
----
-
-## 5. Обробка помилок, тестування та верифікація
-
-1. **Верифікація цілісності при записі:**
-   - Кожен створений `.wclz` файл перед збереженням проходить перевірку контрольної суми (`xxHash64`) та кількості подій (`EventCount` у заголовку == кількість декодованих рядків).
-   - Запис відбувається у тимчасовий файл `<name>.wclz.tmp` з атомарним перейменуванням у `<name>.wclz` тільки після успішної перевірки.
-2. **Автоматичні тести:**
-   - **Round-trip тест кодека `.wclz`:** перевіряє, що після стиснення сирого бою у `.wclz` і зворотного декодування всі 100% подій (`timestamp`, `type`, `source`, `target`, `ability`, `amount`, `x`, `y`, `resources`) збігаються біт-у-біт, а читання одного бою не звертається до жодного іншого файлу.
-   - **Тест дедуплікації та парсера черги:** перевіряє, що дублікати `(report_code, fight_id)` з різних спеків не завантажуються повторно.
-   - **Тест API перегляду:** перевіряє швидкість читання окремих секцій `.wclz` (< 50 мс) та коректність побудови таблиць Damage/Healing/Casts/Replay.
-
+Served locally on `http://127.0.0.1:8080` via `FastAPI` and launched via `start.bat` (100% English UI):
+1. **Log Explorer:** Filter by Content Type (`Mythic+ Season 5` / `Legion Raids`), Dungeon/Boss, Specialization, and Minimum Key Level.
+2. **Single-Fight Analyzer (WCL-Style Tabs):**
+   - `Damage Done` & `Healing Done`
+   - `Casts & Rotation Timeline` (millisecond cast sequence with active buffs at cast time)
+   - `Buffs & Uptimes`
+   - `Builds & Talents` (`CombatantInfo` gear, legendaries, talents, artifact traits)
+   - `Interrupts & Deaths` (with 15s pre-death breakdown)
+3. **Interactive 2D Map Replay (60 FPS HTML5 Canvas):**
+   - Reads only Section 3 of the selected fight's `.wclz` file (~10 ms).
+   - Renders unit positions, movement interpolation, HP percentages, and playback scrubber (`0.5x` – `4x`).
