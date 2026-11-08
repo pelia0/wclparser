@@ -1,8 +1,9 @@
 import asyncio
+from datetime import datetime
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -40,7 +41,7 @@ class ImportReportRequest(BaseModel):
 
 class StartHarvestRequest(BaseModel):
     mode: str = "mplus_s5"
-    pages_per_spec: int = 1
+    pages_per_spec: int = 0
 
 
 def create_app(data_dir: Path = DATA_DIR) -> FastAPI:
@@ -56,7 +57,37 @@ def create_app(data_dir: Path = DATA_DIR) -> FastAPI:
         master_db=master_db,
         protocol_client=protocol_client,
     )
-    harvester_state: Dict[str, Any] = {"running": False, "current_task": "Idle", "last_error": ""}
+    harvester_logs: List[str] = []
+    harvester_state: Dict[str, Any] = {
+        "running": False,
+        "current_task": "Idle",
+        "last_error": "",
+        "specs_done": 0,
+        "specs_total": 0,
+        "pages_scanned": 0,
+        "progress_pct": 0.0,
+    }
+
+    def _append_log(msg: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        harvester_logs.append(f"[{ts}] {msg}")
+        if len(harvester_logs) > 40:
+            del harvester_logs[:-40]
+
+    def _on_progress(update: Dict[str, Any]) -> None:
+        if "current_task" in update:
+            harvester_state["current_task"] = update["current_task"]
+        if "specs_done" in update:
+            harvester_state["specs_done"] = int(update["specs_done"])
+        if "specs_total" in update:
+            harvester_state["specs_total"] = int(update["specs_total"])
+        if "pages_scanned" in update:
+            harvester_state["pages_scanned"] = int(update["pages_scanned"])
+        total = harvester_state.get("specs_total", 0)
+        done = harvester_state.get("specs_done", 0)
+        harvester_state["progress_pct"] = round(done * 100.0 / total, 1) if total > 0 else 0.0
+        if "log" in update and update["log"]:
+            _append_log(str(update["log"]))
 
     app = FastAPI(title="WCL Legion Archiver & Offline Viewer")
 
@@ -176,6 +207,7 @@ def create_app(data_dir: Path = DATA_DIR) -> FastAPI:
             "queued_fights": int(queued),
             "packed_fights": int(packed),
             "compressed_mb": round(int(total_bytes) / (1024 * 1024), 2),
+            "recent_logs": list(harvester_logs),
         }
 
     @app.post("/api/harvester/import-report")
@@ -185,51 +217,83 @@ def create_app(data_dir: Path = DATA_DIR) -> FastAPI:
             raise HTTPException(status_code=400, detail="Invalid WarcraftLogs report code or URL")
         code = m.group(1)
         harvester_state["running"] = True
-        harvester_state["current_task"] = f"Importing report {code}"
+        harvester_state["last_error"] = ""
+        harvester_state["current_task"] = f"Importing report {code}..."
+        _append_log(f"Starting single report import for {code}...")
         try:
             paths = await harvester.import_report_by_code(code, content_type=req.content_type)
             harvester_state["current_task"] = f"Imported {len(paths)} fights from {code}"
+            _append_log(f"Imported and packed {len(paths)} fights from report {code}.")
             return {"report_code": code, "packed_count": len(paths), "files": [p.name for p in paths]}
         except Exception as exc:
             harvester_state["last_error"] = str(exc)
+            harvester_state["current_task"] = "Import failed"
+            _append_log(f"ERROR importing {code}: {exc}")
             raise HTTPException(status_code=500, detail=str(exc))
         finally:
             harvester_state["running"] = False
 
     async def _background_harvest_worker(mode: str, pages_per_spec: int) -> None:
-        harvester_state["running"] = True
-        harvester_state["last_error"] = ""
+        should_stop = lambda: not harvester_state["running"]
         try:
             if mode == "mplus_s5":
-                harvester_state["current_task"] = "Scanning Mythic+ Season 5 (7.3.5) rankings..."
-                await harvester.discover_and_enqueue_mplus_s5(pages_per_spec=pages_per_spec)
+                await harvester.discover_and_enqueue_mplus_s5(
+                    pages_per_spec=pages_per_spec,
+                    on_progress=_on_progress,
+                    should_stop=should_stop,
+                    pack_as_discovered=True,
+                )
             elif mode == "raids":
-                harvester_state["current_task"] = "Scanning Legion Raids (All 5) rankings..."
-                await harvester.discover_and_enqueue_raids(pages_per_spec=pages_per_spec)
+                await harvester.discover_and_enqueue_raids(
+                    pages_per_spec=pages_per_spec,
+                    on_progress=_on_progress,
+                    should_stop=should_stop,
+                    pack_as_discovered=True,
+                )
 
             while harvester_state["running"]:
-                harvester_state["current_task"] = "Unarchiving & packing queued fights (.wclz Level 22)..."
-                packed = await harvester.drain_queue_batch(batch_size=25)
+                harvester_state["current_task"] = "Unarchiving & packing remaining queued fights (.wclz Level 22)..."
+                packed = await harvester.drain_queue_batch(
+                    batch_size=25, on_progress=_on_progress, should_stop=should_stop
+                )
                 if packed == 0:
                     break
-                await asyncio.sleep(0.5)
-            harvester_state["current_task"] = "Harvest batch completed"
+                await asyncio.sleep(0.2)
+
+            if harvester_state["running"]:
+                harvester_state["current_task"] = "Harvest completed"
+                harvester_state["progress_pct"] = 100.0
+                _append_log("Harvest completed successfully.")
+            else:
+                harvester_state["current_task"] = "Stopped by user"
+                _append_log("Harvester stopped by user.")
         except Exception as exc:
             harvester_state["last_error"] = str(exc)
-            harvester_state["current_task"] = "Stopped due to error"
+            harvester_state["current_task"] = f"Error: {exc}"
+            _append_log(f"ERROR: {exc}")
         finally:
             harvester_state["running"] = False
 
     @app.post("/api/harvester/start")
-    async def post_start_harvest(req: StartHarvestRequest, bg: BackgroundTasks) -> Dict[str, Any]:
+    async def post_start_harvest(req: StartHarvestRequest) -> Dict[str, Any]:
         if not harvester_state["running"]:
-            bg.add_task(_background_harvest_worker, req.mode, req.pages_per_spec)
+            pages_desc = "ALL pages (0)" if req.pages_per_spec <= 0 else f"{req.pages_per_spec} page(s)/spec"
+            harvester_state["running"] = True
+            harvester_state["last_error"] = ""
+            harvester_state["specs_done"] = 0
+            harvester_state["specs_total"] = 468 if req.mode == "mplus_s5" else 1440
+            harvester_state["pages_scanned"] = 0
+            harvester_state["progress_pct"] = 0.0
+            harvester_state["current_task"] = f"Starting {req.mode} harvest ({pages_desc})..."
+            _append_log(f"Started {req.mode} harvest ({pages_desc}).")
+            asyncio.create_task(_background_harvest_worker(req.mode, req.pages_per_spec))
         return get_harvester_status()
 
     @app.post("/api/harvester/stop")
     def post_stop_harvest() -> Dict[str, Any]:
         harvester_state["running"] = False
-        harvester_state["current_task"] = "Stopping..."
+        harvester_state["current_task"] = "Stopped"
+        _append_log("Stop requested by user.")
         return get_harvester_status()
 
     web_dir = BASE_DIR / "wcl_archiver" / "web"

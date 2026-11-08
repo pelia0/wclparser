@@ -308,3 +308,44 @@ async def test_protocol_client_graphql_fallback_when_web_endpoints_blocked(tmp_p
     events = await client.fetch_all_fight_events("gqlRep123", 3, 1000, 4000)
     assert len(events) == 1
     assert events[0]["abilityGameID"] == 100780
+
+
+@pytest.mark.asyncio
+async def test_discover_mplus_s5_zero_pages_downloads_until_empty_and_reports_progress(tmp_path: Path):
+    def mock_wcl(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v2/client":
+            return httpx.Response(401, text="No OAuth")
+        if path.startswith("/zone/rankings-table/"):
+            page = int(request.url.params.get("page", "1"))
+            if "11458" in path and "DeathKnight/Blood" in path and page <= 2:
+                html = f'<a href="/reports/repPage{page}Abc123#fight={page}">Run {page}</a>'
+                return httpx.Response(200, text=html)
+            return httpx.Response(200, text="<table></table>")
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(mock_wcl)
+    index_db = IndexDB(tmp_path / "index.db")
+    master_db = MasterDictDB(tmp_path / "master.db")
+    auth = WCLAuthManager(tmp_path / "auth.json", transport=transport)
+    auth.save_session_cookies({"wcl_session": "cookie_sub_1"})
+    client = WCLProtocolClient(auth_manager=auth, transport=transport)
+    pipeline = HarvesterPipeline(tmp_path, index_db, master_db, client)
+
+    progress_events = []
+    stops = {"count": 0}
+
+    def should_stop():
+        # Stop after first spec (2 non-empty pages + 1 empty page) to keep test fast
+        return stops["count"] >= 1
+
+    def on_prog(upd):
+        progress_events.append(upd)
+        if upd.get("specs_done", 0) >= 1:
+            stops["count"] = 1
+
+    enqueued = await pipeline.discover_and_enqueue_mplus_s5(
+        pages_per_spec=0, on_progress=on_prog, should_stop=should_stop
+    )
+    assert enqueued == 2
+    assert any("specs_total" in e and e["specs_total"] == 468 for e in progress_events)

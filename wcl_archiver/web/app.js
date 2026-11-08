@@ -32,7 +32,7 @@ async function initApp() {
   await refreshAuthStatus();
   await refreshHarvesterStatus();
   await loadFightsList();
-  setInterval(refreshHarvesterStatus, 3000);
+  setInterval(refreshHarvesterStatus, 1000);
 }
 
 function switchView(viewName) {
@@ -137,39 +137,106 @@ async function submitAuth() {
   }
 }
 
-async function refreshHarvesterStatus() {
+function renderHarvesterState(st) {
+  const errBanner = document.getElementById("harvester-error-banner");
+  if (errBanner) {
+    if (st.last_error) {
+      errBanner.style.display = "block";
+      errBanner.textContent = st.last_error;
+    } else {
+      errBanner.style.display = "none";
+    }
+  }
+
+  const taskLabel = document.getElementById("harvest-task-label");
+  if (taskLabel) taskLabel.textContent = st.current_task || "Idle";
+
+  const pct = Number(st.progress_pct || 0);
+  const pctLabel = document.getElementById("harvest-pct-label");
+  if (pctLabel) {
+    pctLabel.textContent = `${pct.toFixed(1)}% (${st.specs_done || 0} / ${st.specs_total || 0} specs)`;
+  }
+
+  const fill = document.getElementById("harvest-progress-fill");
+  if (fill) {
+    fill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+  }
+
+  const statState = document.getElementById("stat-state");
+  if (statState) {
+    if (st.running) {
+      statState.textContent = "RUNNING";
+      statState.style.color = "#4ade80";
+    } else if (st.last_error) {
+      statState.textContent = "ERROR";
+      statState.style.color = "#f87171";
+    } else {
+      statState.textContent = "IDLE";
+      statState.style.color = "#94a3b8";
+    }
+  }
+
+  const statPages = document.getElementById("stat-pages");
+  if (statPages) statPages.textContent = String(st.pages_scanned || 0);
+
+  const statQueued = document.getElementById("stat-queued");
+  if (statQueued) statQueued.textContent = String(st.queued_fights || 0);
+
+  const statPacked = document.getElementById("stat-packed");
+  if (statPacked) statPacked.textContent = String(st.packed_fights || 0);
+
+  const statSize = document.getElementById("stat-size");
+  if (statSize) statSize.textContent = `${st.compressed_mb || 0} MB`;
+
   const box = document.getElementById("harvester-status-box");
-  if (!box) return;
+  if (box) {
+    const logs = st.recent_logs || [];
+    box.textContent = logs.length > 0 ? logs.slice().reverse().join("\n") : JSON.stringify(st, null, 2);
+  }
+}
+
+async function refreshHarvesterStatus() {
   const res = await fetch("/api/harvester/status");
   const st = await res.json();
-  box.textContent = JSON.stringify(st, null, 2);
+  renderHarvesterState(st);
 }
 
 async function startHarvest(mode) {
-  const pages = Number(document.getElementById("harvest-pages").value || 1);
-  await fetch("/api/harvester/start", {
+  const rawVal = document.getElementById("harvest-pages").value.trim();
+  const pages = rawVal === "" ? 0 : Math.max(0, parseInt(rawVal, 10));
+  const res = await fetch("/api/harvester/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode, pages_per_spec: pages }),
+    body: JSON.stringify({ mode, pages_per_spec: isNaN(pages) ? 0 : pages }),
   });
-  await refreshHarvesterStatus();
+  const st = await res.json();
+  renderHarvesterState(st);
 }
 
 async function stopHarvest() {
-  await fetch("/api/harvester/stop", { method: "POST" });
-  await refreshHarvesterStatus();
+  const res = await fetch("/api/harvester/stop", { method: "POST" });
+  const st = await res.json();
+  renderHarvesterState(st);
 }
 
 async function importSingleReport() {
   const report = document.getElementById("import-report-input").value.trim();
   if (!report) return;
-  await fetch("/api/harvester/import-report", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ report, content_type: "mplus" }),
-  });
-  await refreshHarvesterStatus();
-  await loadFightsList();
+  const btn = document.getElementById("btn-import-report");
+  btn.disabled = true;
+  btn.textContent = "Importing...";
+  try {
+    await fetch("/api/harvester/import-report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report, content_type: "mplus" }),
+    });
+    await refreshHarvesterStatus();
+    await loadFightsList();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Import Single Report Now";
+  }
 }
 
 async function loadFightsList() {

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 from wcl_archiver.codec.wclz_format import WCLZWriter
 from wcl_archiver.config import (
     LEGION_MPLUS_S5_DUNGEONS,
@@ -159,11 +159,45 @@ class HarvesterPipeline:
                 packed_paths.append(p)
         return packed_paths
 
-    async def discover_and_enqueue_mplus_s5(self, pages_per_spec: int = 1) -> int:
+    async def discover_and_enqueue_mplus_s5(
+        self,
+        pages_per_spec: int = 0,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        pack_as_discovered: bool = False,
+    ) -> int:
         enqueued = 0
+        specs_total = len(LEGION_MPLUS_S5_DUNGEONS) * len(LEGION_SPECS)
+        specs_done = 0
+        pages_scanned = 0
+
         for enc_id, slug in LEGION_MPLUS_S5_DUNGEONS.items():
+            dungeon_title = slug.replace("-", " ").title()
             for class_name, spec_name, role in LEGION_SPECS:
-                for page in range(1, pages_per_spec + 1):
+                if should_stop and should_stop():
+                    return enqueued
+
+                page = 1
+                while True:
+                    if should_stop and should_stop():
+                        return enqueued
+                    if pages_per_spec > 0 and page > pages_per_spec:
+                        break
+
+                    if on_progress:
+                        on_progress(
+                            {
+                                "current_task": (
+                                    f"[M+ S5] {dungeon_title} — {class_name} ({spec_name}) | "
+                                    f"Page {page}{'/' + str(pages_per_spec) if pages_per_spec > 0 else ' (ALL)'}"
+                                ),
+                                "specs_done": specs_done,
+                                "specs_total": specs_total,
+                                "pages_scanned": pages_scanned,
+                                "log": f"Scanning {dungeon_title} | {class_name} {spec_name} (Page {page})...",
+                            }
+                        )
+
                     refs = await self.client.fetch_rankings_fight_refs(
                         zone_id=LEGION_MPLUS_ZONE_ID,
                         encounter_id=enc_id,
@@ -172,6 +206,19 @@ class HarvesterPipeline:
                         spec_name=spec_name,
                         page=page,
                     )
+                    pages_scanned += 1
+
+                    if not refs:
+                        if on_progress and page == 1:
+                            on_progress(
+                                {
+                                    "pages_scanned": pages_scanned,
+                                    "log": f"No rankings returned for {dungeon_title} | {class_name} {spec_name}.",
+                                }
+                            )
+                        break
+
+                    page_enqueued = 0
                     for r in refs:
                         rep = r.get("report") or {}
                         code = rep.get("code") or r.get("reportID")
@@ -198,15 +245,78 @@ class HarvesterPipeline:
                         )
                         if inserted:
                             enqueued += 1
+                            page_enqueued += 1
+
+                    if on_progress:
+                        on_progress(
+                            {
+                                "pages_scanned": pages_scanned,
+                                "log": (
+                                    f"Found {len(refs)} runs on page {page} for {dungeon_title} "
+                                    f"({class_name} {spec_name}) -> +{page_enqueued} new fights queued."
+                                ),
+                            }
+                        )
+
+                    if pack_as_discovered and page_enqueued > 0:
+                        await self.drain_queue_batch(
+                            batch_size=5, on_progress=on_progress, should_stop=should_stop
+                        )
+
+                    page += 1
+
+                specs_done += 1
+                if on_progress:
+                    on_progress({"specs_done": specs_done, "specs_total": specs_total})
+
         return enqueued
 
-    async def discover_and_enqueue_raids(self, pages_per_spec: int = 1) -> int:
+    async def discover_and_enqueue_raids(
+        self,
+        pages_per_spec: int = 0,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        pack_as_discovered: bool = False,
+    ) -> int:
         enqueued = 0
+        total_boss_partitions = sum(
+            len(r.get("partitions", [1])) * len(r.get("bosses", {}))
+            for r in LEGION_RAIDS.values()
+        )
+        specs_total = total_boss_partitions * len(LEGION_SPECS)
+        specs_done = 0
+        pages_scanned = 0
+
         for zone_id, raid_info in LEGION_RAIDS.items():
+            raid_name = raid_info.get("name", f"Zone {zone_id}")
             for partition in raid_info.get("partitions", [1]):
                 for boss_id, boss_slug in raid_info.get("bosses", {}).items():
+                    boss_title = boss_slug.replace("-", " ").title()
                     for class_name, spec_name, role in LEGION_SPECS:
-                        for page in range(1, pages_per_spec + 1):
+                        if should_stop and should_stop():
+                            return enqueued
+
+                        page = 1
+                        while True:
+                            if should_stop and should_stop():
+                                return enqueued
+                            if pages_per_spec > 0 and page > pages_per_spec:
+                                break
+
+                            if on_progress:
+                                on_progress(
+                                    {
+                                        "current_task": (
+                                            f"[{raid_name}] {boss_title} — {class_name} ({spec_name}) | "
+                                            f"Page {page}{'/' + str(pages_per_spec) if pages_per_spec > 0 else ' (ALL)'}"
+                                        ),
+                                        "specs_done": specs_done,
+                                        "specs_total": specs_total,
+                                        "pages_scanned": pages_scanned,
+                                        "log": f"Scanning {raid_name}: {boss_title} | {class_name} {spec_name} (Page {page})...",
+                                    }
+                                )
+
                             refs = await self.client.fetch_rankings_fight_refs(
                                 zone_id=zone_id,
                                 encounter_id=boss_id,
@@ -215,6 +325,12 @@ class HarvesterPipeline:
                                 spec_name=spec_name,
                                 page=page,
                             )
+                            pages_scanned += 1
+
+                            if not refs:
+                                break
+
+                            page_enqueued = 0
                             for r in refs:
                                 rep = r.get("report") or {}
                                 code = rep.get("code") or r.get("reportID")
@@ -240,16 +356,71 @@ class HarvesterPipeline:
                                 )
                                 if inserted:
                                     enqueued += 1
+                                    page_enqueued += 1
+
+                            if on_progress:
+                                on_progress(
+                                    {
+                                        "pages_scanned": pages_scanned,
+                                        "log": (
+                                            f"Found {len(refs)} runs on page {page} for {boss_title} "
+                                            f"({class_name} {spec_name}) -> +{page_enqueued} new fights queued."
+                                        ),
+                                    }
+                                )
+
+                            if pack_as_discovered and page_enqueued > 0:
+                                await self.drain_queue_batch(
+                                    batch_size=5, on_progress=on_progress, should_stop=should_stop
+                                )
+
+                            page += 1
+
+                        specs_done += 1
+                        if on_progress:
+                            on_progress({"specs_done": specs_done, "specs_total": specs_total})
+
         return enqueued
 
-    async def drain_queue_batch(self, batch_size: int = 25) -> int:
+    async def drain_queue_batch(
+        self,
+        batch_size: int = 25,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> int:
+        if should_stop and should_stop():
+            return 0
         await self.warm_unarchive_batch(limit=batch_size)
         pending = self.index_db.get_unarchived_pending_fights(limit=batch_size)
         packed = 0
         for row in pending:
+            if should_stop and should_stop():
+                break
             try:
-                await self.process_single_fight(row)
+                if on_progress:
+                    on_progress(
+                        {
+                            "current_task": (
+                                f"Downloading & packing {row['encounter_slug']} "
+                                f"(Report {row['report_code']} #{row['fight_id']})..."
+                            )
+                        }
+                    )
+                out_file = await self.process_single_fight(row)
                 packed += 1
-            except Exception:
+                if on_progress:
+                    kb = out_file.stat().st_size / 1024.0 if out_file.exists() else 0.0
+                    on_progress(
+                        {
+                            "log": f"Packed {out_file.name} ({kb:.1f} KB, Zstd L22)",
+                        }
+                    )
+            except Exception as exc:
+                if on_progress:
+                    on_progress(
+                        {
+                            "log": f"Skipped fight {row['report_code']}#{row['fight_id']}: {exc}",
+                        }
+                    )
                 continue
         return packed

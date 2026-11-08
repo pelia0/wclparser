@@ -29,3 +29,4 @@ Self-contained WarcraftLogs bulk harvester, columnar `Zstd Level 22` single-figh
    - Filter by Dungeon/Boss, Specialization, or Minimum Key Level.
    - Click **Open Fight** to read only that single fight's `.wclz` file in RAM (~10 ms) without unpacking any other files.
    - Inspect **Damage Done**, **Healing Done**, **Casts & Rotation Timeline**, **Buffs & Uptimes**, **Builds & Talents**, **Interrupts & Deaths**, and **2D Map Replay (60 FPS)**.
+

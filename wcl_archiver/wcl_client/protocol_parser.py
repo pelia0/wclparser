@@ -1,6 +1,11 @@
+import re
 from typing import Any, Dict, List, Optional
 import httpx
 from wcl_archiver.wcl_client.auth import WCLAuthManager
+
+WEB_REPORT_FIGHT_RE = re.compile(
+    r"/reports/([A-Za-z0-9]{10,20})(?:#|\?[^\"']*?)fight=(\d+)"
+)
 
 
 class WCLProtocolClient:
@@ -217,35 +222,101 @@ class WCLProtocolClient:
         spec_name: str = "Any",
         page: int = 1,
     ) -> List[Dict[str, Any]]:
-        query = """
-        query($encounterId: Int!, $page: Int!, $partition: Int!, $className: String, $specName: String) {
-          worldData {
-            encounter(id: $encounterId) {
-              fightRankings(page: $page, partition: $partition, className: $className, specName: $specName)
+        if class_name and class_name != "Any":
+            query = """
+            query($encounterId: Int!, $page: Int!, $partition: Int!, $className: String, $specName: String) {
+              worldData {
+                encounter(id: $encounterId) {
+                  characterRankings(page: $page, partition: $partition, className: $className, specName: $specName)
+                }
+              }
             }
-          }
-        }
-        """
+            """
+            variables: Dict[str, Any] = {
+                "encounterId": encounter_id,
+                "page": page,
+                "partition": partition,
+                "className": class_name,
+                "specName": spec_name,
+            }
+        else:
+            query = """
+            query($encounterId: Int!, $page: Int!, $partition: Int!) {
+              worldData {
+                encounter(id: $encounterId) {
+                  fightRankings(page: $page, partition: $partition)
+                }
+              }
+            }
+            """
+            variables = {
+                "encounterId": encounter_id,
+                "page": page,
+                "partition": partition,
+            }
+
         async with self._make_client() as client:
             resp = await client.post(
                 "/api/v2/client",
-                json={
-                    "query": query,
-                    "variables": {
-                        "encounterId": encounter_id,
-                        "page": page,
-                        "partition": partition,
-                        "className": class_name,
-                        "specName": spec_name,
-                    },
-                },
+                json={"query": query, "variables": variables},
             )
+            if resp.status_code in (401, 403):
+                auth_st = self.auth_manager.get_auth_status()
+                if auth_st.get("has_session_cookie") and not auth_st.get("has_oauth_token"):
+                    web_refs = await self._fetch_rankings_web_table_fallback(
+                        client, zone_id, encounter_id, partition, class_name, spec_name, page
+                    )
+                    if web_refs is not None:
+                        return web_refs
+                raise RuntimeError(
+                    f"WarcraftLogs API v2 rejected the rankings request (HTTP {resp.status_code}). "
+                    "To scan rankings, please provide a valid API v2 Client ID and Client Secret "
+                    "(create free in 10 seconds at https://www.warcraftlogs.com/api/clients) "
+                    "in Section 1 above and click 'Sign In & Save Session'."
+                )
             if resp.status_code != 200:
                 return []
             payload = resp.json()
+            if payload.get("errors") and not payload.get("data"):
+                err_msg = payload["errors"][0].get("message", "Unknown GraphQL error")
+                raise RuntimeError(f"WarcraftLogs API v2 GraphQL error: {err_msg}")
             data = payload.get("data") or {}
             world_data = data.get("worldData") or {}
             encounter = world_data.get("encounter") or {}
-            fight_rankings = encounter.get("fightRankings") or {}
+            fight_rankings = (
+                encounter.get("characterRankings")
+                or encounter.get("fightRankings")
+                or {}
+            )
             rankings = fight_rankings.get("rankings") or []
             return rankings
+
+    async def _fetch_rankings_web_table_fallback(
+        self,
+        client: httpx.AsyncClient,
+        zone_id: int,
+        encounter_id: int,
+        partition: int,
+        class_name: str,
+        spec_name: str,
+        page: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        metric = "leaderboards" if zone_id == 9 else "dps"
+        diff = 0 if zone_id == 9 else 5
+        url = (
+            f"/zone/rankings-table/{zone_id}/{metric}/0/{diff}/0/{encounter_id}"
+            f"/0/{partition}/{class_name}/{spec_name}/0/0/0/?page={page}&search="
+        )
+        web_resp = await client.get(url)
+        if web_resp.status_code in (401, 403) or "just a moment" in web_resp.text.lower():
+            return None
+        if web_resp.status_code != 200:
+            return []
+        refs: List[Dict[str, Any]] = []
+        seen = set()
+        for code, fid in WEB_REPORT_FIGHT_RE.findall(web_resp.text):
+            key = (code, int(fid))
+            if key not in seen:
+                seen.add(key)
+                refs.append({"report": {"code": code, "fightID": int(fid)}})
+        return refs
