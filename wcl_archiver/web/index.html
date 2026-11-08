@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>WCL Legion 7.3.5 Archiver &amp; Offline Viewer</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">WCL Legion 7.3.5 Archiver &amp; Viewer</div>
+    <nav class="main-nav">
+      <button class="nav-btn active" data-view="explorer">Log Explorer</button>
+      <button class="nav-btn" data-view="fight" id="nav-fight-btn" disabled>Fight Analyzer</button>
+      <button class="nav-btn" data-view="auth">Account &amp; Harvester</button>
+    </nav>
+    <div id="auth-badge" class="badge badge-warn">Session: Checking...</div>
+  </header>
+
+  <main class="container">
+    <!-- VIEW 1: EXPLORER -->
+    <section id="view-explorer" class="view active">
+      <div class="filter-bar">
+        <select id="filter-content-type">
+          <option value="mplus">Mythic+ Season 5 (7.3.5)</option>
+          <option value="raid">Legion Raids (All 5)</option>
+        </select>
+        <select id="filter-encounter"><option value="">All Dungeons / Bosses</option></select>
+        <select id="filter-spec"><option value="">All Specializations (36)</option></select>
+        <input type="number" id="filter-min-key" placeholder="Min Key (+20)" min="2" max="35" />
+        <button id="btn-search" class="btn-primary">Search Logs</button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Dungeon / Boss</th>
+            <th>Key / Difficulty</th>
+            <th>Duration</th>
+            <th>Participants</th>
+            <th>File Size (.wclz)</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="fights-tbody"></tbody>
+      </table>
+    </section>
+
+    <!-- VIEW 2: SINGLE FIGHT ANALYZER -->
+    <section id="view-fight" class="view">
+      <div class="fight-header" id="fight-header-info">Select a fight from the Explorer</div>
+      <div class="sub-tabs">
+        <button class="tab-btn active" data-tab="damage">Damage Done</button>
+        <button class="tab-btn" data-tab="healing">Healing Done</button>
+        <button class="tab-btn" data-tab="casts">Casts &amp; Rotation Timeline</button>
+        <button class="tab-btn" data-tab="buffs">Buffs &amp; Uptimes</button>
+        <button class="tab-btn" data-tab="builds">Builds &amp; Talents</button>
+        <button class="tab-btn" data-tab="deaths">Interrupts &amp; Deaths</button>
+        <button class="tab-btn" data-tab="replay2d">2D Map Replay (60 FPS)</button>
+      </div>
+      <div id="tab-content-area" class="tab-content"></div>
+      <div id="replay-container" class="replay-box hidden">
+        <div class="replay-controls">
+          <button id="replay-play" class="btn-primary">Play / Pause</button>
+          <input type="range" id="replay-scrubber" min="0" max="1000" value="0" />
+          <span id="replay-time-label">00:00.0</span>
+          <select id="replay-speed">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+        </div>
+        <canvas id="replay-canvas" width="1100" height="620"></canvas>
+      </div>
+    </section>
+
+    <!-- VIEW 3: AUTH & HARVESTER -->
+    <section id="view-auth" class="view">
+      <div class="card">
+        <h2>WarcraftLogs Subscriber Account Setup</h2>
+        <div class="form-grid">
+          <label>WCL Email: <input type="email" id="auth-email" placeholder="you@example.com" /></label>
+          <label>WCL Password: <input type="password" id="auth-password" placeholder="••••••••" /></label>
+          <label>API v2 Client ID (Optional): <input type="text" id="auth-client-id" /></label>
+          <label>API v2 Client Secret (Optional): <input type="password" id="auth-client-secret" /></label>
+          <label>Or Direct wcl_session Cookie: <input type="text" id="auth-cookie" /></label>
+        </div>
+        <button id="btn-save-auth" class="btn-primary">Sign In &amp; Save Session</button>
+        <pre id="auth-status-box"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script src="/replay2d.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

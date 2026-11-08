@@ -146,3 +146,13 @@ def test_viewer_api_mounts_static_web_dir(tmp_path: Path, monkeypatch):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "WCL Viewer" in resp.text
+
+
+def test_web_ui_root_serves_english_html(tmp_path: Path):
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app)
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "WCL Legion 7.3.5 Archiver" in resp.text
+    assert "Log Explorer" in resp.text
+

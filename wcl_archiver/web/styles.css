@@ -1,0 +1,72 @@
+:root {
+  --bg: #0f141c;
+  --panel: #18202c;
+  --border: #2a364b;
+  --accent: #3b82f6;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; font-size: 18px; color: #60a5fa; }
+.main-nav { display: flex; gap: 8px; }
+.nav-btn, .tab-btn, .btn-primary {
+  background: #243044;
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.nav-btn.active, .tab-btn.active, .btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.container { padding: 20px 24px; }
+.view { display: none; }
+.view.active { display: block; }
+.filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+select, input {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+}
+.data-table th, .data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.sub-tabs { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
+.card { background: var(--panel); padding: 20px; border-radius: 8px; border: 1px solid var(--border); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+.form-grid label { display: flex; flex-direction: column; gap: 6px; }
+.hidden { display: none !important; }
+#replay-canvas {
+  background: #090d12;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 10px;
+}
+.replay-controls { display: flex; align-items: center; gap: 12px; }
+#replay-scrubber { flex: 1; }
