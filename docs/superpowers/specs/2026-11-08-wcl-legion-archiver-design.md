@@ -110,30 +110,72 @@ D:\wowlogsparser\
 
 ---
 
-## 3. Модуль збору та авто-розморожування (`Harvester & Auto-Unarchiver`)
+## 3. Ядро Парсера (`WCL Protocol Parser` + `Combat Log State Machine`)
 
-### 3.1. Побудова черги та дедуплікація (`Discovery Engine`)
-1. **Сканер рейтингів (Rankings Scanner):**
-   - Для **M+ Сезону 5 (Zone 9, Partition 5)**: обходить сторінки рейтингів по кожному з 13 підземель (загальний топ ключів + топ по кожному з 36 спеків).
-   - Для **5 Рейдів Легіону (Zones 10, 11, 12, 13, 17)**: обходить рейтинги по кожному босу (Mythic та Heroic) по всіх 36 спеках (виключаючи партиції препатчу BfA).
-2. **Глобальна дедуплікація `(report_code, fight_id)`:**
-   - Усі знайдені посилання нормалізуються до унікальної пари `(report_code, fight_id)` у таблиці `fights_queue` в `index.db`.
-   - Якщо один бій фігурує в рейтингах 5 гравців M+ групи (або 20 гравців рейду), він завантажується **рівно 1 раз**, а в `index.db` прив'язуються всі учасники та їхні спеки.
+Парсер є центральним компонентом `D:\wowlogsparser` і складається з двох рівнів: **Мережевого парсера протоколів WCL** (який витягує сирі структури зі сторінок, внутрішніх JSON-ендпоінтів та GraphQL v2) та **Бойового парсера подій (Combat State Machine)** (який перетворює сирі атомарні події на структуровані таймлайни, пули, інтервали бафів, ротації та 2D-траєкторії).
 
-### 3.2. Конвеєр без очікування архіву (`Zero-Wait Pipeline`)
-Оскільки логи Легіону на WCL знаходяться в архівному стані, робота розділена на 3 асинхронні пули:
-1. **Unarchive Warmer (Пул розморожування):**
-   - Тримає буфер на 25–40 звітів попереду черги завантаження.
-   - Використовує авторизовану сесію підписки WCL (`cookie` / `XSRF-TOKEN`) для виклику ендпоінту розморожування звіту і перевіряє готовність звіту кожні 2–3 секунди.
-2. **Fight Downloader (Пул вивантаження подій):**
-   - Бере звіти зі статусом `UNARCHIVED` (без жодної секунди очікування).
-   - За один прохід по звіту забирає всі потрібні `fight_id` з цього звіту:
-     - `fights-and-participants` / `masterData` (актори, спели, фази, час бою),
-     - `combatantInfo` (таланти, екіпірування, артефакти),
-     - сторінки `events` (від `start_time` до `end_time` з `includeResources=true` та координатами).
-   - Має вбудований **Rate-Limit Governor**: відстежує залишок квоти WCL API / HTTP-статуси `429` і автоматично регулює паралельність.
-3. **Columnar Packer (Пул пакування):**
-   - Передає сирі події бою у фоновий процес стиснення (`ProcessPoolExecutor`), який формує `.wclz` файл, записує його через атомарний `.tmp` -> `.wclz` перейменування і виставляє статус `PACKED` у `index.db`.
+### 3.1. Рівень 1: Парсер WarcraftLogs (Web / Internal JSON / GraphQL v2)
+
+Оскільки публічний GraphQL API v2 має жорсткий ліміт (`3600 поінтів/год`), чого недостатньо для швидкого дампу всього сезону, парсер комбінує GraphQL v2 та внутрішні JSON-ендпоінти веб-клієнта WCL через авторизовану сесію підписки:
+
+1. **Парсер рейтингів і матриці лідербордів (`Rankings & Leaderboard Parser`):**
+   - Обходить таблиці лідербордів для **M+ Сезону 5 (`zone=9, partition=5`)** по кожному з 13 підземель (загальний ладдер ключів + окремо по кожному з 36 спеків) та для **5 Рейдів Легіону (`zones=10, 11, 12, 13, 17`)** по кожному босу (`difficulty=5` Mythic та `difficulty=4` Heroic) по всіх 36 спеках (ігноруючи партиції препатчу BfA 8.0).
+   - Витягує та дедуплікує в `index.db` унікальні пари `(report_code, fight_id)`, зберігаючи метадані з лідерборду: рівень ключа (`keystoneLevel`), набір афіксів (`affixes[]`), час проходження (`duration`), склад групи та посилання на звіт.
+
+2. **Менеджер авто-розморожування архівних логів (`Unarchive Protocol Handler`):**
+   - Визначає статус звіту (`archived: true`).
+   - Використовує cookies підписки (`wcl_session`, `XSRF-TOKEN`) для автоматичного надсилання запиту `POST /reports/unarchive/{report_code}` у фоновому буфері на 25–40 звітів наперед.
+   - Опитує готовність звіту кожні 2–3 секунди і передає розморожений `report_code` у парсер подій без жодного простою.
+
+3. **Парсер структури звіту та учасників (`MasterData & Fights Parser`):**
+   - Парсить метадані звіту (`/reports/fights-and-participants/{code}/0` або GraphQL `reportData.report`):
+     - Розбирає список усіх боїв звіту (`fights[]`: `id`, `start_time`, `end_time`, `boss`, `name`, `difficulty`, `kill`, `keystoneLevel`, `affixes`, `maps[]`, `phases[]`, `dungeonPulls[]`).
+     - Будує дерево акторів (`friendlies[]`, `enemies[]`, `friendlyPets[]`, `enemyPets[]`) та прив'язує кожного пета/самона (`petOwner`) до його власника-гравця чи боса.
+     - Парсить таблицю здібностей (`abilities[]`: `gameID`, `name`, `type`/школа магії, `icon`) і доповнює глобальний довідник `master_dict.db`.
+
+4. **Парсер потоків сирих подій (`Paginated Raw Event Stream Parser`):**
+   - Ітерує по часових вікнах бою від `start_time` до `end_time` через курсор `nextPageTimestamp` (з параметрами `includeResources=true`, `translate=true`), доки всі 100% подій бою не будуть вивантажені в пам'ять.
+   - Нормалізує всі типи подій WCL:
+     - `combatantinfo` (стартові аури, таланти `[[tier, col, spellID]]`, екіпірування `[slot, itemID, ilvl, bonusIDs, gems, permanentEnchant]`, трейти артефакту `[[spellID, rank]]`, реліквії, базові стати: Str/Agi/Int/Stam, Crit/Haste/Mastery/Vers/Leech/Avoidance/Armor),
+     - `begincast`, `cast`, `interrupt`, `dispel`, `steal`,
+     - `damage`, `heal`, `absorbed`, `damage-split`,
+     - `applybuff`, `applybuffstack`, `refreshbuff`, `removebuff`, `removebuffstack`,
+     - `applydebuff`, `applydebuffstack`, `refreshdebuff`, `removedebuff`, `removedebuffstack`,
+     - `resourcechange`, `energize`, `drain`, `leech`,
+     - `summon`, `create`, `instakill`, `death`, `resurrect`, `aurabroken`,
+     - `encounterstart`, `encounterend`, `dungeonpull`, `mapchange`, `worldmarkerplaced`, `worldmarkerremoved`.
+
+---
+
+### 3.2. Рівень 2: Бойовий парсер-аналізатор (`Combat Event State Machine`)
+
+Сирі події з WCL — це лише плоский потік повідомлень. Перед пакуванням у `.wclz` бойовий парсер проганяє всі події бою через **скінченний автомат станів (State Machine)** за один лінійний прохід $O(N)$ і виконує 6 ключових перетворень:
+
+1. **Резолвінг власників петів та гвардіанів (`Pet & Guardian Attribution`):**
+   - Автоматично прив'язує динамічно викликаних юнітів (клон *Storm, Earth, and Fire*, *Invoke Xuen*, *Doomguard*, *Infernal*, *Dreadstalkers*, *Water Elemental*, тотеми, пастки тощо) через події `summon` та таблицю `friendlyPets` до гравця-власника.
+   - Зберігає як власне ID пета (щоб бачити його окремо на 2D-карті), так і `owner_idx` (щоб його урон/касти коректно плюсувалися в таблицю Damage Done власника).
+
+2. **Реконструкція інтервалів бафів і дебафів (`Aura Interval State Machine`):**
+   - Поєднує стартові аури з `combatantinfo` та події `apply*` / `refresh*` / `apply*stack` / `remove*` у точні часові відрізки `[start_ms, end_ms, stacks, ability_id, source_id, target_id]`.
+   - Автоматично закриває активні аури у момент `death` юніта або `fight_end`, коректно рахуючи Uptime (%) та зберігаючи стан активних бафів гравця в кожну мілісекунду бою (щоб на таймлайні ротації було видно, які бафи/проки висіли в момент кожного касту).
+
+3. **Реконструкція життєвого циклу кастів, ченнелів та GCD (`Cast & Channel Tracker`):**
+   - Зв'язує `begincast` із парним `cast` (успішне завершення), `interrupt` (збиття касту) або передчасним скасуванням (рух/стоп-каст).
+   - Визначає підтримувані закляття (Channels: *Fists of Fury*, *Drain Soul*, *Mind Flay*, *Arcane Missiles*, *Eye Beam* тощо) за тіками періодичного урону/хілу та наступним кастом, фіксуючи точну тривалість ченнелу та факти кліпінгу (раннього переривання іншим спелом).
+
+4. **Точний підрахунок Damage / Healing / Absorbs / Overkill:**
+   - Розділяє чистий ефективний урон (`amount`), оверкіл (`overkill`), поглинений урон (`absorbed`) та необрізаний урон (`unmitigatedAmount`).
+   - Атрибутує події `absorbed` конкретному щиту хілера/танка (*Power Word: Shield*, *Life Cocoon*, *Ignore Pain* тощо) для точного розрахунку HPS.
+   - Відділяє урон у пріоритетну ціль (Boss / Priority Target Damage) від кліву та паддінгу.
+
+5. **Сегментація M+ забігу на пули та фази (`Pull & Phase Segmenter`):**
+   - Для Mythic+ автоматично розбиває весь ключ на окремі пули (`Pull #1`, `Pull #2`, ..., `Boss: Helya`) за подіями входу мобів у бій, `dungeonPulls` та паузами між паками.
+   - Для кожного паку визначає склад мобів (уключно з `targetInstance` для однакових мобів у паку), час пулу та координати центру паку.
+   - Для кожної смерті гравця (`death`) формує зріз останніх 15 секунд перед смертю (вхідні удари, отриманий хіл, активні дефенсиви та доступні сейви, які гравець не натиснув).
+
+6. **Побудова потоку позицій, здоров'я та ресурсів (`Spatial & Resource Trajectory Builder`):**
+   - Витягує з усіх подій семпли `(timestamp, actor_id, instance_id, x, y, facing, hp, max_hp, classResources[])`.
+   - Відсікає дублікати нерухомих координат (коли `dx == 0` і `dy == 0`), будує дельта-потік для 2D-реплею (Секція 3 файлу `.wclz`) та криві ресурсів (Energy, Chi, Mana, Insanity, Maelstrom, Fury, Rage, Runic Power, Astral Power, Holy Power, Combo Points, Soul Shards).
 
 ---
 
@@ -183,3 +225,4 @@ D:\wowlogsparser\
    - **Round-trip тест кодека `.wclz`:** перевіряє, що після стиснення сирого бою у `.wclz` і зворотного декодування всі 100% подій (`timestamp`, `type`, `source`, `target`, `ability`, `amount`, `x`, `y`, `resources`) збігаються біт-у-біт, а читання одного бою не звертається до жодного іншого файлу.
    - **Тест дедуплікації та парсера черги:** перевіряє, що дублікати `(report_code, fight_id)` з різних спеків не завантажуються повторно.
    - **Тест API перегляду:** перевіряє швидкість читання окремих секцій `.wclz` (< 50 мс) та коректність побудови таблиць Damage/Healing/Casts/Replay.
+
