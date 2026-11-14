@@ -10,6 +10,9 @@ class CombatStateMachine:
         actors: List[Dict[str, Any]],
         abilities: List[Dict[str, Any]],
         raw_events: List[Dict[str, Any]],
+        *,
+        include_normalized_events: bool = True,
+        include_replay_frames: bool = True,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
         start_time = int(fight_meta.get("start_time", 0))
         end_time = int(fight_meta.get("end_time", start_time + 1))
@@ -199,7 +202,7 @@ class CombatStateMachine:
                     }
                 )
 
-            if ev.get("x") is not None and ev.get("y") is not None and src_id:
+            if include_replay_frames and ev.get("x") is not None and ev.get("y") is not None and src_id:
                 x_val = int(ev["x"])
                 y_val = int(ev["y"])
                 raw_hp = ev.get("hitPoints")
@@ -213,31 +216,32 @@ class CombatStateMachine:
                         {"t": rel_t, "actor": src_id, "x": x_val, "y": y_val, "hp_pct": hp_pct}
                     )
 
-            res_list = ev.get("classResources") or []
-            res0 = res_list[0] if res_list else {}
-            normalized_events.append(
-                {
-                    "timestamp": rel_t,
-                    "type": ev_type,
-                    "sourceID": src_id,
-                    "targetID": tgt_id,
-                    "targetInstance": int(ev.get("targetInstance", 0) or 0),
-                    "abilityGameID": ability_id,
-                    "hitType": int(ev.get("hitType", 0) or 0),
-                    "amount": int(ev.get("amount", 0) or 0),
-                    "unmitigatedAmount": int(ev.get("unmitigatedAmount", 0) or 0),
-                    "absorbed": int(ev.get("absorbed", 0) or 0),
-                    "overkill": int(ev.get("overkill", 0) or 0),
-                    "hitPoints": int(ev.get("hitPoints", 0) or 0),
-                    "maxHitPoints": int(ev.get("maxHitPoints", 0) or 0),
-                    "resourceType": int(res0.get("type", 0) or 0),
-                    "resourceAmount": int(res0.get("amount", 0) or 0),
-                    "resourceMax": int(res0.get("max", 0) or 0),
-                    "x": int(ev.get("x", 0) or 0),
-                    "y": int(ev.get("y", 0) or 0),
-                    "facing": int(ev.get("facing", 0) or 0),
-                }
-            )
+            if include_normalized_events:
+                res_list = ev.get("classResources") or []
+                res0 = res_list[0] if res_list else {}
+                normalized_events.append(
+                    {
+                        "timestamp": rel_t,
+                        "type": ev_type,
+                        "sourceID": src_id,
+                        "targetID": tgt_id,
+                        "targetInstance": int(ev.get("targetInstance", 0) or 0),
+                        "abilityGameID": ability_id,
+                        "hitType": int(ev.get("hitType", 0) or 0),
+                        "amount": int(ev.get("amount", 0) or 0),
+                        "unmitigatedAmount": int(ev.get("unmitigatedAmount", 0) or 0),
+                        "absorbed": int(ev.get("absorbed", 0) or 0),
+                        "overkill": int(ev.get("overkill", 0) or 0),
+                        "hitPoints": int(ev.get("hitPoints", 0) or 0),
+                        "maxHitPoints": int(ev.get("maxHitPoints", 0) or 0),
+                        "resourceType": int(res0.get("type", 0) or 0),
+                        "resourceAmount": int(res0.get("amount", 0) or 0),
+                        "resourceMax": int(res0.get("max", 0) or 0),
+                        "x": int(ev.get("x", 0) or 0),
+                        "y": int(ev.get("y", 0) or 0),
+                        "facing": int(ev.get("facing", 0) or 0),
+                    }
+                )
 
         for tgt_id, ab_dict in active_buffs.items():
             for ab_id, st in ab_dict.items():

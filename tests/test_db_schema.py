@@ -206,3 +206,22 @@ def test_discovery_failures_persist_until_matching_page_succeeds(tmp_path):
         assert conn.execute("SELECT failure_count FROM scan_failures").fetchone()[0] == 6
     db.mark_page_scanned(**key, refs_found=0, is_exhausted=True)
     assert db.get_queue_counts()["failed_scan_pages"] == 0
+
+
+def test_terminal_scan_clears_only_superseded_failures_and_preserves_history(tmp_path):
+    db = IndexDB(tmp_path / "index.db")
+    scope = dict(zone_id=17, encounter_id=2092, partition=1, class_name="Monk",
+                 spec_name="Windwalker", difficulty=5)
+    for page in (1, 2, 3):
+        db.mark_page_failed(**scope, page=page, reason="old scan failure")
+    db.mark_page_failed(**{**scope, "difficulty":4}, page=3, reason="other scope")
+    db.mark_page_scanned(**scope, page=4, refs_found=70)
+    _enqueue(db)
+    db.mark_page_scanned(**scope, page=2, refs_found=12, is_exhausted=True)
+    assert db.get_queue_counts()["failed_scan_pages"] == 2
+    assert db.is_page_scanned(**scope, page=4)
+    assert len(db.search_fights()) == 1
+    assert db.get_exhausted_page(**scope) == 2
+    with db._connect() as conn:
+        failures = {(row["difficulty"],row["page"]) for row in conn.execute("SELECT * FROM scan_failures")}
+    assert failures == {(5,1),(4,3)}

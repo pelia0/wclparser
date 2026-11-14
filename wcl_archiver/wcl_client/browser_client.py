@@ -16,6 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Coroutine, Dict, List, Optional, TypeVar
+from wcl_archiver.wcl_client.rankings import REPORT_LINK_RE, RankingsDocument, RankingsPage
 
 T = TypeVar("T")
 
@@ -26,7 +27,6 @@ RANKINGS_URL_TEMPLATE = (
     "?boss={encounter}&class={class_name}&spec={spec_name}&partition={partition}&page={page}"
 )
 RANKINGS_ROW_SELECTOR = "table.rankings-table tbody tr, table.summary-table tbody tr"
-REPORT_LINK_RE = re.compile(r"/reports/([A-Za-z0-9]{10,20})(?:#|\?[^\"']*?)fight=(\d+)")
 ROW_TR_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
 PLAYER_NAME_RE = re.compile(
     r'<a\b[^>]*class="[^"]*main-table-player[^"]*"[^>]*>\s*([^<]+?)\s*</a>',
@@ -76,15 +76,7 @@ def assert_valid_rankings_page(html: str) -> None:
     """Reject failure/loading pages before an empty result can exhaust a scan."""
     if is_rate_limit_page(html):
         raise RateLimitError()
-    clean = _visible_rankings_html(html)
-    for attrs in re.findall(r"<table\b([^>]*)>", clean, re.IGNORECASE):
-        classes = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.IGNORECASE)
-        if classes and set(classes.group(2).lower().split()) & {"rankings-table", "ranking-table", "summary-table"}:
-            return
-    visible = unescape(STRIP_TAGS_RE.sub(" ", clean))
-    if re.search(r"\bno (?:rankings|results|data) (?:found|available)(?:\b|\.)", visible, re.IGNORECASE):
-        return
-    raise RuntimeError("Rankings table did not load or page is not a valid rankings result")
+    RankingsDocument(html).assert_valid()
 
 
 def is_challenge_page(title: str, url: str, html: str) -> bool:
@@ -193,6 +185,16 @@ def parse_rankings_html(html: str) -> List[Dict[str, Any]]:
                 )
 
     return results
+
+
+def parse_rankings_page(html: str, current_page: int = 1) -> RankingsPage:
+    """Validate rendered output and retain raw row count plus paginator state."""
+    if is_rate_limit_page(html):
+        raise RateLimitError()
+    document = RankingsDocument(html)
+    document.assert_valid()
+    refs = parse_rankings_html(document.tables[0].html()) if document.tables else []
+    return RankingsPage(refs, row_count=document.row_count, has_next=document.has_next(current_page))
 
 
 def _find_system_browser_exe() -> Optional[str]:
@@ -663,17 +665,17 @@ class BrowserClient:
         self._emit_status("rate_limited", f"WCL rate limit; pausing requests for {delay:.2f}s")
         return delay
 
-    async def _capture_and_validate_rankings(self, page, url):
+    async def _capture_and_validate_rankings(self, page, url, current_page=1):
         _, _, html = await self._read_page_snapshot(page)
         if self.raw_archive is not None:
             self.raw_archive.capture('GET', url, html.encode('utf-8'), source='rendered_html')
         try:
-            assert_valid_rankings_page(html)
+            refs = parse_rankings_page(html, current_page)
         except RateLimitError as exc:
             exc.retry_after = self._record_rate_limit()
             raise
         self._rate_limit_streak = 0
-        return html
+        return refs
 
     async def _goto_page_resilient(
         self,
@@ -827,12 +829,12 @@ class BrowserClient:
                 except Exception:
                     await self._wait_if_challenge(tab)
                     await self._wait_if_logged_out(tab)
-                html = await self._capture_and_validate_rankings(tab, url)
+                refs = await self._capture_and_validate_rankings(tab, url, page)
                 if self.max_delay > 0:
                     delay = random.uniform(self.min_delay, max(self.min_delay, self.max_delay))
                     if delay > 0:
                         await asyncio.sleep(delay)
-                return parse_rankings_html(html)
+                return refs
             finally:
                 tab_queue.put_nowait(tab)
 
@@ -852,8 +854,8 @@ class BrowserClient:
             except Exception:
                 await self._wait_if_challenge()
                 await self._wait_if_logged_out()
-            html = await self._capture_and_validate_rankings(self._page, url)
-        return parse_rankings_html(html)
+            refs = await self._capture_and_validate_rankings(self._page, url, page)
+        return refs
 
     async def _ensure_on_wcl_origin(self) -> None:
         await self._ensure_started()

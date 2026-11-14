@@ -411,9 +411,10 @@ class IndexDB:
                     1 if is_exhausted else 0,
                 ),
             )
-            conn.execute("""
+            page_comparison = ">=" if is_exhausted else "="
+            conn.execute(f"""
                 DELETE FROM scan_failures WHERE zone_id = ? AND encounter_id = ? AND partition = ?
-                    AND difficulty = ? AND class_name = ? AND spec_name = ? AND page = ?
+                    AND difficulty = ? AND class_name = ? AND spec_name = ? AND page {page_comparison} ?
             """, (zone_id, encounter_id, partition, difficulty, class_name, spec_name, page))
 
     def get_scanned_pages_count(self) -> int:

@@ -2,6 +2,7 @@ import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from wcl_archiver.codec.wclz_format import WCLZWriter
@@ -28,9 +29,12 @@ def _analyze_and_pack_cpu(
     zstd_level: int,
     raw_archive=None,
 ) -> Tuple[int, int, Dict[str, Any]]:
+    standalone = isinstance(raw_archive,FightArchive)
     try:
         summary, norm_events, replay = CombatStateMachine.analyze_fight(
-            fight_meta, actors, abilities, raw_events
+            fight_meta, actors, abilities, raw_events,
+            include_normalized_events=not standalone,
+            include_replay_frames=not standalone,
         )
     except Exception as exc:
         if not isinstance(raw_archive,FightArchive):
@@ -49,7 +53,7 @@ def _analyze_and_pack_cpu(
         comp_bytes = WCLZWriter.write_fight(
             out_path, summary, norm_events, replay, zstd_level=zstd_level
         )
-    return comp_bytes, len(norm_events), (summary.get("abilities") or {})
+    return comp_bytes, len(raw_events) if standalone else len(norm_events), (summary.get("abilities") or {})
 
 
 async def _await_pack(future):
@@ -372,6 +376,7 @@ class HarvesterPipeline:
                 report_code = row["report_code"]
                 fight_id = int(row["fight_id"])
                 try:
+                    download_started = time.perf_counter()
                     if on_progress:
                         on_progress(
                             {
@@ -390,6 +395,8 @@ class HarvesterPipeline:
                     )
                     if should_stop and should_stop():
                         continue
+                    if on_progress:
+                        on_progress({'log':f"Downloaded {report_code}#{fight_id}: {len(raw_events)} events in {time.perf_counter()-download_started:.2f}s; ready to pack"})
                     await pack_queue.put(
                         (row, out_path, fight_meta, actors, abilities, raw_events)
                     )
@@ -416,6 +423,7 @@ class HarvesterPipeline:
                 report_code = row["report_code"]
                 fight_id = int(row["fight_id"])
                 try:
+                    pack_started = time.perf_counter()
                     comp_bytes, norm_count, summary_abilities = await _await_pack(loop.run_in_executor(
                         executor,
                         _analyze_and_pack_cpu,
@@ -443,7 +451,7 @@ class HarvesterPipeline:
                         kb = out_path.stat().st_size / 1024.0 if out_path.exists() else 0.0
                         on_progress(
                             {
-                                "log": f"Saved {out_path.name} ({kb:.1f} KB; self-contained full-field archive)",
+                                "log": f"Saved {out_path.name} ({kb:.1f} KB; packed and verified in {time.perf_counter()-pack_started:.2f}s)",
                             }
                         )
                 except Exception as exc:
@@ -591,10 +599,9 @@ class HarvesterPipeline:
             work_queue.put_nowait(None)
 
         scan_finished = asyncio.Event()
-        consecutive_scan_failures = 0
 
         async def _scan_worker() -> None:
-            nonlocal enqueued, specs_done, pages_scanned, consecutive_scan_failures
+            nonlocal enqueued, specs_done, pages_scanned
             while True:
                 unit = await work_queue.get()
                 if unit is None:
@@ -673,7 +680,6 @@ class HarvesterPipeline:
                                 page=page,
                                 difficulty=difficulty if difficulty > 0 else None,
                             )
-                            consecutive_scan_failures = 0
                             last_scan_exc = None
                             break
                         except Exception as exc:
@@ -705,7 +711,6 @@ class HarvesterPipeline:
                             reason=str(last_scan_exc or "Rankings page returned no result"),
                             attempts=3,
                         )
-                        consecutive_scan_failures += 1
                         if on_progress:
                             on_progress(
                                 {
@@ -715,13 +720,16 @@ class HarvesterPipeline:
                                     )
                                 }
                             )
-                        if consecutive_scan_failures >= 6:
-                            raise RuntimeError(
-                                f"Discovery failed {consecutive_scan_failures} times consecutively: {last_scan_exc}"
-                            )
+                        # The exhausted page is durable and will make the job incomplete.
+                        # Continue other scopes while unrelated downloads finish normally.
                         break
 
                     pages_scanned += 1
+                    # Browser pages retain visible rows before report/fight deduplication.
+                    # Plain protocol lists use their length when no page metadata exists.
+                    row_count = int(getattr(refs, "row_count", len(refs)))
+                    has_next = getattr(refs, "has_next", None)
+                    terminal_page = not refs or row_count < 70 or has_next is False
 
                     if not refs:
                         self.index_db.mark_page_scanned(
@@ -731,7 +739,7 @@ class HarvesterPipeline:
                             class_name=class_name,
                             spec_name=spec_name,
                             page=page,
-                            refs_found=0,
+                            refs_found=row_count,
                             is_exhausted=True,
                             difficulty=difficulty,
                         )
@@ -787,8 +795,8 @@ class HarvesterPipeline:
                         class_name=class_name,
                         spec_name=spec_name,
                         page=page,
-                        refs_found=len(refs),
-                        is_exhausted=False,
+                        refs_found=row_count,
+                        is_exhausted=terminal_page,
                         difficulty=difficulty,
                     )
 
@@ -797,8 +805,9 @@ class HarvesterPipeline:
                             {
                                 "pages_scanned": pages_scanned,
                                 "log": (
-                                    f"Found {len(refs)} runs on page {page} for {title} [{label_prefix}] "
-                                    f"({class_name} {spec_name}) -> +{page_enqueued} new fights queued."
+                                    f"Found {row_count} ranking rows ({len(refs)} unique references) on page {page} "
+                                    f"for {title} [{label_prefix}] ({class_name} {spec_name}) "
+                                    f"-> +{page_enqueued} new fights queued."
                                 ),
                             }
                         )
@@ -810,6 +819,8 @@ class HarvesterPipeline:
                             should_stop=should_stop,
                         )
 
+                    if terminal_page:
+                        break
                     page += 1
 
                 specs_done += 1

@@ -37,6 +37,182 @@ def _retry_pipeline(tmp_path, client):
     return db, HarvesterPipeline(tmp_path, db, MasterDictDB(tmp_path / "master.db"), client)
 
 
+class DiscoveryPage(list):
+    def __init__(self, refs=(), row_count=None, has_next=False):
+        super().__init__(refs)
+        self.row_count = len(self) if row_count is None else row_count
+        self.has_next = has_next
+
+
+def _discovery_unit():
+    return dict(zone_id=17, encounter_id=2092, encounter_slug="argus", partition=1,
+                difficulty=5, content_type="raid", class_name="Monk", spec_name="Windwalker",
+                role="dps", label_prefix="Mythic", title="Argus")
+
+
+class ResumeDiscoveryClient(RetryWorkClient):
+    def __init__(self, pages):
+        super().__init__()
+        self.pages, self.page_calls = pages, []
+
+    async def fetch_rankings_fight_refs(self, **kwargs):
+        self.page_calls.append(kwargs["page"])
+        return self.pages.get(kwargs["page"], DiscoveryPage())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_count,has_next", [(69,True),(70,False)])
+async def test_terminal_nonempty_rankings_page_persists_across_pipeline_instances(tmp_path, row_count, has_next):
+    refs = [{"report":{"code":"Resume1","fightID":1}}]
+    client = ResumeDiscoveryClient({1:DiscoveryPage(refs,row_count,has_next)})
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    try:
+        assert await pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=0) == 1
+        assert client.page_calls == [1]
+        assert db.get_exhausted_page(17,2092,1,"Monk","Windwalker",difficulty=5) == 1
+        with db._connect() as conn:
+            assert conn.execute("SELECT refs_found FROM scan_history").fetchone()[0] == row_count
+    finally:
+        pipeline.close()
+    reopened, pipeline = _retry_pipeline(tmp_path, client)
+    try:
+        assert await pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=0) == 0
+        assert client.page_calls == [1]
+        assert reopened.get_queue_counts()["queued_fights"] == 1
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_scan_history_resumes_first_unscanned_page_and_uses_raw_row_count(tmp_path):
+    refs = [{"report":{"code":"Resume1","fightID":1}}]
+    client = ResumeDiscoveryClient({1:DiscoveryPage(refs,70,True), 2:DiscoveryPage()})
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    try:
+        assert await pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=1) == 1
+        assert client.page_calls == [1]
+        assert db.get_exhausted_page(17,2092,1,"Monk","Windwalker",difficulty=5) is None
+        db.mark_page_failed(17,2092,1,"Monk","Windwalker",2,difficulty=5,reason="old invalid empty")
+        db.mark_page_failed(17,2092,1,"Monk","Windwalker",3,difficulty=5,reason="old invalid empty")
+    finally:
+        pipeline.close()
+    reopened, pipeline = _retry_pipeline(tmp_path, client)
+    try:
+        await pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=0)
+        assert client.page_calls == [1,2]
+        assert reopened.get_queue_counts()["failed_scan_pages"] == 0
+        assert reopened.get_queue_counts()["queued_fights"] == 1
+        await pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=0)
+        assert client.page_calls == [1,2]
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_seventy_raw_rows_continue_despite_deduped_single_reference(tmp_path):
+    refs = [{"report":{"code":"Resume1","fightID":1}}]
+    client = ResumeDiscoveryClient({1:DiscoveryPage(refs,70,True),2:DiscoveryPage()})
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    try:
+        assert await pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=0) == 1
+        assert client.page_calls == [1,2]
+        with db._connect() as conn:
+            assert conn.execute("SELECT refs_found FROM scan_history WHERE page=1").fetchone()[0] == 70
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_legitimate_empty_page_does_not_cancel_inflight_packing_or_retry(tmp_path):
+    import asyncio
+    refs = [{"report":{"code":"Resume1","fightID":1}}]
+    class SlowDownloadClient(ResumeDiscoveryClient):
+        def __init__(self):
+            super().__init__({1:DiscoveryPage(refs,70,True),2:DiscoveryPage()})
+            self.download_started, self.empty_seen = asyncio.Event(), asyncio.Event()
+            self.cancelled = False
+
+        async def fetch_rankings_fight_refs(self, **kwargs):
+            if kwargs["page"] == 2:
+                await self.download_started.wait()
+                self.empty_seen.set()
+            return await super().fetch_rankings_fight_refs(**kwargs)
+
+        async def fetch_all_fight_events(self, *args):
+            self.download_started.set()
+            try:
+                await self.empty_seen.wait()
+                await asyncio.sleep(0.01)
+                return []
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    client = SlowDownloadClient()
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    pipeline.scan_concurrency = 2
+    try:
+        await asyncio.wait_for(pipeline._run_discovery_pool([_discovery_unit()], pages_per_spec=0,
+                                                         pack_as_discovered=True), timeout=5)
+        assert client.page_calls == [1,2]
+        assert not client.cancelled
+        assert len(db.search_fights(status="PACKED")) == 1
+        assert db.get_queue_counts()["failed_scan_pages"] == 0
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_six_failed_scan_units_do_not_cancel_inflight_fight_download(tmp_path):
+    import asyncio
+    class IsolatedScanClient(RetryWorkClient):
+        def __init__(self):
+            super().__init__()
+            self.download_started, self.scans_failed = asyncio.Event(), asyncio.Event()
+            self.cancelled = False
+            self.scan_calls = {}
+
+        async def fetch_rankings_fight_refs(self, **kwargs):
+            spec = kwargs["spec_name"]
+            self.scan_calls[spec] = self.scan_calls.get(spec,0) + 1
+            if spec == "Good":
+                return DiscoveryPage([{"report":{"code":"Isolated1","fightID":1}}])
+            await self.download_started.wait()
+            raise TimeoutError("ranking page unavailable")
+
+        async def fetch_all_fight_events(self, *args):
+            self.download_started.set()
+            try:
+                await self.scans_failed.wait()
+                await asyncio.sleep(0.01)
+                return []
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    client = IsolatedScanClient()
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    pipeline.scan_concurrency = 2
+    pipeline._scan_retry_base_delay = 0
+    units = [{**_discovery_unit(),"spec_name":spec} for spec in ["Good", *[f"Failed{i}" for i in range(6)]]]
+    warnings = []
+    def progress(update):
+        if "WARNING: Scan failed" in update.get("log", ""):
+            warnings.append(update["log"])
+            if len(warnings) == 6:
+                client.scans_failed.set()
+    try:
+        await asyncio.wait_for(pipeline._run_discovery_pool(units, on_progress=progress,
+                                                         pack_as_discovered=True),timeout=5)
+        assert not client.cancelled
+        assert len(db.search_fights(status="PACKED")) == 1
+        assert db.get_queue_counts()["failed_scan_pages"] == 6
+        assert all(client.scan_calls[f"Failed{i}"] == 3 for i in range(6))
+    finally:
+        client.scans_failed.set()
+        pipeline.close()
+
+
 @pytest.mark.asyncio
 async def test_empty_failed_batch_preserves_later_pending_and_recovers(tmp_path):
     client = RetryWorkClient(report_failures=1)
@@ -206,6 +382,9 @@ async def test_discovery_error_cancels_and_awaits_background_drain(tmp_path):
         return 0
 
     pipeline._fetch_rankings_refs = fail_scan
+    def fail_state_store(*args, **kwargs):
+        raise RuntimeError("Discovery failed bookkeeping")
+    pipeline.index_db.mark_page_failed = fail_state_store
     pipeline.drain_queue_batch = blocked_drain
     unit = dict(zone_id=17, encounter_id=2092, encounter_slug="argus", partition=1,
                 difficulty=5, content_type="raid", class_name="Monk", spec_name="Windwalker",
@@ -556,7 +735,8 @@ async def test_discover_mplus_s5_zero_pages_downloads_until_empty_and_reports_pr
         if path.startswith("/zone/rankings-table/"):
             page = int(request.url.params.get("page", "1"))
             if "11501" in path and "DeathKnight/Blood" in path and page <= 2:
-                html = f'<a href="/reports/repPage{page}Abc123#fight={page}">Run {page}</a>'
+                html = "".join(f'<a href="/reports/repPage{page}Abc123#fight={fid}">Run {fid}</a>'
+                               for fid in range(1, 71))
                 return httpx.Response(200, text=html)
             return httpx.Response(200, text="<table></table>")
         return httpx.Response(404)
@@ -584,7 +764,7 @@ async def test_discover_mplus_s5_zero_pages_downloads_until_empty_and_reports_pr
     enqueued = await pipeline.discover_and_enqueue_mplus_s5(
         pages_per_spec=0, on_progress=on_prog, should_stop=should_stop
     )
-    assert enqueued == 2
+    assert enqueued == 140
     assert any("specs_total" in e and e["specs_total"] == 468 for e in progress_events)
 
     # Re-running the same spec should skip already scanned pages from scan_history

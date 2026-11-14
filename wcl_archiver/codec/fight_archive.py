@@ -30,6 +30,7 @@ import zstandard as zstd
 
 MAGIC = b"WCLF\x02"
 _MISSING = msgpack.ExtType(1, b"")
+_BYTE_SET_BITS = tuple(tuple(bit for bit in range(8) if byte & (1 << bit)) for byte in range(256))
 
 
 def _default(value):
@@ -79,30 +80,30 @@ json_bytes = _json_bytes
 
 
 def _columns(events):
-    count, columns = len(events), {}
-    for index, event in enumerate(events):
-        for key, value in event.items():
-            column = columns.get(key)
-            if column is None:
-                column = columns[key] = {"values": []}
-            values = column["values"]
-            presence = column.get("presence")
-            if presence is None and len(values) != index:
-                presence = column["presence"] = _prefix_bitmap(len(values), (index >> 3) + 1)
-            if presence is not None:
-                byte_index = index >> 3
-                presence.extend(b"\0" * (byte_index + 1 - len(presence)))
-                presence[byte_index] |= 1 << (index & 7)
-            values.append(value)
+    count, states = len(events), {}
     bitmap_size = (count + 7) >> 3
-    for column in columns.values():
-        if len(column["values"]) < count:
-            presence = column.get("presence")
+    for index, event in enumerate(events):
+        byte_index, bit = index >> 3, 1 << (index & 7)
+        for key, value in event.items():
+            state = states.get(key)
+            if state is None:
+                state = states[key] = [[], None]
+            values, presence = state
+            if presence is None and len(values) != index:
+                # The final bitmap size is known. Allocate once instead of extending
+                # or looking up per-value metadata millions of times per fight.
+                presence = state[1] = _prefix_bitmap(len(values), bitmap_size)
+            if presence is not None:
+                presence[byte_index] |= bit
+            values.append(value)
+    columns = {}
+    for key, (values, presence) in states.items():
+        column = {"values": values}
+        if len(values) < count:
             if presence is None:
-                presence = _prefix_bitmap(len(column["values"]), bitmap_size)
-            else:
-                presence.extend(b"\0" * (bitmap_size - len(presence)))
+                presence = _prefix_bitmap(len(values), bitmap_size)
             column["presence"] = bytes(presence)
+        columns[key] = column
     return {"count": count, "columns": columns}
 
 
@@ -142,15 +143,14 @@ def _records(table):
             raise ValueError("Corrupt archive presence bitmap length")
         if count & 7 and presence[-1] >> (count & 7):
             raise ValueError("Corrupt archive presence bitmap padding")
-        if sum(byte.bit_count() for byte in presence) != len(values):
+        if int.from_bytes(presence, "little").bit_count() != len(values):
             raise ValueError("Corrupt archive presence/value count")
         value_index = 0
         for byte_index, byte in enumerate(presence):
-            while byte:
-                low_bit = byte & -byte
-                rows[(byte_index << 3) + low_bit.bit_length() - 1][key] = values[value_index]
+            base = byte_index << 3
+            for bit in _BYTE_SET_BITS[byte]:
+                rows[base + bit][key] = values[value_index]
                 value_index += 1
-                byte ^= low_bit
     return rows
 
 

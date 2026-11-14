@@ -1,0 +1,10 @@
+# Ranking resume, final-page detection, and throughput fixes
+
+User reports apparent lost scan history, slow archival, and retries of clearly empty rankings. User rule: fewer than70 log rows OR no paginator/no enabled Next means stop after current page. Preserve current collection and all fields; no reset authorized for this follow-up.
+
+Observed base dc004a9: index.db retains98 successful page1 rows,11PACKED and594QUEUED fights;95failed page2 rows repeatedly retried by automatic whole-harvest restart. Live empty table says `All of the recorded fights for this boss, difficulty, size and region are private.` and has disabled Next. Existing validator rejects this legitimate empty state, causing discovery exceptions to cancel in-flight downloads.
+
+- [x] Browser parser task: list-compatible RankingsPage with row_count and has_next. Count visible log rows before report/fight deduplication. Follow real paginator enabled Next/current-page links; absent/disabled paginator ends. Recognize confirmed private/empty state; reject429/loading/auth/errors. Tests for0/69/70rows, duplicate rows, missing/disabled/active Next, exact live empty text. No real data edits.
+- [x] Pipeline/database task: consume page metadata; persist final-page marker including nonempty final page; new instances skip saved pages/final scope. Clear only superseded failed pages beyond confirmed terminal page. Preserve existing successful history and fights. Plain-list clients use <70 threshold. Regression reopen DB + pipeline/server session without refetch; nowholejobrestart on legitimate end. Coordinate browser result attrs.
+- [x] Root profiling: use an existing self-contained fight in an isolated temp benchmark; identify measured capture/download/analyze/pack costs. Optimize demonstrated redundant work while preserving full-record checks and bytes. Show stage timings so network waits are distinguished from packing. No extra source sidecars.
+- [x] Run fullsuite, independent focused review, preserve real catalogue/auth/fights; test actual empty page HTML; commit/push source-only per earlier authorization. Leave server stopped for user after installing updates.

@@ -29,9 +29,13 @@ In **Account & Harvester**, select the visible browser or API v2 source. The vis
 
 The **Pages per Spec** field defaults to **2**. Raid collection keeps all five Legion raids, every configured boss and partition, and all four difficulties: Mythic, Heroic, Normal, and LFR. Selecting a specific raid difficulty narrows that request. Setting pages to `0` explicitly requests all available ranking pages. Mythic+ collection remains Legion Season 5, zone 9 / partition 5, across the 13 configured dungeons and 36 specializations. A report URL or code can also be imported directly.
 
+For browser rankings, collection ends after the current page when there are fewer than **70 visible log rows**, no paginator, or no enabled Next control. Rows are counted before duplicate fights are merged. A recognized empty/private-results message is a successful terminal page. Successfully scanned pages and terminal boundaries are saved in SQLite and reused after stopping, restarting the harvester, or restarting the server; starting a job does not clear that history.
+
 Only one harvest or report import can run at a time. Stop waits for the active collection task to finish its cancellation cleanup; another start or import is rejected while collection or cleanup is active. Shutdown also closes the collection browser and pipeline resources.
 
 Failed work records an attempt count and reason. Retries are bounded within a run. A zero-result packing batch does not finish the job while pending or retryable work remains. Exhausted failures are reported as **incomplete**, with failed report/fight counts. Starting a new collection run makes failed work eligible for another bounded set of attempts.
+
+Exhausted ranking-page failures remain visible without cancelling unrelated fight downloads. The activity log reports download time separately from packing and verification time, so a long network wait is distinguishable from local archive processing.
 
 HTTP 429 and rendered **Too Many Requests** ranking pages apply a shared cooldown across browser navigation, JSON requests, and scan workers. A retry loads the same ranking page. `Retry-After` is honored within bounded delays; otherwise the collector uses exponential backoff. Error pages and unfinished loading placeholders do not certify an empty ranking page. If bounded retries are exhausted, the failure remains explicit and a new collection start permits another attempt.
 
