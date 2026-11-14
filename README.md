@@ -1,6 +1,6 @@
 # WCL Legion 7.3.5 Archiver & Offline Viewer
 
-A local WarcraftLogs collector for historical Legion investigations, including TauriWoW bug reports. The archive preserves received source responses before parsing them. The viewer provides derived fight summaries, damage and healing breakdowns, cast timelines, buffs, builds, deaths, and a 2D replay.
+A local WarcraftLogs collector for historical Legion investigations, including TauriWoW bug reports. Each new fight archive is a self-contained compressed file containing every received game-event field, report metadata, supplemental replay records, and provenance. The viewer provides derived fight summaries, damage and healing breakdowns, cast timelines, buffs, builds, deaths, and a 2D replay.
 
 ## Install and start
 
@@ -33,44 +33,60 @@ Only one harvest or report import can run at a time. Stop waits for the active c
 
 Failed work records an attempt count and reason. Retries are bounded within a run. A zero-result packing batch does not finish the job while pending or retryable work remains. Exhausted failures are reported as **incomplete**, with failed report/fight counts. Starting a new collection run makes failed work eligible for another bounded set of attempts.
 
+HTTP 429 and rendered **Too Many Requests** ranking pages apply a shared cooldown across browser navigation, JSON requests, and scan workers. A retry loads the same ranking page. `Retry-After` is honored within bounded delays; otherwise the collector uses exponential backoff. Error pages and unfinished loading placeholders do not certify an empty ranking page. If bounded retries are exhausted, the failure remains explicit and a new collection start permits another attempt.
+
 ## What the archive preserves
 
-The authoritative archive is the source-response store under `data/raw/`:
+New collections write **standalone WCLF version 2 (`.wclf`) files**. The fight file is the authoritative record and has no raw-response sidecar dependency:
 
-- Original response bodies are captured before JSON parsing or combat-event normalization. HTTP client captures retain decoded response content bytes; browser fetch text is encoded as UTF-8. Browser-rendered rankings are labeled as DOM snapshots.
-- SHA-256 addressed Zstandard blobs deduplicate identical response bodies. The SQLite manifest records request context, capture time, response status, report/fight attribution, and provenance. Authentication headers and cookies are not request provenance.
-- Received unknown fields, explicit nulls, numeric spellings, and event ordering remain available in the original bodies. Parsing and analysis do not overwrite them.
-- Canonical paginated event responses are required to certify a fight's source collection. Replay segments are supplemental. Malformed JSON, GraphQL errors, and non-advancing pagination fail collection instead of silently certifying a truncated result. A source-write failure prevents the fight from being marked packed.
+- Full canonical event objects retain every received key, including unknown fields, nested values, explicit nulls, absent fields, and event ordering. Dynamic columns preserve these distinctions without requiring a predefined event schema.
+- Integer and decimal numeric values retain their precision. JSON is parsed with decimal precision before archival; the normalized viewer representation is separate from these full-field records.
+- The same file contains full report metadata, supplemental replay records, derived summary data, and compact request/page provenance. Authentication headers and cookies are not provenance.
+- Sections are independently compressed with **Zstandard level 9** and protected by SHA-256 checksums. The writer verifies decoded full-event equality before a fight is marked packed. This compression setting favors practical packing time; total throughput and archive size depend on the actual workload.
+- Canonical paginated event responses are required. Replay segments are supplemental. Malformed JSON, GraphQL errors, and non-advancing pagination fail collection instead of silently certifying a truncated result.
 
-New `.wclf` files contain compressed **derived summaries and references to source captures**. They do not duplicate the complete event stream. Source responses remain independent of derived analysis: received bodies can survive even if a later analysis or packing step fails. Legacy `.wclz` files remain readable as viewer archives, but their normalized event data does not provide the same preservation guarantee as the source archive.
+Response buffering is transient and held in RAM for active work and bounded report metadata caches. New collection does **not** save raw HTTP body text, ranking HTML, error pages, a raw manifest database, or a `data/raw/` tree. Event snapshots are released after a verified write or a failed/cancelled attempt. The archive preserves logical JSON game data; original HTTP whitespace, body bytes, and numeric text spellings are not retained.
 
-The collector preserves what WarcraftLogs returns through these endpoints. It does not claim access to the uploader's complete original combat-log file, or that every original logging detail is exposed by WarcraftLogs. The final collection size depends on the reports, event counts, available pages, and deduplication; no fixed final-size estimate is promised.
+The new fight file remains readable and exportable after the collector and its in-memory buffers are gone. Derived analyzer output is separate from the full event fields. Legacy `.wclz` and WCLF version 1 readers remain for compatibility; old WCLF version 1 files may still require their original source sidecars. New collection writes self-contained version 2 files only.
+
+The collector preserves what WarcraftLogs returns through these endpoints. It does not claim access to the uploader's complete original combat-log file, or that every original logging detail is exposed by WarcraftLogs. The final collection size and packing speed depend on the selected reports, event counts, fields, and runtime resources; no fixed final size or full-pipeline speed factor is promised.
 
 ## Explore and export
 
-**Log Explorer** defaults to packed fights. Filters include content type, dungeon/boss, specialization, key level, raid difficulty, and stored queue status. Previous/Next controls use stable limit/offset pagination. Only packed rows offer **Open Fight**. The analyzer reads the selected fight and its required source pages rather than opening the entire collection.
+**Log Explorer** defaults to packed fights. Filters include content type, dungeon/boss, specialization, key level, raid difficulty, and stored queue status. Previous/Next controls use stable limit/offset pagination. Only packed rows offer **Open Fight**. The analyzer reads the selected standalone archive rather than opening the entire collection. **Full source records** exposes the archived provenance and logical response records; **Export full event fields** exports the unnormalized canonical events.
 
 The local API exposes the source evidence separately from viewer analysis:
 
 | Endpoint | Result |
 | --- | --- |
 | `GET /api/fights?status=PACKED&limit=100&offset=0` | Paginated catalogue; `status=all` includes queued, retryable, and failed rows. |
-| `GET /api/fights/{fight_uid}/sources` | The fight's source manifest and capture metadata, including references used for original-body export. |
-| `GET /api/archive/responses/{capture_id}` | The original captured response body. Use this to retain exact JSON text, numeric spellings, and response structure. |
-| `GET /api/fights/{fight_uid}/raw-events` | Parsed event objects from preserved canonical responses, retaining source fields rather than the viewer's normalized event schema. JSON reserialization is not a byte-for-byte copy of the original response. |
+| `GET /api/fights/{fight_uid}/sources` | Manifest and provenance for source records contained in the fight archive. |
+| `GET /api/fights/{fight_uid}/sources/{capture_id}` | Reconstructed logical JSON for a source record, read from the standalone file. This is not an export of original HTTP body bytes. |
+| `GET /api/fights/{fight_uid}/download` | Download the complete self-contained fight archive. |
+| `GET /api/fights/{fight_uid}/full-events` | Full canonical event objects, including all source fields rather than the viewer's normalized event schema. |
+| `GET /api/fights/{fight_uid}/raw-events` | Backward-compatible alias for the full-event export; the name does not imply permanent raw-response storage. |
 | `GET /api/fights/{fight_uid}/summary` | Derived viewer summary. |
 | `GET /api/fights/{fight_uid}/events` | Filtered, normalized viewer events. |
 | `GET /api/harvester/status` | Current job state, progress, queue/failure counters, and archive size information. |
 
-`fight_uid` is the report code followed by an underscore and fight ID, for example `aBcDeFg123_2`. Original-body exports are the authority when exact response formatting or number representation matters. Legacy viewer-only fights may have no source manifest to export.
+`fight_uid` is the report code followed by an underscore and fight ID, for example `aBcDeFg123_2`. Source and full-event exports read the file itself and do not depend on downloader memory or a separate raw store. Legacy viewer-only archives may have no full source records to export.
 
 ## Local storage and backups
 
-All collected data stays in the local `data/` directory, which Git ignores. No collection is uploaded by this project. The catalogue, source manifest, compressed source objects, `.wclf`/`.wclz` fight files, authentication session, and browser profile are local runtime artifacts rather than repository contents.
+All collected data stays in the local `data/` directory, which Git ignores. No collection is uploaded by this project. The catalogue, `.wclf` fight files, authentication session, and browser profile are local runtime artifacts rather than repository contents. Source-code publication excludes these local files.
 
-Back up the **whole data directory while the server is stopped**. A `.wclf` file alone is not a complete backup: its source references require the matching `raw/manifest.db` and `raw/objects/` files. Keep authentication and browser profiles private when sharing selected source evidence.
+A new WCLF version 2 file alone contains the full records needed to read and export that fight. Back up the **whole data directory while the server is stopped** to preserve the catalogue, collection progress, and account setup as well. Keep authentication and browser profiles private when sharing selected fight archives.
 
-An intentional fresh-collection reset must stop the server and collection workers first. Reset only archive/catalogue/scan data confined to the repository's `data/` directory; preserve `auth_session.json` and browser profiles. After a reset, start the viewer idle and begin collection explicitly.
+An intentional fresh-collection reset must stop the server and collection workers first. The reset utility removes recognized `mplus_s5/`, `raids/`, legacy `raw/`, and `staging/` collection directories plus catalogue/scan databases, confined to the chosen data directory. It preserves `auth_session.json`, browser profiles, and unrecognized top-level paths. It rejects links and reparse points before deleting anything.
+
+```powershell
+# Validate targets and report planned removal counts without deleting:
+python -m wcl_archiver.reset_data
+# Explicitly perform the reset after stopping the server:
+python -m wcl_archiver.reset_data --confirm-reset
+```
+
+A reset creates empty catalogues and does not start collection. Leave the server stopped until it is intentionally launched, then begin collection explicitly.
 
 ## Verification
 

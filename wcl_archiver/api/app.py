@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
 
 from wcl_archiver.codec.wclz_format import WCLZReader
 from wcl_archiver.codec.raw_archive import RawArchive, SourceFightReader
+from wcl_archiver.codec.fight_archive import FightArchive, PackedFightReader
 from wcl_archiver.config import (
     AppConfig,
     BASE_DIR,
@@ -65,7 +66,7 @@ def create_app(
     index_db = IndexDB(data_dir / "index.db")
     master_db = MasterDictDB(data_dir / "master_dict.db")
     auth_manager = WCLAuthManager(data_dir / "auth_session.json")
-    raw_archive = RawArchive(data_dir/'raw')
+    raw_archive = FightArchive(data_dir)
     protocol_client = WCLProtocolClient(auth_manager=auth_manager,raw_archive=raw_archive)
     browser_client_ref: Dict[str, Optional[BrowserClient]] = {"instance": None}
     harvester = HarvesterPipeline(
@@ -149,6 +150,7 @@ def create_app(
         finally:
             if job_task is asyncio.current_task():
                 harvester_state["running"] = False
+                raw_archive.clear()
 
     async def _stop_job() -> None:
         nonlocal stop_task
@@ -275,34 +277,73 @@ def create_app(
         return file_path
 
     def _reader(file_path):
-        return SourceFightReader if file_path.suffix == '.wclf' else WCLZReader
+        if file_path.suffix == '.wclf':
+            return PackedFightReader if PackedFightReader.is_packed_fight(file_path) else SourceFightReader
+        return WCLZReader
+
+    def _legacy_source_archive(path):
+        payload = SourceFightReader._read(path)
+        root = (path.parent/payload['archive_root']).resolve()
+        if not (root/'manifest.db').is_file():
+            raise HTTPException(status_code=409,detail='Legacy fight source store is missing')
+        return RawArchive(root)
 
     @app.get('/api/fights/{fight_uid}/sources')
     def get_fight_sources(fight_uid: str):
         path = _resolve_fight_file(fight_uid)
         if path.suffix != '.wclf':
             raise HTTPException(status_code=409,detail='Legacy analysis file has no complete source archive')
+        if PackedFightReader.is_packed_fight(path):
+            manifest = PackedFightReader.source_manifest(path)
+            for capture in manifest['captures']:
+                capture['download_url'] = f"/api/fights/{fight_uid}/sources/{capture['id']}"
+            return manifest
         manifest = SourceFightReader.source_manifest(path)
+        legacy = _legacy_source_archive(path)
         ids = [manifest['master_capture'],*manifest['event_captures'],*manifest.get('supplemental_captures',[])]
-        manifest['captures'] = [{**raw_archive.capture_info(cid),
+        manifest['captures'] = [{**legacy.capture_info(cid),
                                  'download_url':f'/api/archive/responses/{cid}'} for cid in ids]
         return manifest
 
+    @app.get('/api/fights/{fight_uid}/sources/{capture_id}')
+    def get_packed_source_response(fight_uid: str,capture_id: str):
+        path = _resolve_fight_file(fight_uid)
+        if not PackedFightReader.is_packed_fight(path):
+            raise HTTPException(status_code=409,detail='Fight uses a legacy source format')
+        try:
+            body = PackedFightReader.read_source_response(path,capture_id)
+        except KeyError:
+            raise HTTPException(status_code=404,detail='Source record not found in fight')
+        return Response(body,media_type='application/json',headers={
+            'Content-Disposition':f'attachment; filename="{capture_id}.json"'})
+
+    @app.get('/api/fights/{fight_uid}/download')
+    def download_fight(fight_uid: str):
+        path = _resolve_fight_file(fight_uid)
+        return FileResponse(path,media_type='application/octet-stream',filename=path.name)
+
     @app.get('/api/archive/responses/{capture_id}')
     def get_source_response(capture_id: str):
+        legacy_root = data_dir/'raw'
+        if not (legacy_root/'manifest.db').is_file():
+            raise HTTPException(status_code=404,detail='No legacy source store; download the standalone fight instead')
         try:
-            body = raw_archive.read_body(capture_id)
+            body = RawArchive(legacy_root).read_body(capture_id)
         except KeyError:
             raise HTTPException(status_code=404,detail='Source response not found')
         return Response(body,media_type='application/octet-stream',headers={
             'Content-Disposition':f'attachment; filename="{capture_id}.source"'})
 
     @app.get('/api/fights/{fight_uid}/raw-events')
+    @app.get('/api/fights/{fight_uid}/full-events')
     def get_raw_events(fight_uid: str):
         path = _resolve_fight_file(fight_uid)
         if path.suffix != '.wclf':
             raise HTTPException(status_code=409,detail='Legacy analysis file has no original events')
-        return SourceFightReader.read_raw_events(path)
+        reader = _reader(path)
+        if reader is PackedFightReader:
+            return Response(PackedFightReader.full_events_json(path),media_type='application/json')
+        return reader.read_raw_events(path)
 
     @app.get("/api/fights/{fight_uid}/summary")
     def get_fight_summary(fight_uid: str) -> Dict[str, Any]:
@@ -566,12 +607,16 @@ def create_app(
         if db_scanned > int(harvester_state.get("pages_scanned", 0)):
             harvester_state["pages_scanned"] = db_scanned
         source_stats = raw_archive.stats()
+        if (data_dir/'raw'/'manifest.db').is_file():
+            source_stats = {**source_stats,**RawArchive(data_dir/'raw').stats()}
         return {
             **harvester_state,
             **index_db.get_queue_counts(),
             "queued_fights": int(queued),
             "packed_fights": int(packed),
             **source_stats,
+            'archive_mode':'standalone',
+            'archive_bytes':int(total_bytes),
             "source_mb": round(source_stats['source_bytes']/(1024*1024),2),
             "analysis_mb": round(int(total_bytes)/(1024*1024),2),
             "compressed_mb": round((int(total_bytes)+source_stats['source_bytes']) / (1024 * 1024), 2),

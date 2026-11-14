@@ -506,7 +506,7 @@ async function openSingleFight(fightUid) {
   if (sourceLinks) {
     sourceLinks.classList.toggle('hidden', !currentFightSummary.source_available);
     document.getElementById('fight-source-manifest').href = `/api/fights/${encodeURIComponent(fightUid)}/sources`;
-    document.getElementById('fight-source-events').href = `/api/fights/${encodeURIComponent(fightUid)}/raw-events`;
+    document.getElementById('fight-source-events').href = `/api/fights/${encodeURIComponent(fightUid)}/full-events`;
   }
   document.getElementById("nav-fight-btn").disabled = false;
   const keyDiff = formatKeyOrDifficulty(currentFightSummary.keystone_level, currentFightSummary.difficulty);

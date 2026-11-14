@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from wcl_archiver.codec.wclz_format import WCLZWriter
+from wcl_archiver.codec.fight_archive import FightArchive
 from wcl_archiver.config import (
     LEGION_MPLUS_S5_DUNGEONS,
     LEGION_MPLUS_S5_PARTITION,
@@ -27,9 +28,19 @@ def _analyze_and_pack_cpu(
     zstd_level: int,
     raw_archive=None,
 ) -> Tuple[int, int, Dict[str, Any]]:
-    summary, norm_events, replay = CombatStateMachine.analyze_fight(
-        fight_meta, actors, abilities, raw_events
-    )
+    try:
+        summary, norm_events, replay = CombatStateMachine.analyze_fight(
+            fight_meta, actors, abilities, raw_events
+        )
+    except Exception as exc:
+        if not isinstance(raw_archive,FightArchive):
+            raise
+        # Historical records remain packable even when an unfamiliar field or
+        # event prevents this version of the derived analyzer from understanding it.
+        summary = {**fight_meta,'duration_ms':max(1,int(fight_meta['end_time'])-int(fight_meta['start_time'])),
+                   'actors':actors,'abilities':{},'analysis_error':str(exc)}
+        norm_events = raw_events
+        replay = {'map_id':fight_meta.get('map_id',0),'pulls':fight_meta.get('pulls',[])}
     if raw_archive is not None:
         summary['map_id'] = replay.get('map_id',0)
         summary['pulls'] = replay.get('pulls',[])
@@ -101,6 +112,8 @@ class HarvesterPipeline:
         if self._pack_executor is not None:
             self._pack_executor.shutdown(wait=True)
             self._pack_executor = None
+        if isinstance(self.raw_archive,FightArchive):
+            self.raw_archive.clear()
 
     def _cache_master(self, report_code: str, data: Dict[str, Any]) -> None:
         self._master_cache[report_code] = data
@@ -110,7 +123,8 @@ class HarvesterPipeline:
 
     async def _get_report_master(self, report_code: str) -> Dict[str, Any]:
         cached = self._master_cache.get(report_code)
-        if cached is not None:
+        has_source = getattr(self.raw_archive,'has_report_metadata',None)
+        if cached is not None and (not callable(has_source) or has_source(report_code)):
             self._master_cache.move_to_end(report_code)
             return cached
 
@@ -429,7 +443,7 @@ class HarvesterPipeline:
                         kb = out_path.stat().st_size / 1024.0 if out_path.exists() else 0.0
                         on_progress(
                             {
-                                "log": f"Saved {out_path.name} ({kb:.1f} KB analysis; original sources retained separately)",
+                                "log": f"Saved {out_path.name} ({kb:.1f} KB; self-contained full-field archive)",
                             }
                         )
                 except Exception as exc:

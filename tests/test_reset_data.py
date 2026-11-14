@@ -17,7 +17,8 @@ def collection_fixture(root):
     db.enqueue_fight("report", 1, "raid", 17, 1, 2092, "argus")
     db.mark_page_scanned(17, 2092, 1, "Monk", "Windwalker", 1, 1)
     MasterDictDB(root / "master_dict.db").upsert_spell(1, "old spell")
-    for name in ("mplus_s5/a/old.wclz", "raids/b/old.wclz", "raw/blobs/source.zst"):
+    for name in ("mplus_s5/a/old.wclz", "raids/b/old.wclz", "raids/b/full.wclf",
+                 "raw/blobs/source.zst", "raw/manifest.db", "staging/pending/full.wclf.tmp"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"saved source or cache")
@@ -45,7 +46,7 @@ def test_reset_only_recognized_collection_and_recreates_empty_catalogues(tmp_pat
     result = reset_collection(root)
     assert result == {"removed_files": len(removed_paths), "removed_bytes": expected_bytes}
     assert all(p.read_bytes() == body for p, body in preserved.items())
-    assert all(not (root / name).exists() for name in ("mplus_s5", "raids", "raw", "index.db-wal", "master_dict.db-shm"))
+    assert all(not (root / name).exists() for name in ("mplus_s5", "raids", "raw", "staging", "index.db-wal", "master_dict.db-shm"))
     db = IndexDB(root / "index.db")
     assert db.search_fights() == []
     assert db.get_scanned_pages_count() == 0

@@ -2,6 +2,9 @@ import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 import json
+from email.utils import parsedate_to_datetime
+from html import unescape
+import math
 import os
 import random
 import re
@@ -41,6 +44,47 @@ DURATION_CELL_RE = re.compile(
 )
 DURATION_RE = re.compile(r"\b(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\b")
 STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+
+
+class RateLimitError(RuntimeError):
+    """A real HTTP or rendered-page rate limit; never an empty rankings page."""
+
+    def __init__(self, message="WCL rate limit (429 Too Many Requests)", retry_after=0.0):
+        super().__init__(message)
+        self.retry_after = float(retry_after)
+
+
+class NavigationHTTPError(RuntimeError):
+    pass
+
+
+def _visible_rankings_html(html: str) -> str:
+    clean = re.sub(r"<!--.*?-->", " ", html or "", flags=re.DOTALL)
+    clean = re.sub(r"<(script|style|template)\b[^>]*>.*?</\1\s*>", " ", clean,
+                   flags=re.DOTALL | re.IGNORECASE)
+    return HIDDEN_SPAN_RE.sub(" ", clean)
+
+
+def is_rate_limit_page(html: str) -> bool:
+    """Inspect rendered text, excluding embedded translation/script/style data."""
+    visible = unescape(STRIP_TAGS_RE.sub(" ", _visible_rankings_html(html)))
+    visible = re.sub(r"\s+", " ", visible).lower()
+    return bool(re.search(r"\btoo many requests\b|\brate[ -]limit(?:ed| exceeded| reached)?\b|\brequest limit exceeded\b", visible))
+
+
+def assert_valid_rankings_page(html: str) -> None:
+    """Reject failure/loading pages before an empty result can exhaust a scan."""
+    if is_rate_limit_page(html):
+        raise RateLimitError()
+    clean = _visible_rankings_html(html)
+    for attrs in re.findall(r"<table\b([^>]*)>", clean, re.IGNORECASE):
+        classes = re.search(r"\bclass\s*=\s*(['\"])(.*?)\1", attrs, re.IGNORECASE)
+        if classes and set(classes.group(2).lower().split()) & {"rankings-table", "ranking-table", "summary-table"}:
+            return
+    visible = unescape(STRIP_TAGS_RE.sub(" ", clean))
+    if re.search(r"\bno (?:rankings|results|data) (?:found|available)(?:\b|\.)", visible, re.IGNORECASE):
+        return
+    raise RuntimeError("Rankings table did not load or page is not a valid rankings result")
 
 
 def is_challenge_page(title: str, url: str, html: str) -> bool:
@@ -594,6 +638,43 @@ class BrowserClient:
             if self.state == "waiting_login":
                 self._emit_status("ready", "Logged in, browser ready")
 
+    async def _wait_for_cooldown(self) -> None:
+        while self._cooldown_until > time.monotonic():
+            if self.should_stop and self.should_stop():
+                raise RuntimeError("Stopped by user")
+            # Recheck after sleeping: another worker may extend the deadline.
+            await asyncio.sleep(self._cooldown_until - time.monotonic())
+
+    def _record_rate_limit(self, retry_after: str = "") -> float:
+        self._rate_limit_streak = getattr(self, "_rate_limit_streak", 0) + 1
+        delay = min(120.0, 2.0 * 2 ** min(self._rate_limit_streak - 1, 6))
+        if retry_after:
+            try:
+                parsed_delay = float(retry_after)
+            except (ValueError, TypeError):
+                try:
+                    parsed_delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    parsed_delay = delay
+            if math.isfinite(parsed_delay):
+                # Honor seconds or HTTP dates, bounded to 50 ms..5 minutes.
+                delay = max(0.05, min(300.0, parsed_delay))
+        self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay)
+        self._emit_status("rate_limited", f"WCL rate limit; pausing requests for {delay:.2f}s")
+        return delay
+
+    async def _capture_and_validate_rankings(self, page, url):
+        _, _, html = await self._read_page_snapshot(page)
+        if self.raw_archive is not None:
+            self.raw_archive.capture('GET', url, html.encode('utf-8'), source='rendered_html')
+        try:
+            assert_valid_rankings_page(html)
+        except RateLimitError as exc:
+            exc.retry_after = self._record_rate_limit()
+            raise
+        self._rate_limit_streak = 0
+        return html
+
     async def _goto_page_resilient(
         self,
         page: Any,
@@ -608,12 +689,32 @@ class BrowserClient:
         for attempt in range(max(1, attempts)):
             if self.should_stop and self.should_stop():
                 raise RuntimeError("Stopped by user")
+            await self._wait_for_cooldown()
             try:
                 try:
-                    await current.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    response = await current.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 except TypeError:
-                    await current.goto(url, wait_until="domcontentloaded")
+                    response = await current.goto(url, wait_until="domcontentloaded")
+                status = int(getattr(response, "status", 200)) if response is not None else 200
+                if status >= 400:
+                    if self.raw_archive is not None:
+                        _, _, html = await self._read_page_snapshot(current)
+                        self.raw_archive.capture('GET', url, html.encode('utf-8'), status=status, source='rendered_html')
+                    if status == 429:
+                        headers = getattr(response, "headers", {}) or {}
+                        retry_after = next((value for key, value in headers.items() if key.lower() == 'retry-after'), '')
+                        delay = self._record_rate_limit(retry_after)
+                        raise RateLimitError(f"WCL navigation HTTP 429: {url}", delay)
+                    raise NavigationHTTPError(f"WCL navigation HTTP {status}: {url}")
                 return current
+            except NavigationHTTPError:
+                raise
+            except RateLimitError as exc:
+                last_exc = exc
+                if attempt >= attempts - 1:
+                    break
+                # Reuse the same tab/URL; shared cooldown gates every worker.
+                continue
             except Exception as exc:
                 last_exc = exc
                 if self.should_stop and self.should_stop():
@@ -726,13 +827,11 @@ class BrowserClient:
                 except Exception:
                     await self._wait_if_challenge(tab)
                     await self._wait_if_logged_out(tab)
-                _, _, html = await self._read_page_snapshot(tab)
+                html = await self._capture_and_validate_rankings(tab, url)
                 if self.max_delay > 0:
                     delay = random.uniform(self.min_delay, max(self.min_delay, self.max_delay))
                     if delay > 0:
                         await asyncio.sleep(delay)
-                if self.raw_archive is not None:
-                    self.raw_archive.capture('GET',url,html.encode('utf-8'),source='rendered_html')
                 return parse_rankings_html(html)
             finally:
                 tab_queue.put_nowait(tab)
@@ -753,9 +852,7 @@ class BrowserClient:
             except Exception:
                 await self._wait_if_challenge()
                 await self._wait_if_logged_out()
-            _, _, html = await self._read_page_snapshot()
-        if self.raw_archive is not None:
-            self.raw_archive.capture('GET',url,html.encode('utf-8'),source='rendered_html')
+            html = await self._capture_and_validate_rankings(self._page, url)
         return parse_rankings_html(html)
 
     async def _ensure_on_wcl_origin(self) -> None:
@@ -782,9 +879,7 @@ class BrowserClient:
         challenge_attempts = 0
         rate_attempts = 0
         for _ in range(7):
-            now = time.monotonic()
-            if self._cooldown_until > now:
-                await asyncio.sleep(self._cooldown_until - now)
+            await self._wait_for_cooldown()
 
             await self._ensure_on_wcl_origin()
             seq_before = self._challenge_cleared_seq
@@ -792,6 +887,7 @@ class BrowserClient:
             try:
                 async with self._eval_shared():
                     async with req_sem:
+                        await self._wait_for_cooldown()
                         res = await self._page.evaluate(
                             """async ({url, method}) => {
                                 const headers = {'X-Requested-With': 'XMLHttpRequest'};
@@ -823,16 +919,9 @@ class BrowserClient:
 
             if status == 429:
                 rate_attempts += 1
+                wait_s = self._record_rate_limit(retry_after_raw)
                 if rate_attempts > 4:
-                    return status, text
-                wait_s = min(20.0, 2.0 * (2 ** min(rate_attempts - 1, 3))) + random.uniform(0.25, 1.0)
-                if retry_after_raw:
-                    try:
-                        wait_s = max(1.5, min(30.0, float(retry_after_raw)))
-                    except ValueError:
-                        pass
-                self._cooldown_until = max(self._cooldown_until, time.monotonic() + wait_s)
-                await asyncio.sleep(wait_s)
+                    raise RateLimitError(f"WCL request HTTP 429: {full_url}", wait_s)
                 continue
 
             if status in (0, 401, 403) or is_challenge_page("", full_url, text):
@@ -860,7 +949,8 @@ class BrowserClient:
         return await self._run_in_browser_loop(self._unarchive_report_impl(report_code))
 
     async def _unarchive_report_impl(self, report_code: str) -> bool:
-        if report_code in self._report_master_cache:
+        has_source = getattr(self.raw_archive,'has_report_metadata',None)
+        if report_code in self._report_master_cache and (not callable(has_source) or has_source(report_code)):
             return True
 
         status, data = await self._request_json_impl(
@@ -897,7 +987,8 @@ class BrowserClient:
 
     async def _fetch_report_master_and_fights_impl(self, report_code: str) -> Dict[str, Any]:
         cached = self._report_master_cache.get(report_code)
-        if cached is not None:
+        has_source = getattr(self.raw_archive,'has_report_metadata',None)
+        if cached is not None and (not callable(has_source) or has_source(report_code)):
             self._report_master_cache.move_to_end(report_code)
             return cached
 
@@ -974,6 +1065,8 @@ class BrowserClient:
                 seg_results = await asyncio.gather(*[_fetch_seg(c0, c1) for c0, c1 in chunks])
                 if self.should_stop and self.should_stop():
                     return []
+                if self.raw_archive is not None and any(sr is None for sr in seg_results):
+                    raise RuntimeError('Incomplete replay segment download; retry this fight')
                 if all(sr is not None for sr in seg_results):
                     replay_events: List[Dict[str, Any]] = []
                     for sr in seg_results:

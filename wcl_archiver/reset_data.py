@@ -16,7 +16,7 @@ from wcl_archiver.config import DATA_DIR as DEFAULT_DIR
 from wcl_archiver.db.schema import IndexDB, MasterDictDB
 
 
-COLLECTION_DIRS = ("mplus_s5", "raids", "raw")
+COLLECTION_DIRS = ("mplus_s5", "raids", "raw", "staging")
 COLLECTION_FILES = tuple(
     name + suffix
     for name in ("index.db", "master_dict.db")
