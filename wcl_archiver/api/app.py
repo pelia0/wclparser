@@ -66,7 +66,7 @@ def create_app(
     index_db = IndexDB(data_dir / "index.db")
     master_db = MasterDictDB(data_dir / "master_dict.db")
     auth_manager = WCLAuthManager(data_dir / "auth_session.json")
-    raw_archive = FightArchive(data_dir)
+    raw_archive = FightArchive(data_dir, compression=cfg.archive_compression)
     protocol_client = WCLProtocolClient(auth_manager=auth_manager,raw_archive=raw_archive)
     browser_client_ref: Dict[str, Optional[BrowserClient]] = {"instance": None}
     harvester = HarvesterPipeline(

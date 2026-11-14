@@ -29,7 +29,7 @@ def test_standalone_copy_preserves_every_field_and_exact_logical_numbers(tmp_pat
     output = tmp_path / "original.wclf"
     assert archive.write_fight(output, {"report_code":"Report1","fight_id":1,"actors":[]}, "Report1", 1) == output.stat().st_size
     assert not root.exists()
-    assert output.read_bytes().startswith(b"WCLF\x02")
+    assert output.read_bytes().startswith(b"WCLF\x03")
     assert archive.stats()["source_bytes"] == archive.stats()["source_responses"] == 0
     assert archive.stats()["buffered_event_captures"] == 0
     copied = tmp_path / "copied.wclf"

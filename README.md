@@ -43,17 +43,20 @@ HTTP 429 and rendered **Too Many Requests** ranking pages apply a shared cooldow
 
 ## What the archive preserves
 
-New collections write **standalone WCLF version 2 (`.wclf`) files**. The fight file is the authoritative record and has no raw-response sidecar dependency:
+New collections write **standalone WCLF version 3 (`.wclf`) files**. The fight file is the authoritative record and has no raw-response sidecar dependency:
 
 - Full canonical event objects retain every received key, including unknown fields, nested values, explicit nulls, absent fields, and event ordering. Dynamic columns preserve these distinctions without requiring a predefined event schema.
 - Integer and decimal numeric values retain their precision. JSON is parsed with decimal precision before archival; the normalized viewer representation is separate from these full-field records.
 - The same file contains full report metadata, supplemental replay records, derived summary data, and compact request/page provenance. Authentication headers and cookies are not provenance.
-- Sections are independently compressed with **Zstandard level 9** and protected by SHA-256 checksums. The writer verifies decoded full-event equality before a fight is marked packed. This compression setting favors practical packing time; total throughput and archive size depend on the actual workload.
+- Identical canonical and replay columns are stored once inside the file and referenced by both streams. Different fields, presence bitmaps, and differing event streams remain complete. Exact integer deltas are selected only when they compress better; numeric values are never rounded.
+- The default **compact** profile uses **LZMA preset 6**, retaining Zstandard level 9 for a section when it produces a smaller result. The **fast** profile uses Zstandard level 9 with the same lossless shared-column encoding. Sections have SHA-256 checksums, and every reconstructed logical section is verified before publication. The compact profile trades a few seconds of additional compression work for smaller files; total throughput and size depend on the workload.
 - Canonical paginated event responses are required. Replay segments are supplemental. Malformed JSON, GraphQL errors, and non-advancing pagination fail collection instead of silently certifying a truncated result.
 
 Response buffering is transient and held in RAM for active work and bounded report metadata caches. New collection does **not** save raw HTTP body text, ranking HTML, error pages, a raw manifest database, or a `data/raw/` tree. Event snapshots are released after a verified write or a failed/cancelled attempt. The archive preserves logical JSON game data; original HTTP whitespace, body bytes, and numeric text spellings are not retained.
 
-The new fight file remains readable and exportable after the collector and its in-memory buffers are gone. Derived analyzer output is separate from the full event fields. Legacy `.wclz` and WCLF version 1 readers remain for compatibility; old WCLF version 1 files may still require their original source sidecars. New collection writes self-contained version 2 files only.
+The new fight file remains readable and exportable after the collector and its in-memory buffers are gone. Derived analyzer output is separate from the full event fields. WCLF version 2 files remain fully readable. Legacy `.wclz` and WCLF version 1 readers remain for compatibility; old WCLF version 1 files may still require their original source sidecars. New collection writes self-contained version 3 files only.
+
+To favor packing speed, set `WCL_ARCHIVE_COMPRESSION=fast` before starting the server. The default is `compact`; no API credentials are required for either storage profile.
 
 The collector preserves what WarcraftLogs returns through these endpoints. It does not claim access to the uploader's complete original combat-log file, or that every original logging detail is exposed by WarcraftLogs. The final collection size and packing speed depend on the selected reports, event counts, fields, and runtime resources; no fixed final size or full-pipeline speed factor is promised.
 
@@ -81,7 +84,18 @@ The local API exposes the source evidence separately from viewer analysis:
 
 All collected data stays in the local `data/` directory, which Git ignores. No collection is uploaded by this project. The catalogue, `.wclf` fight files, authentication session, and browser profile are local runtime artifacts rather than repository contents. Source-code publication excludes these local files.
 
-A new WCLF version 2 file alone contains the full records needed to read and export that fight. Back up the **whole data directory while the server is stopped** to preserve the catalogue, collection progress, and account setup as well. Keep authentication and browser profiles private when sharing selected fight archives.
+A standalone WCLF version 2 or 3 file alone contains the full records needed to read and export that fight. Back up the **whole data directory while the server is stopped** to preserve the catalogue, collection progress, and account setup as well. Keep authentication and browser profiles private when sharing selected fight archives.
+
+Existing standalone archives can be repacked with the local server stopped:
+
+```powershell
+# Inspect the catalogue without changing stored fight data:
+python -m wcl_archiver.repack_data
+# Repack verified smaller copies and update only catalogue byte counts:
+python -m wcl_archiver.repack_data --apply --compression compact
+```
+
+Repacking preserves all four logical sections, full source responses, and scan/queue history. A candidate replaces its original only after exact logical verification and only when it is smaller. Failed candidates leave the original intact. Use the updated application to open version 3 files.
 
 An intentional fresh-collection reset must stop the server and collection workers first. The reset utility removes recognized `mplus_s5/`, `raids/`, legacy `raw/`, and `staging/` collection directories plus catalogue/scan databases, confined to the chosen data directory. It preserves `auth_session.json`, browser profiles, and unrecognized top-level paths. It rejects links and reparse points before deleting anything.
 

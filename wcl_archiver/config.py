@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -161,3 +162,4 @@ class AppConfig:
     download_concurrency: int = 4
     browser_request_concurrency: int = 8
     pack_workers: int = 4
+    archive_compression: str = field(default_factory=lambda: os.environ.get("WCL_ARCHIVE_COMPRESSION", "compact"))

@@ -1,7 +1,7 @@
-"""Self-contained, full-field WCLF2 archives with transient capture buffers.
+"""Self-contained, full-field WCLF3 archives with transient capture buffers.
 
-Only write_fight touches the filesystem. Original JSON values are authoritative;
-wire whitespace is intentionally discarded. Each independent Zstd section has a
+Writers touch the filesystem only during publication. JSON values are authoritative;
+wire whitespace is intentionally discarded. Each independent compressed section has a
 SHA-256 checksum over its MessagePack representation.
 
 Event tables contain count and dynamic columns. Each column stores only its
@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
+import lzma
 import os
 from pathlib import Path
 import re
@@ -28,7 +29,9 @@ import msgpack
 import zstandard as zstd
 
 
-MAGIC = b"WCLF\x02"
+MAGIC = b"WCLF\x03"
+LEGACY_MAGIC = b"WCLF\x02"
+SECTION_NAMES = ("summary", "events", "replay", "metadata")
 _MISSING = msgpack.ExtType(1, b"")
 _BYTE_SET_BITS = tuple(tuple(bit for bit in range(8) if byte & (1 << bit)) for byte in range(256))
 
@@ -116,6 +119,79 @@ def _prefix_bitmap(present_count, byte_count):
     return result
 
 
+def _validate_table(table):
+    """Validate lengths without allocating an event dictionary per row."""
+    count, columns = table["count"], table["columns"]
+    if type(count) is not int or count < 0 or not isinstance(columns, dict):
+        raise ValueError("Corrupt archive column table")
+    for column in columns.values():
+        values = column if isinstance(column, list) else column["values"]
+        presence = None if isinstance(column, list) else column.get("presence")
+        if not isinstance(values, list):
+            raise ValueError("Corrupt archive column values")
+        if presence is None:
+            valid = len(values) == count
+        else:
+            valid = (isinstance(presence, bytes) and len(presence) == (count + 7) >> 3
+                     and (not count & 7 or not presence[-1] >> (count & 7))
+                     and int.from_bytes(presence, "little").bit_count() == len(values))
+        if not valid:
+            raise ValueError("Corrupt archive column lengths or presence bitmap")
+
+
+def _encode_table(table, canonical=None):
+    _validate_table(table)
+    columns, shared, deltas = {}, {}, []
+    compressor = zstd.ZstdCompressor(level=9)
+    for key, column in table["columns"].items():
+        if (canonical is not None and table["count"] == canonical["count"]
+                and key in canonical["columns"] and _pack(column) == _pack(canonical["columns"][key])):
+            shared[key] = key
+            continue
+        if isinstance(column, dict) and column["values"] and all(type(v) is int for v in column["values"]):
+            previous, differences = 0, []
+            for value in column["values"]:
+                differences.append(value - previous)
+                previous = value
+            candidate = {**column, "values": differences}
+            if len(compressor.compress(_pack([candidate, key]))) < len(compressor.compress(_pack([column]))):
+                column = candidate
+                deltas.append(key)
+        columns[key] = column
+    return {"table": {**table, "columns": columns}, "shared_columns": shared,
+            "column_order": list(table["columns"]), "delta_columns": deltas}
+
+
+def _decode_table(encoded, canonical=None):
+    table = encoded["table"]
+    columns, shared = table["columns"], encoded["shared_columns"]
+    order, deltas = encoded["column_order"], encoded["delta_columns"]
+    if (not isinstance(columns, dict) or not isinstance(shared, dict) or not isinstance(order, list)
+            or not isinstance(deltas, list) or len(set(order)) != len(order)
+            or len(set(deltas)) != len(deltas) or set(columns) & set(shared)
+            or set(order) != set(columns) | set(shared) or not set(deltas) <= set(columns)):
+        raise ValueError("Corrupt archive column encoding")
+    if shared and (canonical is None or type(table["count"]) is not int or table["count"] != canonical["count"]):
+        raise ValueError("Corrupt archive reference count")
+    for key, reference in shared.items():
+        if reference != key or reference not in canonical["columns"]:
+            raise ValueError("Corrupt archive column reference")
+        columns[key] = canonical["columns"][reference]
+    for key in deltas:
+        column = columns[key]
+        values = column["values"]
+        if not isinstance(values, list) or not all(type(v) is int for v in values):
+            raise ValueError("Corrupt archive integer delta column")
+        previous, restored = 0, []
+        for value in values:
+            previous += value
+            restored.append(previous)
+        columns[key] = {**column, "values": restored}
+    table["columns"] = {key: columns[key] for key in order}
+    _validate_table(table)
+    return table
+
+
 def _records(table):
     count, columns = table["count"], table["columns"]
     if not isinstance(count, int) or count < 0 or not isinstance(columns, dict):
@@ -195,7 +271,10 @@ def _page_template(body, path):
 class FightArchive:
     supports_parallel_event_pages = True
 
-    def __init__(self, root):
+    def __init__(self, root, compression="compact"):
+        if compression not in ("fast", "compact"):
+            raise ValueError("Unknown archive compression profile")
+        self.compression = compression
         self.root = Path(root)  # Compatibility only; never created or accessed.
         self._scope = ContextVar("fight_capture_" + uuid.uuid4().hex, default=None)
         self._captures = {}
@@ -406,8 +485,6 @@ class FightArchive:
             completed = self._completed[key]
         except KeyError as exc:
             raise ValueError("No complete source archive for this fight") from exc
-        path = Path(path)
-        tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             events, replay, capture_rows = [], [], []
             for cap in [completed["master"], *completed["pages"], *completed["replay"]]:
@@ -423,13 +500,36 @@ class FightArchive:
                 capture_rows.append(record)
             metadata = {"manifest": completed["manifest"], "captures": capture_rows}
             sections = {"summary": summary, "events": _columns(events), "replay": _columns(replay), "metadata": metadata}
+            return self.write_sections(path, sections, compression=self.compression)
+        finally:
+            self._completed.pop(key, None)
+            self._drop_attempt(completed["manifest"]["fetch_id"])
+
+    @staticmethod
+    def write_sections(path, sections, compression="compact"):
+        """Verify all logical sections before atomically publishing a standalone file."""
+        if compression not in ("fast", "compact") or set(sections) != set(SECTION_NAMES):
+            raise ValueError("Unknown compression profile or archive sections")
+        path = Path(path)
+        tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
             index, chunks, offset = {}, [], 0
             compressor = zstd.ZstdCompressor(level=9)
-            for name, value in sections.items():
+            for name in SECTION_NAMES:
+                value = sections[name]
+                if name in ("events", "replay"):
+                    value = _encode_table(value, sections["events"] if name == "replay" else None)
                 raw = _pack(value)
                 compressed = compressor.compress(raw)
+                codec = "zstd"
+                if compression == "compact":
+                    candidate = lzma.compress(raw, preset=6)
+                    if len(candidate) < len(compressed):
+                        compressed, codec = candidate, "lzma"
                 index[name] = {"offset": offset, "length": len(compressed), "size": len(raw),
-                               "sha256": hashlib.sha256(raw).digest()}
+                               "sha256": hashlib.sha256(raw).digest(), "compression": codec}
+                if name in ("events", "replay"):
+                    index[name]["encoding"] = "columns-v1"
                 chunks.append(compressed)
                 offset += len(compressed)
             header = _pack(index)
@@ -440,47 +540,79 @@ class FightArchive:
                     stream.write(chunk)
                 stream.flush()
                 os.fsync(stream.fileno())
-            # Check every section and all full-field event records before publication.
-            for name in ("summary", "metadata"):
+            for name in SECTION_NAMES:
                 if _pack(PackedFightReader._read_section(tmp, name)) != _pack(sections[name]):
                     raise ValueError("Fight section verification failed")
-            if PackedFightReader.read_raw_events(tmp) != events or PackedFightReader._read_replay_events(tmp) != replay:
-                raise ValueError("Fight full-field event verification failed")
             os.replace(tmp, path)
             return path.stat().st_size
         finally:
             tmp.unlink(missing_ok=True)
-            self._completed.pop(key, None)
-            self._drop_attempt(completed["manifest"]["fetch_id"])
 
 
 class PackedFightReader:
     @staticmethod
     def is_packed_fight(path):
         with Path(path).open("rb") as stream:
-            return stream.read(len(MAGIC)) == MAGIC
+            return stream.read(len(MAGIC)) in (MAGIC, LEGACY_MAGIC)
 
     @staticmethod
     def _read_section(path, name):
         try:
             with Path(path).open("rb") as stream:
-                if stream.read(5) != MAGIC:
-                    raise ValueError("Invalid WCLF2 archive")
+                magic = stream.read(5)
+                if magic not in (MAGIC, LEGACY_MAGIC):
+                    raise ValueError("Corrupt or invalid WCLF archive")
                 header_size = struct.unpack("<I", stream.read(4))[0]
                 if header_size > 1024 * 1024:
                     raise ValueError("Corrupt archive header")
                 index = _unpack(stream.read(header_size))
                 section = index[name]
+                ranges = []
+                for section_name in SECTION_NAMES:
+                    entry = index[section_name]
+                    if any(type(entry[field]) is not int or entry[field] < 0 for field in ("offset", "length", "size")):
+                        raise ValueError("Corrupt archive section range")
+                    end = entry["offset"] + entry["length"]
+                    if not entry["length"] or not entry["size"] or 9 + header_size + end > os.fstat(stream.fileno()).st_size:
+                        raise ValueError("Corrupt archive section range")
+                    ranges.append((entry["offset"], end))
+                ranges.sort()
+                if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+                    raise ValueError("Corrupt overlapping archive sections")
                 stream.seek(9 + header_size + section["offset"])
                 compressed = stream.read(section["length"])
                 if len(compressed) != section["length"]:
                     raise ValueError("Corrupt truncated archive section")
-            raw = zstd.ZstdDecompressor().decompress(compressed, max_output_size=section["size"])
+            codec = section.get("compression", "zstd" if magic == LEGACY_MAGIC else None)
+            if magic == LEGACY_MAGIC and (codec != "zstd" or section.get("encoding") is not None):
+                raise ValueError("Corrupt legacy archive encoding")
+            if codec == "zstd":
+                raw = zstd.ZstdDecompressor().decompress(compressed, max_output_size=section["size"])
+            elif codec == "lzma":
+                decoder = lzma.LZMADecompressor(memlimit=128 * 1024 * 1024)
+                raw = decoder.decompress(compressed, max_length=section["size"] + 1)
+                if not decoder.eof or decoder.unused_data:
+                    raise ValueError("Corrupt archive LZMA section")
+            else:
+                raise ValueError("Unknown archive compression codec")
             if len(raw) != section["size"] or hashlib.sha256(raw).digest() != section["sha256"]:
                 raise ValueError("Corrupt archive section checksum")
-            return _unpack(raw)
-        except (OSError, KeyError, TypeError, struct.error, msgpack.UnpackException, zstd.ZstdError) as exc:
-            raise ValueError("Corrupt or missing WCLF2 archive section") from exc
+            value = _unpack(raw)
+            encoding = section.get("encoding")
+            if encoding is None:
+                if magic == MAGIC and name in ("events", "replay"):
+                    raise ValueError("Corrupt missing archive column encoding")
+                return value
+            if magic != MAGIC or encoding != "columns-v1" or name not in ("events", "replay"):
+                raise ValueError("Unknown archive section encoding")
+            canonical = PackedFightReader._read_section(path, "events") if name == "replay" and value["shared_columns"] else None
+            return _decode_table(value, canonical)
+        except (OSError, KeyError, TypeError, IndexError, AttributeError, struct.error, msgpack.UnpackException, zstd.ZstdError, lzma.LZMAError) as exc:
+            raise ValueError("Corrupt or missing WCLF archive section") from exc
+
+    @classmethod
+    def read_sections(cls, path):
+        return {name: cls._read_section(path, name) for name in SECTION_NAMES}
 
     @classmethod
     def read_summary_only(cls, path):
