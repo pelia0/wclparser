@@ -3,7 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <title>WCL Legion 7.3.5 Archiver &amp; Offline Viewer</title>
-  <link rel="stylesheet" href="/styles.css?v=3" />
+  <link rel="stylesheet" href="/styles.css?v=5" />
+  <script>
+    const whTooltips = { colorLinks: true, iconizeLinks: true, renameLinks: true };
+  </script>
+  <script src="https://wow.zamimg.com/js/tooltips.js"></script>
 </head>
 <body>
   <header class="topbar">
@@ -26,7 +30,21 @@
         </select>
         <select id="filter-encounter"><option value="">All Dungeons / Bosses</option></select>
         <select id="filter-spec"><option value="">All Specializations (36)</option></select>
+        <select id="filter-difficulty">
+          <option value="">All Raid Difficulties</option>
+          <option value="5">Mythic</option>
+          <option value="4">Heroic</option>
+          <option value="3">Normal</option>
+          <option value="1">LFR</option>
+        </select>
         <input type="number" id="filter-min-key" placeholder="Min Key (+20)" min="2" max="35" />
+        <select id="filter-status" aria-label="Archive status">
+          <option value="PACKED" selected>Packed fights</option>
+          <option value="QUEUED">Queued fights</option>
+          <option value="RETRY">Retryable fights</option>
+          <option value="FAILED">Failed fights</option>
+          <option value="all">All statuses</option>
+        </select>
         <button id="btn-search" class="btn-primary">Search Logs</button>
       </div>
       <table class="data-table">
@@ -36,23 +54,48 @@
             <th>Key / Difficulty</th>
             <th>Duration</th>
             <th>Participants</th>
-            <th>File Size (.wclz)</th>
+            <th>Status</th>
+            <th>Viewer Cache Size</th>
             <th>Action</th>
           </tr>
         </thead>
         <tbody id="fights-tbody"></tbody>
       </table>
+      <div class="filter-bar" style="margin-top: 12px;">
+        <button id="btn-fights-prev" class="nav-btn" disabled>Previous</button>
+        <span id="fights-page-label">No fights</span>
+        <button id="btn-fights-next" class="nav-btn" disabled>Next</button>
+      </div>
     </section>
 
     <!-- VIEW 2: SINGLE FIGHT ANALYZER -->
     <section id="view-fight" class="view">
       <div class="fight-header" id="fight-header-info">Select a fight from the Explorer</div>
+      <p id="fight-source-links" class="hidden">
+        <a id="fight-source-manifest" target="_blank" rel="noopener">Original source responses</a>
+        &nbsp;|&nbsp;
+        <a id="fight-source-events" target="_blank" rel="noopener">All original event fields (JSON)</a>
+      </p>
+      <div class="filter-bar" id="fight-global-filters" style="margin-bottom: 12px; align-items: center;">
+        <label style="font-size: 13px; color: #94a3b8;">Source / Player:
+          <select id="fight-filter-player" style="margin-left: 6px; min-width: 200px;">
+            <option value="">All Players</option>
+          </select>
+        </label>
+        <label style="font-size: 13px; color: #94a3b8;">Target:
+          <select id="fight-filter-target" style="margin-left: 6px; min-width: 220px;">
+            <option value="">All Targets</option>
+          </select>
+        </label>
+        <button id="fight-filter-reset" class="nav-btn" style="padding: 6px 12px;">Reset Filters</button>
+      </div>
       <div class="sub-tabs">
         <button class="tab-btn active" data-tab="damage">Damage Done</button>
         <button class="tab-btn" data-tab="healing">Healing Done</button>
+        <button class="tab-btn" data-tab="events">Events Log</button>
         <button class="tab-btn" data-tab="casts">Casts &amp; Rotation Timeline</button>
         <button class="tab-btn" data-tab="buffs">Buffs &amp; Uptimes</button>
-        <button class="tab-btn" data-tab="builds">Builds &amp; Talents</button>
+        <button class="tab-btn" data-tab="builds">Builds &amp; Talents (Wowhead)</button>
         <button class="tab-btn" data-tab="deaths">Interrupts &amp; Deaths</button>
         <button class="tab-btn" data-tab="replay2d">2D Map Replay (60 FPS)</button>
       </div>
@@ -60,16 +103,21 @@
       <div id="replay-container" class="replay-box hidden">
         <div class="replay-controls">
           <button id="replay-play" class="btn-primary">Play / Pause</button>
-          <input type="range" id="replay-scrubber" min="0" max="1000" value="0" />
-          <span id="replay-time-label">00:00.0</span>
-          <select id="replay-speed">
+          <input type="range" id="replay-scrubber" min="0" max="1000" value="0" style="flex: 1;" />
+          <span id="replay-time-label" style="min-width: 110px;">00:00.0</span>
+          <select id="replay-speed" title="Playback Speed">
             <option value="0.5">0.5x</option>
             <option value="1" selected>1x</option>
             <option value="2">2x</option>
             <option value="4">4x</option>
+            <option value="8">8x</option>
+          </select>
+          <select id="replay-camera-mode" title="Camera Mode">
+            <option value="follow" selected>Camera: Follow Party (Auto-Zoom)</option>
+            <option value="full">Camera: Full Dungeon Map</option>
           </select>
         </div>
-        <canvas id="replay-canvas" width="1100" height="620"></canvas>
+        <canvas id="replay-canvas" width="1100" height="620" style="background: #090d14; border: 1px solid #2a364b; border-radius: 6px; cursor: grab;"></canvas>
       </div>
     </section>
 
@@ -96,10 +144,31 @@
       </div>
 
       <div class="card">
-        <h2>2. Harvester Control &amp; Bulk Extraction (Zstd Level 22 .wclz)</h2>
+        <h2>2. Harvester Control &amp; Historical Source Collection</h2>
+        <div class="filter-bar" style="align-items: center; margin-bottom: 10px;">
+          <label>Mode:
+            <select id="harvest-source-mode" style="margin-left: 6px;">
+              <option value="browser" selected>Visible browser</option>
+              <option value="api">API v2</option>
+            </select>
+          </label>
+          <button id="btn-browser-open" class="btn-primary">Open Browser Window</button>
+          <button id="btn-browser-close" class="nav-btn">Close Browser</button>
+          <span style="color: #94a3b8; font-size: 13px;">Browser state: <strong id="browser-state-label" style="color: #e2e8f0;">not_started</strong></span>
+        </div>
+        <div id="browser-action-banner" style="margin-bottom: 12px; padding: 10px 12px; border-radius: 6px; display: none; background: #422006; border: 1px solid #f59e0b; color: #fde68a; font-weight: 600;"></div>
         <div class="filter-bar" style="align-items: center;">
-          <label>Pages per Spec (<strong>0 = ALL / Download Everything</strong>, 1 = Top 100):
-            <input type="number" id="harvest-pages" value="0" min="0" max="1000" style="width: 90px; margin-left: 6px;" />
+          <label>Pages per Spec (<strong>default 2</strong>; 0 = all available pages):
+            <input type="number" id="harvest-pages" value="2" min="0" max="1000" style="width: 90px; margin-left: 6px;" />
+          </label>
+          <label>Raid Difficulty:
+            <select id="harvest-raid-difficulty" style="margin-left: 6px;">
+              <option value="0" selected>All (Mythic + Heroic + Normal + LFR)</option>
+              <option value="5">Mythic Only</option>
+              <option value="4">Heroic Only</option>
+              <option value="3">Normal Only</option>
+              <option value="1">LFR Only</option>
+            </select>
           </label>
           <button id="btn-harvest-mplus" class="btn-primary">Start Mythic+ Season 5 (7.3.5) Harvest</button>
           <button id="btn-harvest-raids" class="btn-primary">Start All 5 Legion Raids Harvest</button>
@@ -137,13 +206,17 @@
               <div id="stat-queued" style="font-weight: 700; font-size: 15px; margin-top: 2px;">0</div>
             </div>
             <div style="background: #18202c; padding: 8px 10px; border-radius: 6px; border: 1px solid #2a364b;">
-              <div style="color: #94a3b8;">Packed (.wclz)</div>
+              <div style="color: #94a3b8;">Packed Fights</div>
               <div id="stat-packed" style="font-weight: 700; font-size: 15px; margin-top: 2px; color: #4ade80;">0</div>
             </div>
             <div style="background: #18202c; padding: 8px 10px; border-radius: 6px; border: 1px solid #2a364b;">
-              <div style="color: #94a3b8;">Compressed Size</div>
+              <div style="color: #94a3b8;">Viewer Cache Size</div>
               <div id="stat-size" style="font-weight: 700; font-size: 15px; margin-top: 2px;">0 MB</div>
             </div>
+          </div>
+          <div style="margin-top: 10px; font-size: 13px; color: #94a3b8;">
+            Pending: <span id="stat-pending">0 reports / 0 retries</span> |
+            Failed: <span id="stat-failures">0 reports / 0 fights</span>
           </div>
         </div>
 
@@ -153,7 +226,7 @@
     </section>
   </main>
 
-  <script src="/replay2d.js?v=3"></script>
-  <script src="/app.js?v=3"></script>
+  <script src="/replay2d.js?v=6"></script>
+  <script src="/app.js?v=6"></script>
 </body>
 </html>

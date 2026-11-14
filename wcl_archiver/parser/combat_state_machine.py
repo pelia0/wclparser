@@ -24,7 +24,9 @@ class CombatStateMachine:
                 pet_owner_map[aid] = int(a["petOwner"])
 
         ability_map: Dict[int, Dict[str, Any]] = {
-            int(ab["gameID"]): ab for ab in abilities if "gameID" in ab
+            int(ab["gameID"] if "gameID" in ab else ab["guid"]): ab
+            for ab in abilities
+            if "gameID" in ab or "guid" in ab
         }
 
         combatant_builds: Dict[str, Dict[str, Any]] = {}
@@ -53,9 +55,17 @@ class CombatStateMachine:
             abs_t = int(ev.get("timestamp", start_time))
             rel_t = max(0, min(duration_ms, abs_t - start_time))
             ev_type = str(ev.get("type", "unknown"))
-            src_id = int(ev.get("sourceID", 0) or 0)
-            tgt_id = int(ev.get("targetID", 0) or 0)
-            ability_id = int(ev.get("abilityGameID", 0) or 0)
+            src_id = int(ev.get("sourceID", 0) or (ev.get("source") or {}).get("id", 0) or 0)
+            tgt_id = int(ev.get("targetID", 0) or (ev.get("target") or {}).get("id", 0) or 0)
+            ab_obj = ev.get("ability") if isinstance(ev.get("ability"), dict) else None
+            ability_id = int(ev.get("abilityGameID", 0) or (ab_obj.get("guid", 0) if ab_obj else 0) or 0)
+            if ab_obj and ability_id and ability_id not in ability_map:
+                ability_map[ability_id] = {
+                    "gameID": ability_id,
+                    "name": str(ab_obj.get("name", f"Spell #{ability_id}")),
+                    "type": int(ab_obj.get("type", 1) or 1),
+                    "icon": str(ab_obj.get("abilityIcon", "")),
+                }
 
             if ev_type == "summon" and src_id and tgt_id:
                 pet_owner_map[tgt_id] = pet_owner_map.get(src_id, src_id)
@@ -142,13 +152,24 @@ class CombatStateMachine:
                     )
 
             elif ev_type == "interrupt":
+                ex_ab = ev.get("extraAbility") if isinstance(ev.get("extraAbility"), dict) else None
+                interrupted_id = int(
+                    ev.get("extraAbilityGameID", 0) or (ex_ab.get("guid", 0) if ex_ab else 0) or 0
+                )
+                if ex_ab and interrupted_id and interrupted_id not in ability_map:
+                    ability_map[interrupted_id] = {
+                        "gameID": interrupted_id,
+                        "name": str(ex_ab.get("name", f"Spell #{interrupted_id}")),
+                        "type": int(ex_ab.get("type", 1) or 1),
+                        "icon": str(ex_ab.get("abilityIcon", "")),
+                    }
                 interrupts.append(
                     {
                         "t_ms": rel_t,
                         "source_id": owner_id,
                         "target_id": tgt_id,
                         "ability_id": ability_id,
-                        "interrupted_ability_id": int(ev.get("extraAbilityGameID", 0) or 0),
+                        "interrupted_ability_id": interrupted_id,
                     }
                 )
 
@@ -162,11 +183,18 @@ class CombatStateMachine:
                 recent = [
                     h for h in incoming_history[tgt_id] if window_start <= h["t_ms"] <= rel_t
                 ]
+                kill_ab = ev.get("killingAbility") if isinstance(ev.get("killingAbility"), dict) else None
+                killing_id = int(
+                    ev.get("killingAbilityGameID", 0)
+                    or (kill_ab.get("guid", 0) if kill_ab else 0)
+                    or ability_id
+                    or 0
+                )
                 deaths.append(
                     {
                         "t_ms": rel_t,
                         "target_id": tgt_id,
-                        "killing_ability_id": int(ev.get("killingAbilityGameID", 0) or 0),
+                        "killing_ability_id": killing_id,
                         "recent_events": recent,
                     }
                 )
@@ -278,6 +306,7 @@ class CombatStateMachine:
             "encounter_id": int(fight_meta.get("encounter_id", 0)),
             "name": fight_meta.get("name", ""),
             "keystone_level": int(fight_meta.get("keystone_level", 0)),
+            "difficulty": int(fight_meta.get("difficulty", 0) or 0),
             "affixes": fight_meta.get("affixes", []),
             "duration_ms": duration_ms,
             "actors": actors,

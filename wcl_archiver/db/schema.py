@@ -2,10 +2,12 @@ from contextlib import contextmanager
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 class IndexDB:
+    MAX_WORK_ATTEMPTS = 3
+
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,12 +70,55 @@ class IndexDB:
                     UNIQUE(fight_uid, player_name, class_name, spec_name)
                 );
 
+                CREATE TABLE IF NOT EXISTS scan_history (
+                    zone_id INTEGER NOT NULL,
+                    encounter_id INTEGER NOT NULL,
+                    partition INTEGER NOT NULL,
+                    difficulty INTEGER NOT NULL DEFAULT 0,
+                    class_name TEXT NOT NULL,
+                    spec_name TEXT NOT NULL,
+                    page INTEGER NOT NULL,
+                    refs_found INTEGER NOT NULL DEFAULT 0,
+                    is_exhausted INTEGER NOT NULL DEFAULT 0,
+                    scanned_at INTEGER DEFAULT (strftime('%s','now')),
+                    PRIMARY KEY (zone_id, encounter_id, partition, difficulty, class_name, spec_name, page)
+                );
+
+                CREATE TABLE IF NOT EXISTS scan_failures (
+                    zone_id INTEGER NOT NULL,
+                    encounter_id INTEGER NOT NULL,
+                    partition INTEGER NOT NULL,
+                    difficulty INTEGER NOT NULL DEFAULT 0,
+                    class_name TEXT NOT NULL,
+                    spec_name TEXT NOT NULL,
+                    page INTEGER NOT NULL,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER DEFAULT (strftime('%s','now')),
+                    PRIMARY KEY (zone_id, encounter_id, partition, difficulty, class_name, spec_name, page)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_fights_lookup
                     ON fights(content_type, zone_id, encounter_id, status);
                 CREATE INDEX IF NOT EXISTS idx_participants_spec
                     ON fight_participants(class_name, spec_name, fight_uid);
                 """
             )
+            # Existing catalogues gain retry metadata in place.
+            for table in ("reports", "fights"):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for column, declaration in (
+                    ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_error", "TEXT NOT NULL DEFAULT ''"),
+                ):
+                    if column not in columns:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            conn.execute("""
+                UPDATE fights SET status = 'FAILED', last_error = 'Report unavailable: ' ||
+                    COALESCE((SELECT last_error FROM reports WHERE reports.report_code = fights.report_code), '')
+                WHERE status IN ('QUEUED', 'RETRY') AND report_code IN
+                    (SELECT report_code FROM reports WHERE archive_status = 'FAILED')
+            """)
 
     @staticmethod
     def make_fight_uid(report_code: str, fight_id: int) -> str:
@@ -124,6 +169,12 @@ class IndexDB:
                 ),
             )
             inserted = cur.rowcount > 0
+            conn.execute("""
+                UPDATE fights SET status = 'FAILED', last_error = 'Report unavailable: ' ||
+                    (SELECT last_error FROM reports WHERE report_code = ?)
+                WHERE fight_uid = ? AND status IN ('QUEUED', 'RETRY') AND EXISTS
+                    (SELECT 1 FROM reports WHERE report_code = ? AND archive_status = 'FAILED')
+            """, (report_code, fight_uid, report_code))
             if participant:
                 conn.execute(
                     """
@@ -150,9 +201,23 @@ class IndexDB:
     def mark_report_unarchived(self, report_code: str, status: str = "UNARCHIVED") -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE reports SET archive_status = ?, updated_at = strftime('%s','now') WHERE report_code = ?",
+                "UPDATE reports SET archive_status = ?, last_error = '', updated_at = strftime('%s','now') WHERE report_code = ?",
                 (status, report_code),
             )
+
+    def mark_report_failed(self, report_code: str, reason: str = "") -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO reports (report_code) VALUES (?)", (report_code,))
+            conn.execute("""
+                UPDATE reports SET failure_count = failure_count + 1, last_error = ?,
+                    archive_status = CASE WHEN failure_count + 1 >= ? THEN 'FAILED' ELSE 'RETRY' END,
+                    updated_at = strftime('%s','now') WHERE report_code = ?
+            """, (reason, self.MAX_WORK_ATTEMPTS, report_code))
+            conn.execute("""
+                UPDATE fights SET status = 'FAILED', last_error = ?
+                WHERE report_code = ? AND status IN ('QUEUED', 'RETRY') AND EXISTS
+                    (SELECT 1 FROM reports WHERE report_code = ? AND archive_status = 'FAILED')
+            """, (f"Report unavailable: {reason}", report_code, report_code))
 
     def mark_fight_packed(
         self,
@@ -161,6 +226,7 @@ class IndexDB:
         file_rel_path: str,
         compressed_bytes: int,
         event_count: int,
+        duration_ms: Optional[int] = None,
     ) -> None:
         fight_uid = self.make_fight_uid(report_code, fight_id)
         with self._connect() as conn:
@@ -170,34 +236,194 @@ class IndexDB:
                 SET status = 'PACKED',
                     file_rel_path = ?,
                     compressed_bytes = ?,
-                    event_count = ?
+                    event_count = ?,
+                    duration_ms = COALESCE(?, duration_ms),
+                    last_error = ''
                 WHERE fight_uid = ?
                 """,
-                (file_rel_path, compressed_bytes, event_count, fight_uid),
+                (file_rel_path, compressed_bytes, event_count, duration_ms, fight_uid),
             )
+
+    def mark_fight_failed(self, report_code: str, fight_id: int, reason: str = "") -> None:
+        fight_uid = self.make_fight_uid(report_code, fight_id)
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE fights SET failure_count = failure_count + 1, last_error = ?,
+                    status = CASE WHEN failure_count + 1 >= ? THEN 'FAILED' ELSE 'RETRY' END
+                    WHERE fight_uid = ?""",
+                (reason, self.MAX_WORK_ATTEMPTS, fight_uid),
+            )
+
+    def get_queue_counts(self) -> Dict[str, int]:
+        with self._connect() as conn:
+            counts = {}
+            for key, table, column, status in (
+                ("pending_reports", "reports", "archive_status", "PENDING"),
+                ("queued_fights", "fights", "status", "QUEUED"),
+                ("retryable_reports", "reports", "archive_status", "RETRY"),
+                ("retryable_fights", "fights", "status", "RETRY"),
+                ("failed_reports", "reports", "archive_status", "FAILED"),
+                ("failed_fights", "fights", "status", "FAILED"),
+            ):
+                counts[key] = int(conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (status,)
+                ).fetchone()[0])
+            counts["failed_scan_pages"] = int(conn.execute("SELECT COUNT(*) FROM scan_failures").fetchone()[0])
+            return counts
+
+    def retry_failed_work(self, report_code: Optional[str] = None) -> None:
+        """Open a fresh retry budget only when the user starts another harvest."""
+        with self._connect() as conn:
+            scope = " AND report_code = ?" if report_code is not None else ""
+            params = (report_code,) if report_code is not None else ()
+            conn.execute("""UPDATE reports SET archive_status = 'PENDING', failure_count = 0
+                WHERE archive_status IN ('RETRY', 'FAILED')""" + scope, params)
+            conn.execute("""UPDATE fights SET status = 'QUEUED', failure_count = 0
+                WHERE status IN ('RETRY', 'FAILED')""" + scope, params)
 
     def get_pending_reports_for_unarchive(self, limit: int = 30) -> List[str]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT report_code FROM reports WHERE archive_status = 'PENDING' LIMIT ?",
-                (limit,),
+                """SELECT report_code FROM reports WHERE archive_status IN ('PENDING', 'RETRY')
+                    AND failure_count < ? ORDER BY failure_count ASC, report_code ASC LIMIT ?""",
+                (self.MAX_WORK_ATTEMPTS, limit),
             ).fetchall()
             return [r["report_code"] for r in rows]
 
-    def get_unarchived_pending_fights(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_unarchived_pending_fights(self, limit: int = 20, report_code: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._connect() as conn:
+            scope = " AND f.report_code = ?" if report_code is not None else ""
+            params = [self.MAX_WORK_ATTEMPTS]
+            if report_code is not None:
+                params.append(report_code)
+            params.append(limit)
             rows = conn.execute(
-                """
+                f"""
                 SELECT f.*
                 FROM fights f
                 JOIN reports r ON r.report_code = f.report_code
-                WHERE r.archive_status = 'UNARCHIVED' AND f.status = 'QUEUED'
-                ORDER BY f.keystone_level DESC, f.duration_ms ASC
+                WHERE r.archive_status = 'UNARCHIVED' AND f.status IN ('QUEUED', 'RETRY')
+                    AND f.failure_count < ? {scope}
+                ORDER BY f.failure_count ASC, f.keystone_level DESC, f.duration_ms ASC, f.fight_uid ASC
                 LIMIT ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def is_page_scanned(
+        self,
+        zone_id: int,
+        encounter_id: int,
+        partition: int,
+        class_name: str,
+        spec_name: str,
+        page: int,
+        difficulty: int = 0,
+    ) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM scan_history
+                WHERE zone_id = ? AND encounter_id = ? AND partition = ?
+                  AND difficulty = ? AND class_name = ? AND spec_name = ? AND page = ?
+                """,
+                (zone_id, encounter_id, partition, difficulty, class_name, spec_name, page),
+            ).fetchone()
+            return row is not None
+
+    def get_exhausted_page(
+        self,
+        zone_id: int,
+        encounter_id: int,
+        partition: int,
+        class_name: str,
+        spec_name: str,
+        difficulty: int = 0,
+    ) -> Optional[int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(page) AS min_exhausted_page FROM scan_history
+                WHERE zone_id = ? AND encounter_id = ? AND partition = ?
+                  AND difficulty = ? AND class_name = ? AND spec_name = ? AND is_exhausted = 1
+                """,
+                (zone_id, encounter_id, partition, difficulty, class_name, spec_name),
+            ).fetchone()
+            if row and row["min_exhausted_page"] is not None:
+                return int(row["min_exhausted_page"])
+            return None
+
+    def mark_page_failed(
+        self,
+        zone_id: int,
+        encounter_id: int,
+        partition: int,
+        class_name: str,
+        spec_name: str,
+        page: int,
+        difficulty: int = 0,
+        reason: str = "",
+        attempts: int = 3,
+    ) -> None:
+        """Record an exhausted page without certifying it as scanned."""
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO scan_failures (
+                    zone_id, encounter_id, partition, difficulty, class_name, spec_name,
+                    page, failure_count, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(zone_id, encounter_id, partition, difficulty, class_name, spec_name, page)
+                DO UPDATE SET failure_count = scan_failures.failure_count + excluded.failure_count,
+                    last_error = excluded.last_error, updated_at = strftime('%s','now')
+            """, (zone_id, encounter_id, partition, difficulty, class_name, spec_name,
+                  page, max(1, int(attempts)), reason))
+
+    def mark_page_scanned(
+        self,
+        zone_id: int,
+        encounter_id: int,
+        partition: int,
+        class_name: str,
+        spec_name: str,
+        page: int,
+        refs_found: int,
+        is_exhausted: bool = False,
+        difficulty: int = 0,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scan_history (
+                    zone_id, encounter_id, partition, difficulty, class_name, spec_name,
+                    page, refs_found, is_exhausted, scanned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+                """,
+                (
+                    zone_id,
+                    encounter_id,
+                    partition,
+                    difficulty,
+                    class_name,
+                    spec_name,
+                    page,
+                    int(refs_found),
+                    1 if is_exhausted else 0,
+                ),
+            )
+            conn.execute("""
+                DELETE FROM scan_failures WHERE zone_id = ? AND encounter_id = ? AND partition = ?
+                    AND difficulty = ? AND class_name = ? AND spec_name = ? AND page = ?
+            """, (zone_id, encounter_id, partition, difficulty, class_name, spec_name, page))
+
+    def get_scanned_pages_count(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM scan_history").fetchone()
+            return int(row["c"]) if row else 0
+
+    def clear_scan_history(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM scan_history")
 
     def search_fights(
         self,
@@ -206,11 +432,17 @@ class IndexDB:
         class_name: Optional[str] = None,
         spec: Optional[str] = None,
         min_key_level: Optional[int] = None,
+        difficulty: Optional[int] = None,
         status: Optional[str] = None,
         limit: int = 100,
+        offset: int = 0,
+        report_code: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         clauses = ["1=1"]
         params: List[Any] = []
+        if report_code is not None:
+            clauses.append("f.report_code = ?")
+            params.append(report_code)
         if content_type:
             clauses.append("f.content_type = ?")
             params.append(content_type)
@@ -220,6 +452,9 @@ class IndexDB:
         if min_key_level is not None:
             clauses.append("f.keystone_level >= ?")
             params.append(min_key_level)
+        if difficulty is not None:
+            clauses.append("f.difficulty = ?")
+            params.append(difficulty)
         if status:
             clauses.append("f.status = ?")
             params.append(status)
@@ -235,13 +470,13 @@ class IndexDB:
                 f"EXISTS (SELECT 1 FROM fight_participants fp WHERE fp.fight_uid = f.fight_uid AND {' AND '.join(sub_clauses)})"
             )
 
-        params.append(limit)
+        params.extend((limit, max(0, offset)))
         sql = f"""
             SELECT f.*
             FROM fights f
             WHERE {' AND '.join(clauses)}
-            ORDER BY f.keystone_level DESC, f.duration_ms ASC
-            LIMIT ?
+            ORDER BY f.keystone_level DESC, f.duration_ms ASC, f.fight_uid ASC
+            LIMIT ? OFFSET ?
         """
         with self._connect() as conn:
             fight_rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -298,6 +533,15 @@ class MasterDictDB:
             conn.execute(
                 "INSERT OR REPLACE INTO spells (spell_id, name, school, icon) VALUES (?, ?, ?, ?)",
                 (int(spell_id), name, int(school), icon),
+            )
+
+    def upsert_spells_batch(self, spells: List[Tuple[int, str, int, str]]) -> None:
+        if not spells:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO spells (spell_id, name, school, icon) VALUES (?, ?, ?, ?)",
+                [(int(sid), name, int(school), icon) for sid, name, school, icon in spells],
             )
 
     def get_spell(self, spell_id: int) -> Optional[Dict[str, Any]]:

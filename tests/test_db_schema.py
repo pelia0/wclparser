@@ -78,3 +78,131 @@ def test_master_dict_db_stores_spells(tmp_path: Path):
     spell = md.get_spell(113656)
     assert spell["name"] == "Fists of Fury"
     assert spell["school"] == 4
+
+
+def test_index_db_scan_history_and_difficulty_filter(tmp_path: Path):
+    db = IndexDB(tmp_path / "index.db")
+    assert db.get_scanned_pages_count() == 0
+    assert db.is_page_scanned(9, 11501, 5, "Monk", "Windwalker", 1, difficulty=0) is False
+    assert db.get_exhausted_page(9, 11501, 5, "Monk", "Windwalker", difficulty=0) is None
+
+    db.mark_page_scanned(9, 11501, 5, "Monk", "Windwalker", 1, refs_found=25, is_exhausted=False, difficulty=0)
+    db.mark_page_scanned(9, 11501, 5, "Monk", "Windwalker", 2, refs_found=0, is_exhausted=True, difficulty=0)
+    assert db.is_page_scanned(9, 11501, 5, "Monk", "Windwalker", 1, difficulty=0) is True
+    assert db.get_exhausted_page(9, 11501, 5, "Monk", "Windwalker", difficulty=0) == 2
+    assert db.get_scanned_pages_count() == 2
+
+    # Raid difficulty filtering
+    db.enqueue_fight("rHeroic", 1, "raid", 17, 1, 2092, "argus-the-unmaker", difficulty=4)
+    db.enqueue_fight("rMythic", 2, "raid", 17, 1, 2092, "argus-the-unmaker", difficulty=5)
+    heroic_only = db.search_fights(content_type="raid", difficulty=4)
+    assert len(heroic_only) == 1
+    assert heroic_only[0]["report_code"] == "rHeroic"
+
+
+def _enqueue(db, code="report", fid=1, **kwargs):
+    db.enqueue_fight(code, fid, "raid", 17, 1, 2092, "argus", **kwargs)
+
+
+def test_exact_duration_and_stable_offset_pagination(tmp_path):
+    db = IndexDB(tmp_path / "index.db")
+    for code in ("z", "a", "m"):
+        _enqueue(db, code, duration_ms=999999)
+        db.mark_fight_packed(code, 1, f"{code}.wclz", 10, 1, duration_ms=12345)
+    assert [r["fight_uid"] for r in db.search_fights(limit=1, offset=1)] == ["m_1"]
+    assert all(r["duration_ms"] == 12345 for r in db.search_fights())
+    db.mark_fight_packed("m", 1, "m.wclz", 10, 1)
+    assert db.search_fights(limit=1, offset=1)[0]["duration_ms"] == 12345
+
+
+def test_persistent_bounded_retries_and_terminal_report_dependencies(tmp_path):
+    path = tmp_path / "index.db"
+    db = IndexDB(path)
+    _enqueue(db, "bad")
+    db.mark_report_failed("bad", "upstream unavailable")
+    _enqueue(db, "fresh")
+    assert db.get_pending_reports_for_unarchive(limit=1) == ["fresh"]
+    assert db.get_queue_counts()["retryable_reports"] == 1
+    db = IndexDB(path)
+    for _ in range(2):
+        db.mark_report_failed("bad", "upstream unavailable")
+    counts = db.get_queue_counts()
+    assert counts == dict(pending_reports=1, queued_fights=1, retryable_reports=0,
+                          retryable_fights=0, failed_reports=1, failed_fights=1, failed_scan_pages=0)
+    row = db.search_fights(status="FAILED")[0]
+    assert "upstream unavailable" in row["last_error"]
+    assert db.get_pending_reports_for_unarchive() == ["fresh"]
+    db.retry_failed_work()
+    assert db.get_queue_counts()["failed_reports"] == 0
+    assert db.get_queue_counts()["queued_fights"] == 2
+    assert set(db.get_pending_reports_for_unarchive()) == {"bad", "fresh"}
+
+
+def test_fight_retry_fairness_saved_reasons_and_budget_reset(tmp_path):
+    db = IndexDB(tmp_path / "index.db")
+    _enqueue(db, "r", 1, keystone_level=40)
+    _enqueue(db, "r", 2, keystone_level=1)
+    db.mark_report_unarchived("r")
+    db.mark_fight_failed("r", 1, "disk failure")
+    assert db.get_unarchived_pending_fights(limit=1)[0]["fight_id"] == 2
+    assert db.get_queue_counts()["retryable_fights"] == 1
+    for _ in range(2):
+        db.mark_fight_failed("r", 1, "disk failure")
+    assert db.get_queue_counts()["failed_fights"] == 1
+    failed = db.search_fights(status="FAILED")[0]
+    assert failed["failure_count"] == 3
+    assert failed["last_error"] == "disk failure"
+    db.retry_failed_work()
+    row = next(r for r in db.search_fights() if r["fight_id"] == 1)
+    assert row["failure_count"] == 0
+    assert row["status"] == "QUEUED"
+
+
+def test_old_schema_migrates_retry_columns_without_losing_fights(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    db = IndexDB(path)
+    _enqueue(db)
+    with sqlite3.connect(path) as conn:
+        for table in ("reports", "fights"):
+            for column in ("failure_count", "last_error"):
+                if column in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                    conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    db = IndexDB(path)
+    assert db.search_fights()[0]["failure_count"] == 0
+    db.mark_report_failed("report", "migrated")
+    assert db.get_queue_counts()["retryable_reports"] == 1
+
+
+def test_later_discovered_fights_under_terminal_report_do_not_remain_queued(tmp_path):
+    db = IndexDB(tmp_path / "index.db")
+    _enqueue(db, "bad")
+    for _ in range(3):
+        db.mark_report_failed("bad", "unavailable")
+    _enqueue(db, "bad", 2)
+    counts = db.get_queue_counts()
+    assert counts["queued_fights"] == 0
+    assert counts["failed_fights"] == 2
+
+
+def test_discovery_failures_persist_until_matching_page_succeeds(tmp_path):
+    path = tmp_path / "index.db"
+    db = IndexDB(path)
+    key = dict(zone_id=17, encounter_id=2092, partition=1, class_name="Monk",
+               spec_name="Windwalker", page=2, difficulty=5)
+    db.mark_page_failed(**key, reason="ranking page unavailable", attempts=3)
+    db = IndexDB(path)
+    db.retry_failed_work()
+    assert db.get_queue_counts()["failed_scan_pages"] == 1
+    assert not db.is_page_scanned(**key)
+    with db._connect() as conn:
+        row = dict(conn.execute("SELECT * FROM scan_failures").fetchone())
+    assert row["last_error"] == "ranking page unavailable"
+    assert row["failure_count"] == 3
+    db.mark_page_failed(**key, reason="still unavailable", attempts=3)
+    db.mark_page_scanned(**{**key, "difficulty": 4}, refs_found=0)
+    assert db.get_queue_counts()["failed_scan_pages"] == 1
+    with db._connect() as conn:
+        assert conn.execute("SELECT failure_count FROM scan_failures").fetchone()[0] == 6
+    db.mark_page_scanned(**key, refs_found=0, is_exhausted=True)
+    assert db.get_queue_counts()["failed_scan_pages"] == 0

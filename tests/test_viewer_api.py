@@ -7,6 +7,61 @@ from wcl_archiver.codec.wclz_format import WCLZWriter
 from wcl_archiver.db.schema import IndexDB
 
 
+def test_explorer_ui_paginates_and_renders_untrusted_names_as_text():
+    import shutil
+    import subprocess
+    from wcl_archiver.config import BASE_DIR
+
+    script = r'''
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+class Element {
+  constructor() { this.children = []; this.value = ''; this.textContent = ''; this.classList={add(){}}; }
+  appendChild(child) { this.children.push(child); return child; }
+  replaceChildren(...children) { this.children = children; }
+  addEventListener() {}
+  set innerHTML(value) { if (value.includes('<img src=x')) throw Error('unsafe HTML name'); this.html=value; this.children = []; }
+}
+const fields = {};
+const document = {
+  getElementById(id) { return fields[id] ||= new Element(); },
+  createElement() { return new Element(); },
+};
+let urls = [];
+const rows = [
+  {fight_uid:'unsafe\'id', status:'QUEUED', encounter_slug:'<img src=x onerror=alert(1)>', participants:[]},
+  {fight_uid:'safe_2', status:'PACKED', encounter_slug:'Boss', participants:[{player_name:'<img src=x>',spec_name:'Monk'}]},
+];
+const context = {document, window:{addEventListener(){}}, URLSearchParams, console,
+  fetch:async url => { urls.push(url); return {ok:true,json:async()=>rows}; }};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+(async()=>{
+  await vm.runInContext('loadFightsList()',context);
+  assert(urls[0].includes('status=PACKED'));
+  assert(urls[0].includes('offset=0'));
+  let rendered = fields['fights-tbody'].children;
+  assert.equal(rendered[0].children[0].textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(rendered[0].children[4].textContent, 'QUEUED');
+  assert(!rendered[0].children.some(cell=>cell.children.some(child=>child.textContent==='Open Fight')));
+  assert(rendered[1].children.some(cell=>cell.children.some(child=>child.textContent==='Open Fight')));
+  await vm.runInContext('loadFightsList(100)',context);
+  assert(urls[1].includes('offset=100'));
+  assert.equal(fields['btn-fights-prev'].disabled,false);
+  await vm.runInContext(`currentFightSummary = {
+    actors:[{id:1,name:'<img src=x>',type:'Monk'}],
+    abilities:{10:{name:'<img src=x>'}},
+    cast_timeline:{1:[{ability_id:10,t_ms:1000}]}
+  }; renderFightTab('casts')`,context);
+  assert(fields['tab-content-area'].html.includes('&lt;img src=x&gt;'));
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+    result = subprocess.run([shutil.which("node"), "-e", script, str(BASE_DIR / "wcl_archiver/web/app.js")],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_viewer_api_serves_catalog_search_and_isolated_single_fight(tmp_path: Path):
     index_db = IndexDB(tmp_path / "index.db")
     index_db.enqueue_fight(
@@ -74,6 +129,16 @@ def test_viewer_api_serves_catalog_search_and_isolated_single_fight(tmp_path: Pa
     e_actor = client.get("/api/fights/aBcDeFg123_2/events?actor_id=1").json()
     assert e_actor["count"] == 2
     assert {e["timestamp"] for e in e_actor["events"]} == {1000, 5000}
+
+    e_dmg = client.get("/api/fights/aBcDeFg123_2/events?event_type=damage&source_id=1&target_id=99").json()
+    assert e_dmg["count"] == 1
+    assert e_dmg["events"][0]["amount"] == 50000
+
+    b_resp = client.get("/api/fights/aBcDeFg123_2/breakdown?mode=damage&source_id=1&target_id=99").json()
+    assert b_resp["by_source"][0]["actor_id"] == 1
+    assert b_resp["by_source"][0]["total"] == 50000
+    assert b_resp["by_target"][0]["target_id"] == 99
+    assert b_resp["by_ability"][0]["ability_id"] == 113656
 
     # 6. Not found handling (record missing from DB)
     err404 = client.get("/api/fights/nonexistent_1/summary")
@@ -149,6 +214,9 @@ def test_viewer_api_mounts_static_web_dir(tmp_path: Path, monkeypatch):
 
 
 def test_web_ui_root_serves_english_html(tmp_path: Path):
+    import re
+    from wcl_archiver.config import BASE_DIR
+
     app = create_app(data_dir=tmp_path)
     client = TestClient(app)
     resp = client.get("/")
@@ -156,9 +224,70 @@ def test_web_ui_root_serves_english_html(tmp_path: Path):
     assert "WCL Legion 7.3.5 Archiver" in resp.text
     assert "Log Explorer" in resp.text
 
+    # Verify all web UI files contain only English (no Cyrillic text)
+    cyrillic_re = re.compile(r"[\u0400-\u04FF]")
+    for fname in ("index.html", "app.js", "replay2d.js"):
+        content = (BASE_DIR / "wcl_archiver" / "web" / fname).read_text(encoding="utf-8")
+        assert not cyrillic_re.search(content), f"Found non-English Cyrillic text in {fname}"
+
     st = client.get("/api/harvester/status").json()
     assert st["queued_fights"] == 0
     assert st["packed_fights"] == 0
     stop_st = client.post("/api/harvester/stop").json()
     assert stop_st["running"] is False
 
+
+def test_harvester_auto_restarts_scan_and_pack_on_error(tmp_path: Path, monkeypatch):
+    import time
+    from wcl_archiver.harvester.pipeline import HarvesterPipeline
+
+    attempts = {"count": 0}
+    packed_on_retry = {"done": False}
+
+    async def fake_discover_mplus(
+        self,
+        pages_per_spec: int = 0,
+        on_progress=None,
+        should_stop=None,
+        pack_as_discovered: bool = False,
+    ) -> int:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise TimeoutError("Page.goto: Timeout 30000ms exceeded.")
+        return 0
+
+    async def fake_drain(self, batch_size: int = 25, on_progress=None, should_stop=None) -> int:
+        if attempts["count"] >= 2 and not packed_on_retry["done"]:
+            packed_on_retry["done"] = True
+            return 1
+        return 0
+
+    monkeypatch.setattr(HarvesterPipeline, "discover_and_enqueue_mplus_s5", fake_discover_mplus)
+    monkeypatch.setattr(HarvesterPipeline, "drain_queue_batch", fake_drain)
+
+    app = create_app(
+        data_dir=tmp_path,
+        rankings_source="protocol",
+        error_restart_base_delay=0.05,
+    )
+    with TestClient(app) as client:
+        start_res = client.post(
+            "/api/harvester/start",
+            json={"mode": "mplus_s5", "pages_per_spec": 1, "rankings_source": "protocol"},
+        )
+        assert start_res.status_code == 200
+
+        deadline = time.monotonic() + 5.0
+        st = {}
+        while time.monotonic() < deadline:
+            st = client.get("/api/harvester/status").json()
+            if not st["running"] and attempts["count"] >= 2:
+                break
+            time.sleep(0.05)
+
+    assert attempts["count"] == 2
+    assert packed_on_retry["done"] is True
+    assert st["running"] is False
+    assert st["progress_pct"] == 100.0
+    assert any("Auto-restarting harvest (scan + pack)" in line for line in st["recent_logs"])
+    assert any("Harvest completed successfully." in line for line in st["recent_logs"])

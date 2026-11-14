@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-BASE_DIR = Path(r"D:\wowlogsparser")
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 LEGION_MPLUS_ZONE_ID = 9
@@ -10,14 +10,14 @@ LEGION_MPLUS_ZONE_ID = 9
 LEGION_MPLUS_S5_PARTITION = 5
 
 LEGION_MPLUS_S5_DUNGEONS: Dict[int, str] = {
-    11458: "black-rook-hold",
+    11501: "black-rook-hold",
     11677: "cathedral-of-eternal-night",
     11571: "court-of-stars",
     11466: "darkheart-thicket",
     11456: "eye-of-azshara",
     11477: "halls-of-valor",
     11492: "maw-of-souls",
-    11465: "neltharions-lair",
+    11458: "neltharions-lair",
     11651: "return-to-karazhan-lower",
     11652: "return-to-karazhan-upper",
     11753: "seat-of-the-triumvirate",
@@ -103,6 +103,13 @@ LEGION_RAIDS: Dict[int, Dict] = {
     },
 }
 
+LEGION_RAID_DIFFICULTIES: Dict[int, str] = {
+    5: "Mythic",
+    4: "Heroic",
+    3: "Normal",
+    1: "LFR",
+}
+
 LEGION_SPECS: List[Tuple[str, str, str]] = [
     ("DeathKnight", "Blood", "tank"),
     ("DeathKnight", "Frost", "dps"),
@@ -150,3 +157,6 @@ class AppConfig:
     top_runs_per_dungeon_spec: int = 100
     top_runs_per_raid_boss_spec: int = 50
     zstd_level: int = 22
+    scan_concurrency: int = 3
+    download_concurrency: int = 4
+    pack_workers: int = 4

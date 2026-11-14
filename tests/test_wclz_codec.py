@@ -95,7 +95,8 @@ def test_wclz_single_fight_sections_and_high_compression(tmp_path: Path):
 
     # Test read_full_fight and read_header
     hdr = WCLZReader.read_header(wclz_path)
-    assert hdr["version"] == 1
+    assert hdr["version"] == 2
+    assert hdr["flags"] == 1
     assert hdr["event_count"] == 5000
     assert hdr["duration_ms"] == 840000
     assert hdr["checksum64"] != 0
@@ -104,6 +105,7 @@ def test_wclz_single_fight_sections_and_high_compression(tmp_path: Path):
     assert full["summary"]["report_code"] == "aBcDeFg123"
     assert len(full["events"]) == 5000
     assert full["replay"]["map_id"] == 1492
+    assert full["replay"]["frames"] == replay_stream["frames"]
 
 
 def test_wclz_invalid_magic(tmp_path: Path):
@@ -135,3 +137,125 @@ def test_wclz_truncated_header_and_null_replay_fields(tmp_path: Path):
     assert len(read_rep["frames"]) == 2
     assert read_rep["frames"][0] == {"t": 0, "actor": 0, "x": 0, "y": 0, "hp_pct": 0}
     assert read_rep["frames"][1] == {"t": 500, "actor": 2, "x": 10, "y": 20, "hp_pct": 10000}
+
+
+def test_wclz_v2_derived_replay_cast_timeline_and_v1_compat(tmp_path: Path):
+    import struct
+    import msgpack
+    import xxhash
+    import zstandard as zstd
+    from wcl_archiver.codec.wclz_format import HEADER_STRUCT, HEADER_SIZE, MAGIC, INT_COLUMNS
+    from wcl_archiver.parser.combat_state_machine import CombatStateMachine
+
+    raw_events = [
+        {
+            "timestamp": 1000,
+            "type": "cast",
+            "sourceID": 1,
+            "targetID": 99,
+            "abilityGameID": 100780,
+            "hitPoints": 5000000,
+            "maxHitPoints": 10000000,
+            "x": -41000,
+            "y": 28000,
+            "classResources": [{"type": 12, "amount": 3, "max": 5}],
+        },
+        {
+            "timestamp": 1250,
+            "type": "applybuff",
+            "sourceID": 1,
+            "targetID": 1,
+            "abilityGameID": 137639,
+            "hitPoints": 5000000,
+            "maxHitPoints": 10000000,
+            "x": -41010,
+            "y": 28010,
+        },
+        {
+            "timestamp": 1500,
+            "type": "cast",
+            "sourceID": 1,
+            "targetID": 99,
+            "abilityGameID": 113656,
+            "hitPoints": 4900000,
+            "maxHitPoints": 10000000,
+            "x": -41010,
+            "y": 28010,
+            "classResources": [{"type": 12, "amount": 2, "max": 5}],
+        },
+    ]
+    fight_meta = {
+        "report_code": "testV2",
+        "fight_id": 1,
+        "start_time": 1000,
+        "end_time": 6000,
+        "encounter_id": 11492,
+        "name": "Maw of Souls",
+        "keystone_level": 28,
+        "map_id": 1492,
+        "pulls": [],
+    }
+    actors = [{"id": 1, "name": "Pellia", "type": "Monk"}, {"id": 99, "name": "Helya", "type": "Boss"}]
+    abilities = [{"gameID": 100780, "name": "Tiger Palm", "type": 1}]
+    summary, norm_events, replay = CombatStateMachine.analyze_fight(fight_meta, actors, abilities, raw_events)
+
+    v2_path = tmp_path / "fight_v2.wclz"
+    WCLZWriter.write_fight(v2_path, summary, norm_events, replay)
+    hdr = WCLZReader.read_header(v2_path)
+    assert hdr["version"] == 2
+    assert hdr["sec3_size"] < 200  # derived replay takes minimal space
+
+    full_v2 = WCLZReader.read_full_fight(v2_path)
+    assert full_v2["summary"] == msgpack.unpackb(msgpack.packb(summary, use_bin_type=True), raw=False)
+    assert full_v2["events"] == norm_events
+    assert full_v2["replay"] == replay
+
+    # Synthesize a legacy v1 Zstd file and verify WCLZReader reads it cleanly
+    v1_path = tmp_path / "legacy_v1.wclz"
+    type_vocab, type_list, type_indices = {}, [], []
+    cols = {c: [] for c in INT_COLUMNS}
+    for ev in norm_events:
+        ts = ev["type"]
+        if ts not in type_vocab:
+            type_vocab[ts] = len(type_list)
+            type_list.append(ts)
+        type_indices.append(type_vocab[ts])
+        for c in INT_COLUMNS:
+            cols[c].append(ev[c])
+    s1 = zstd.ZstdCompressor(level=1).compress(msgpack.packb(summary, use_bin_type=True))
+    s2 = zstd.ZstdCompressor(level=1).compress(
+        msgpack.packb(
+            {
+                "count": len(norm_events),
+                "type_list": type_list,
+                "type_indices": encode_delta_ints(type_indices),
+                "cols": {c: encode_delta_ints(v) for c, v in cols.items()},
+            },
+            use_bin_type=True,
+        )
+    )
+    frames = replay["frames"]
+    s3 = zstd.ZstdCompressor(level=1).compress(
+        msgpack.packb(
+            {
+                "map_id": replay["map_id"],
+                "pulls": replay["pulls"],
+                "count": len(frames),
+                "t": encode_delta_ints([f["t"] for f in frames]),
+                "actor": encode_delta_ints([f["actor"] for f in frames]),
+                "x": encode_delta_ints([f["x"] for f in frames]),
+                "y": encode_delta_ints([f["y"] for f in frames]),
+                "hp_pct": encode_delta_ints([f["hp_pct"] for f in frames]),
+            },
+            use_bin_type=True,
+        )
+    )
+    o1 = HEADER_SIZE
+    o2 = o1 + len(s1)
+    o3 = o2 + len(s2)
+    chk = xxhash.xxh64(s1 + s2 + s3).intdigest()
+    v1_hdr = HEADER_STRUCT.pack(MAGIC, 1, 0, 0, len(norm_events), 5000, o1, len(s1), o2, len(s2), o3, len(s3), chk)
+    v1_path.write_bytes(v1_hdr + s1 + s2 + s3)
+
+    full_v1 = WCLZReader.read_full_fight(v1_path)
+    assert full_v1 == full_v2
