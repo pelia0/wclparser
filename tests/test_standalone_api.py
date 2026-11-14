@@ -109,7 +109,7 @@ async def test_partial_replay_segment_cannot_be_marked_complete(tmp_path,monkeyp
     client._fight_boss_cache[('Abc1234567',1)]=99
     async def request(method,path):
         if '/240000/' in path: return 503,None
-        payload={'events':[{'timestamp':1,'type':'cast'}]}
+        payload={'events':[{'timestamp':int(path.split('/')[5]),'type':'cast'}]}
         archive.capture(method,path,json.dumps(payload).encode())
         return 200,payload
     monkeypatch.setattr(client,'_request_json_impl',request)

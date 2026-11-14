@@ -243,8 +243,8 @@ def test_empty_records_and_multiple_pages_reconstruct_source_boundaries(tmp_path
               b'{"events":[],"nextPageTimestamp":null,"custom":false}']
     ids = []
     with archive.fight_capture("Pages1", 1) as fetch:
-        for n, body in enumerate(bodies):
-            ids.append(archive.capture("GET", f"/reports/summary-events/Pages1/1/{n}/100", body))
+        for cursor, body in zip((0,50),bodies):
+            ids.append(archive.capture("GET", f"/reports/summary-events/Pages1/1/{cursor}/100", body))
         archive.complete_fight("Pages1", 1, fetch, 0, 100, 2)
     path = tmp_path / "pages.wclf"
     archive.write_fight(path, {}, "Pages1", 1)
@@ -275,3 +275,124 @@ def test_corrupt_sparse_presence_bitmaps_are_rejected(presence, values):
     from wcl_archiver.codec.fight_archive import _records
     with pytest.raises(ValueError, match="(?i)corrupt|bitmap|presence|column"):
         _records({"count":9, "columns":{"field":{"presence":presence,"values":values}}})
+
+
+def test_parsed_capture_body_reuses_precise_values_without_bulk_promotion(tmp_path):
+    archive = FightArchive(tmp_path / "unused")
+    assert archive.supports_parallel_event_pages is True
+    assert not getattr(archive,"supports_bulk_events",False)
+    archive.capture("GET", "/reports/fights-and-participants/Precise1/0", MASTER)
+    with archive.fight_capture("Precise1",1) as fetch:
+        cid = archive.capture("GET", "/reports/summary-events/Precise1/1/0/100", b'{"events":[{"value":0.123456789012345678901,"unknown":[null,true,184467440737095516160]}]}')
+        body = archive.get_capture_body(cid)
+        assert body is archive.get_capture_body(cid)
+        assert body["events"][0]["value"] == Decimal("0.123456789012345678901")
+        archive.complete_fight("Precise1",1,fetch,0,100,1)
+    path = tmp_path / "precise.wclf"
+    archive.write_fight(path, {}, "Precise1",1)
+    assert PackedFightReader.read_raw_events(path) == body["events"]
+
+
+@pytest.mark.parametrize("grammar", ["summary-events","events/summary"])
+def test_parallel_canonical_pages_are_ordered_by_requested_cursor_and_fully_reconstruct(tmp_path,grammar):
+    archive = FightArchive(tmp_path / "unused")
+    archive.capture("GET", "/reports/fights-and-participants/Parallel1/0", MASTER)
+    pages = {
+        (0,49): {"events":[{"timestamp":10,"id":"z","unknown":None},{"timestamp":10,"id":"a","bool":True}],"nextPageTimestamp":30,"extra":{"x":None}},
+        (30,49): {"events":[{"timestamp":30,"id":"middle"}],"nextPageTimestamp":None,"extra":False},
+        (50,100): {"events":[{"timestamp":60,"id":"late-first"}],"nextPageTimestamp":80},
+        (80,100): {"events":[{"timestamp":80,"id":"late-last"}],"nextPageTimestamp":None},
+    }
+    ids = {}
+    with archive.fight_capture("Parallel1",1) as fetch:
+        for cursor,end in [(80,100),(30,49),(50,100),(0,49)]:
+            body = pages[(cursor,end)]
+            ids[(cursor,end)] = archive.capture("GET",f"/reports/{grammar}/Parallel1/1/{cursor}/{end}",json.dumps(body).encode())
+        archive.complete_fight("Parallel1",1,fetch,0,100,5)
+    path = tmp_path / "parallel.wclf"
+    archive.write_fight(path,{},"Parallel1",1)
+    expected = [event for body in pages.values() for event in body["events"]]
+    assert PackedFightReader.read_raw_events(path) == expected
+    assert PackedFightReader.source_manifest(path)["event_captures"] == list(ids[key] for key in pages)
+    for key,cid in ids.items():
+        assert json.loads(PackedFightReader.read_source_response(path,cid)) == pages[key]
+
+
+def test_parallel_empty_window_retains_source_metadata_and_coverage(tmp_path):
+    archive = FightArchive(tmp_path / "unused")
+    archive.capture("GET", "/reports/fights-and-participants/EmptyWindow1/0",MASTER)
+    with archive.fight_capture("EmptyWindow1",1) as fetch:
+        late = archive.capture("GET","/reports/summary-events/EmptyWindow1/1/50/100",b'{"events":[{"timestamp":60}],"nextPageTimestamp":null}')
+        early = archive.capture("GET","/reports/summary-events/EmptyWindow1/1/0/49",b'{"events":[],"nextPageTimestamp":null,"unknown":{"empty":true}}')
+        archive.complete_fight("EmptyWindow1",1,fetch,0,100,1)
+    path = tmp_path / "empty_window.wclf"
+    archive.write_fight(path,{},"EmptyWindow1",1)
+    assert PackedFightReader.source_manifest(path)["event_captures"] == [early,late]
+    assert json.loads(PackedFightReader.read_source_response(path,early))["unknown"] == {"empty":True}
+
+
+@pytest.mark.parametrize("ranges,next_values", [
+    ([(0,49),(51,100)],[None,None]),
+    ([(0,99)],[None]),
+    ([(0,100)],[50]),
+    ([(0,100),(31,100)],[30,None]),
+    ([(-1,100)],[None]),
+    ([(0,101)],[None]),
+    ([(0,100)],[0]),
+])
+def test_complete_rejects_gaps_truncation_and_invalid_canonical_page_bounds(tmp_path,ranges,next_values):
+    archive = FightArchive(tmp_path / "unused")
+    archive.capture("GET","/reports/fights-and-participants/InvalidPages1/0",MASTER)
+    with archive.fight_capture("InvalidPages1",1) as fetch:
+        for (cursor,end),next_value in zip(ranges,next_values):
+            archive.capture("GET",f"/reports/summary-events/InvalidPages1/1/{cursor}/{end}",json.dumps({"events":[],"nextPageTimestamp":next_value}).encode())
+        with pytest.raises(ValueError,match="(?i)page|window|cursor|coverage|bound"):
+            archive.complete_fight("InvalidPages1",1,fetch,0,100,0)
+    assert archive.stats()["buffered_complete_fights"] == 0
+    assert archive.stats()["buffered_event_captures"] == 0
+
+
+@pytest.mark.parametrize("wrong_url", ["/reports/summary-events/Wrong/1/0/100","/reports/summary-events/BoundPages1/2/0/100"])
+def test_complete_rejects_canonical_url_report_or_fight_mismatch(tmp_path,wrong_url):
+    archive = FightArchive(tmp_path / "unused")
+    archive.capture("GET","/reports/fights-and-participants/BoundPages1/0",MASTER)
+    with archive.fight_capture("BoundPages1",1) as fetch:
+        cid = archive.capture("GET","/reports/summary-events/BoundPages1/1/0/100",b'{"events":[]}')
+        archive._captures[cid]["info"]["url"] = wrong_url
+        with pytest.raises(ValueError,match="(?i)report|fight|binding"):
+            archive.complete_fight("BoundPages1",1,fetch,0,100,0)
+
+
+def test_canonical_page_integral_decimal_cursor_matches_integer_request(tmp_path):
+    archive = FightArchive(tmp_path / "unused")
+    archive.capture("GET","/reports/fights-and-participants/DecimalCursor1/0",MASTER)
+    with archive.fight_capture("DecimalCursor1",1) as fetch:
+        archive.capture("GET","/reports/summary-events/DecimalCursor1/1/0/100",b'{"events":[{"timestamp":10}],"nextPageTimestamp":50.0}')
+        archive.capture("GET","/reports/summary-events/DecimalCursor1/1/50/100",b'{"events":[],"nextPageTimestamp":null}')
+        archive.complete_fight("DecimalCursor1",1,fetch,0,100,1)
+    path = tmp_path / "decimal_cursor.wclf"
+    archive.write_fight(path,{},"DecimalCursor1",1)
+    assert PackedFightReader.read_raw_events(path) == [{"timestamp":10}]
+
+
+@pytest.mark.parametrize("bad_cursor", [True,Decimal("50.5"),Decimal("NaN"),Decimal("Infinity"),Decimal("-Infinity")])
+def test_canonical_page_rejects_boolean_nonintegral_and_nonfinite_cursors(tmp_path,bad_cursor):
+    archive = FightArchive(tmp_path / "unused")
+    cap = {"info":{"url":"/reports/summary-events/BadCursor1/1/0/100"},"body":{"events":[],"nextPageTimestamp":bad_cursor}}
+    with pytest.raises(ValueError,match="(?i)cursor"):
+        archive._ordered_canonical_pages([cap],"BadCursor1",1,0,100)
+
+
+def test_graphql_event_capture_order_remains_unchanged(tmp_path):
+    archive = FightArchive(tmp_path / "unused")
+    archive.capture("GET","/reports/fights-and-participants/GraphOrder1/0",MASTER)
+    with archive.fight_capture("GraphOrder1",1) as fetch:
+        ids = []
+        for timestamp in (60,10):
+            body = {"data":{"reportData":{"report":{"events":{"data":[{"timestamp":timestamp}],"nextPageTimestamp":None}}}}}
+            ids.append(archive.capture("POST","/api/v2/client",json.dumps(body).encode(),request_json={"variables":{"code":"GraphOrder1","fightId":1}}))
+        archive.complete_fight("GraphOrder1",1,fetch,0,100,2)
+    path = tmp_path / "graphql_order.wclf"
+    archive.write_fight(path,{},"GraphOrder1",1)
+    assert PackedFightReader.read_raw_events(path) == [{"timestamp":60},{"timestamp":10}]
+    assert PackedFightReader.source_manifest(path)["event_captures"] == ids

@@ -193,6 +193,8 @@ def _page_template(body, path):
 
 
 class FightArchive:
+    supports_parallel_event_pages = True
+
     def __init__(self, root):
         self.root = Path(root)  # Compatibility only; never created or accessed.
         self._scope = ContextVar("fight_capture_" + uuid.uuid4().hex, default=None)
@@ -288,6 +290,60 @@ class FightArchive:
     def capture_info(self, capture_id):
         return deepcopy(self._captures[capture_id]["info"])
 
+    def get_capture_body(self, capture_id):
+        """Reuse the parsed, precision-preserving object; callers must not mutate it."""
+        return self._captures[capture_id]["body"]
+
+    @staticmethod
+    def _ordered_canonical_pages(pages, report_code, fight_id, start, end):
+        windows = {}
+        has_graphql = False
+        for cap in pages:
+            match = re.search(r"/reports/(?:summary-events|events/summary)/([A-Za-z0-9]+)/(\d+)/(-?\d+)/(-?\d+)(?:/|\?|$)",cap["info"]["url"])
+            if match is None:
+                variables = (cap["info"].get("request_json") or {}).get("variables") or {}
+                if variables.get("code") == report_code and variables.get("fightId") == int(fight_id):
+                    has_graphql = True
+                    continue
+                raise ValueError("Invalid canonical page request URL")
+            code, fid, cursor, window_end = match.groups()
+            cursor, window_end = int(cursor), int(window_end)
+            if code != report_code or int(fid) != int(fight_id):
+                raise ValueError("Canonical page URL report/fight binding mismatch")
+            if not int(start) <= cursor <= window_end <= int(end):
+                raise ValueError("Canonical page request bounds exceed fight boundaries")
+            windows.setdefault(window_end, []).append((cursor, cap))
+        # GraphQL can be a sequential fallback for the remaining web tail.
+        # Its capture order remains authoritative for that legacy path.
+        if has_graphql:
+            return pages
+        ordered = []
+        window_start = int(start)
+        for window_end, captures in sorted(windows.items()):
+            expected_cursor = window_start
+            captures.sort(key=lambda item: item[0])
+            for index, (cursor, cap) in enumerate(captures):
+                if cursor != expected_cursor:
+                    raise ValueError("Canonical page cursor chain has a gap or overlap")
+                next_cursor = cap["body"].get("nextPageTimestamp")
+                if next_cursor is not None:
+                    is_integer = type(next_cursor) is int or (
+                        isinstance(next_cursor, Decimal) and next_cursor.is_finite()
+                        and next_cursor == next_cursor.to_integral_value()
+                    )
+                    if not is_integer or not cursor < next_cursor <= window_end:
+                        raise ValueError("Invalid canonical next page cursor")
+                    expected_cursor = int(next_cursor)
+                    if index == len(captures) - 1:
+                        raise ValueError("Canonical page chain is incomplete")
+                elif index != len(captures) - 1:
+                    raise ValueError("Canonical page exists after a terminal response")
+                ordered.append(cap)
+            window_start = window_end + 1
+        if window_start != int(end) + 1:
+            raise ValueError("Canonical window coverage does not match fight boundaries")
+        return ordered
+
     def has_report_metadata(self, report_code):
         if report_code not in self._masters:
             return False
@@ -304,6 +360,7 @@ class FightArchive:
             raise ValueError("Complete source report metadata is missing")
         captures = [self._captures[cid] for cid in self._attempts.get(fetch_id, [])]
         pages = [cap for cap in captures if cap["info"]["kind"] == "events"]
+        pages = self._ordered_canonical_pages(pages, report_code, fight_id, start, end)
         supplemental = [cap for cap in captures if cap["info"]["kind"] == "replay"]
         def segment_start(cap):
             match = re.search(r"/replaysegment/[^/]+/\d+/(-?\d+)/", cap["info"]["url"])

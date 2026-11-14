@@ -115,7 +115,7 @@ def create_app(
                 profile_dir=data_dir / "browser_profile",
                 on_status=_on_browser_status,
                 should_stop=lambda: not harvester_state["running"],
-                max_concurrent_requests=cfg.download_concurrency,
+                max_concurrent_requests=cfg.browser_request_concurrency,
                 scan_concurrency=cfg.scan_concurrency,
                 raw_archive=raw_archive,
             )

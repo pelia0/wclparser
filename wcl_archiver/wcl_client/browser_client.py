@@ -2,6 +2,7 @@ import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 import json
+from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from html import unescape
 import math
@@ -56,6 +57,32 @@ class RateLimitError(RuntimeError):
 
 class NavigationHTTPError(RuntimeError):
     pass
+
+
+def _validated_canonical_rows(body, start, end):
+    if not isinstance(body, dict) or not isinstance(body.get("events"), list):
+        raise RuntimeError("Invalid canonical event page structure")
+    previous = start
+    for event in body["events"]:
+        timestamp = event.get("timestamp") if isinstance(event, dict) else None
+        if isinstance(timestamp, Decimal) and (not timestamp.is_finite() or timestamp != timestamp.to_integral_value()):
+            raise RuntimeError("Canonical event timestamp is not a finite integer")
+        if type(timestamp) not in (int, Decimal) or not start <= timestamp <= end or timestamp < previous:
+            raise RuntimeError("Canonical event timestamps are missing, outside the requested range, or unordered")
+        previous = timestamp
+    return body["events"]
+
+
+async def _gather_owned(*coroutines):
+    """Wait for every acquisition child to finish before capture buffers close."""
+    tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+    try:
+        return await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _visible_rankings_html(html: str) -> str:
@@ -915,9 +942,10 @@ class BrowserClient:
                 status = 0
                 text = str(exc)
 
+            capture_id = None
             if self.raw_archive is not None and status:
-                self.raw_archive.capture(method,full_url,text.encode('utf-8'),status=status,
-                                         source='browser_fetch_text')
+                capture_id = self.raw_archive.capture(method,full_url,text.encode('utf-8'),status=status,
+                                                      source='browser_fetch_text')
 
             if status == 429:
                 rate_attempts += 1
@@ -941,6 +969,9 @@ class BrowserClient:
 
             if status == 200:
                 try:
+                    get_body = getattr(self.raw_archive, "get_capture_body", None)
+                    if capture_id is not None and callable(get_body):
+                        return status, get_body(capture_id)
                     return status, json.loads(text)
                 except (ValueError, TypeError) as exc:
                     raise RuntimeError('Invalid JSON response from WCL') from exc
@@ -1037,6 +1068,54 @@ class BrowserClient:
             self.raw_archive.complete_fight(report_code,fight_id,fetch_id,start_time,end_time,len(events))
             return events
 
+    async def _fetch_canonical_range(self, report_code, fight_id, start, end):
+        result = []
+        cursor = int(start)
+        while cursor <= int(end):
+            if self.should_stop and self.should_stop():
+                raise asyncio.CancelledError()
+            path = (f"/reports/summary-events/{report_code}/{fight_id}/{cursor}/{end}"
+                    "/0/0/Any/0/-1.0.-1.-1/0")
+            status, body = await self._request_json_impl("GET", path)
+            if status != 200:
+                raise RuntimeError(f"Failed canonical event download (HTTP {status})")
+            batch = _validated_canonical_rows(body, cursor, end)
+            result.extend(batch)
+            next_timestamp = body.get("nextPageTimestamp")
+            if next_timestamp is None:
+                break
+            if (type(next_timestamp) not in (int, Decimal)
+                    or isinstance(next_timestamp, Decimal) and (
+                        not next_timestamp.is_finite() or next_timestamp != next_timestamp.to_integral_value())
+                    or not cursor < next_timestamp <= end
+                    or batch and next_timestamp <= batch[-1]["timestamp"]):
+                raise RuntimeError("Canonical pagination cursor is stale, noninteger, or outside its requested window")
+            cursor = int(next_timestamp)
+        return result
+
+    async def _fetch_supplemental_replay(self, report_code, boss_id, start, end):
+        async def fetch_segment(left, right):
+            if self.should_stop and self.should_stop():
+                raise asyncio.CancelledError()
+            status, body = await self._request_json_impl(
+                "GET", f"/reports/replaysegment/{report_code}/{boss_id}/{left}/{right}/")
+            if status != 200 or not isinstance(body, dict) or not isinstance(body.get("events"), list):
+                raise RuntimeError(f"Incomplete replay segment download (HTTP {status}); retry this fight")
+        return await _gather_owned(*(fetch_segment(left, min(left + 239999, int(end)))
+                                     for left in range(int(start), int(end) + 1, 240000)))
+
+    async def _fetch_parallel_fight_events(self, report_code, fight_id, boss_id, start, end):
+        midpoint = (int(start) + int(end)) // 2
+        windows = [(int(start), midpoint)]
+        if midpoint < int(end):
+            windows.append((midpoint + 1, int(end)))
+        jobs = [self._fetch_canonical_range(report_code, fight_id, left, right) for left, right in windows]
+        if boss_id > 0:
+            jobs.append(self._fetch_supplemental_replay(report_code, boss_id, start, end))
+        # gather preserves window order even when later ranges complete first.
+        results = await _gather_owned(*jobs)
+        return [event for records in results[:len(windows)] for event in records]
+
     async def _fetch_all_fight_events_impl(
         self,
         report_code: str,
@@ -1045,6 +1124,8 @@ class BrowserClient:
         end_time: int,
     ) -> List[Dict[str, Any]]:
         boss_id = self._fight_boss_cache.get((report_code, int(fight_id)), 0)
+        if bool(getattr(self.raw_archive, "supports_parallel_event_pages", False)):
+            return await self._fetch_parallel_fight_events(report_code, fight_id, boss_id, start_time, end_time)
         if boss_id > 0:
             step_ms = 240000
             chunks: List[tuple[int, int]] = []

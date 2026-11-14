@@ -37,6 +37,8 @@ Failed work records an attempt count and reason. Retries are bounded within a ru
 
 Exhausted ranking-page failures remain visible without cancelling unrelated fight downloads. The activity log reports download time separately from packing and verification time, so a long network wait is distinguishable from local archive processing.
 
+Browser collection keeps four fights in progress and crawls two disjoint time windows per fight, sharing a maximum of eight JSON requests. Each window follows every canonical pagination cursor; supplemental replay segments download alongside those pages. Captures are validated and restored to their requested page order before packing. This reduces the sequential network wait while preserving the complete canonical records, including fields that replay segments do not contain. The shared 429 cooldown still applies to every request; the network and WCL limits determine actual throughput. The browser summary endpoint returns roughly 300 events per page. The existing OAuth API v2 path can request up to 10,000 events per page and requires API client credentials.
+
 HTTP 429 and rendered **Too Many Requests** ranking pages apply a shared cooldown across browser navigation, JSON requests, and scan workers. A retry loads the same ranking page. `Retry-After` is honored within bounded delays; otherwise the collector uses exponential backoff. Error pages and unfinished loading placeholders do not certify an empty ranking page. If bounded retries are exhausted, the failure remains explicit and a new collection start permits another attempt.
 
 ## What the archive preserves

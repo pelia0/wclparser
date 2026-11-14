@@ -159,4 +159,5 @@ class AppConfig:
     zstd_level: int = 22
     scan_concurrency: int = 3
     download_concurrency: int = 4
+    browser_request_concurrency: int = 8
     pack_workers: int = 4
