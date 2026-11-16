@@ -281,21 +281,83 @@ class IndexDB:
             conn.execute("""UPDATE fights SET status = 'QUEUED', failure_count = 0
                 WHERE status IN ('RETRY', 'FAILED')""" + scope, params)
 
-    def get_pending_reports_for_unarchive(self, limit: int = 30) -> List[str]:
+    def _has_pending_mplus(self, conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            """SELECT 1 FROM fights f JOIN reports r ON r.report_code = f.report_code
+               WHERE f.content_type = 'mplus' AND f.status IN ('QUEUED', 'RETRY')
+                 AND f.failure_count < ? AND
+                 (r.archive_status = 'UNARCHIVED' OR
+                  (r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?))
+               LIMIT 1""", (self.MAX_WORK_ATTEMPTS, self.MAX_WORK_ATTEMPTS),
+        ).fetchone() is not None
+
+    def has_pending_mplus(self) -> bool:
         with self._connect() as conn:
+            return self._has_pending_mplus(conn)
+
+    def get_pending_reports_for_unarchive(self, limit: int = 30) -> List[str]:
+        if limit <= 0:
+            return []
+        with self._connect() as conn:
+            mplus_first = self._has_pending_mplus(conn)
+            scope = " AND f.content_type = 'mplus'" if mplus_first else ""
+            # rowid is the existing insertion sequence: enqueue uses INSERT OR
+            # IGNORE and status updates never move a fight. Deduplicate reports
+            # by their oldest remaining fight, not by the report's age or code.
             rows = conn.execute(
-                """SELECT report_code FROM reports WHERE archive_status IN ('PENDING', 'RETRY')
-                    AND failure_count < ? ORDER BY failure_count ASC, report_code ASC LIMIT ?""",
-                (self.MAX_WORK_ATTEMPTS, limit),
+                """SELECT f.report_code FROM fights f
+                   JOIN reports r ON r.report_code = f.report_code
+                   WHERE f.status IN ('QUEUED', 'RETRY') AND f.failure_count < ?
+                     AND r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?"""
+                + scope + " ORDER BY f.rowid ASC",
+                (self.MAX_WORK_ATTEMPTS, self.MAX_WORK_ATTEMPTS),
+            )
+            codes, seen = [], set()
+            for row in rows:
+                code = row["report_code"]
+                if code not in seen:
+                    codes.append(code)
+                    seen.add(code)
+                    if len(codes) == limit:
+                        return codes
+            if mplus_first:
+                return codes
+            # Failed imports can leave report-only work. Retain its bounded
+            # retry path so the global drain can eventually finish.
+            rows = conn.execute(
+                """SELECT r.report_code FROM reports r
+                   WHERE r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?
+                     AND NOT EXISTS (SELECT 1 FROM fights f WHERE f.report_code = r.report_code
+                         AND f.status IN ('QUEUED', 'RETRY') AND f.failure_count < ?)
+                   ORDER BY r.rowid ASC LIMIT ?""",
+                (self.MAX_WORK_ATTEMPTS, self.MAX_WORK_ATTEMPTS, limit - len(codes)),
             ).fetchall()
-            return [r["report_code"] for r in rows]
+            return codes + [row["report_code"] for row in rows]
 
     def get_unarchived_pending_fights(self, limit: int = 20, report_code: Optional[str] = None) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
         with self._connect() as conn:
             scope = " AND f.report_code = ?" if report_code is not None else ""
+            if report_code is None and self._has_pending_mplus(conn):
+                scope = " AND f.content_type = 'mplus'"
             params = [self.MAX_WORK_ATTEMPTS]
             if report_code is not None:
                 params.append(report_code)
+            else:
+                # A younger prepared report must not overtake an older fight
+                # whose report is still pending or within its retry budget.
+                blocker = conn.execute(
+                    """SELECT f.rowid FROM fights f
+                       JOIN reports r ON r.report_code = f.report_code
+                       WHERE f.status IN ('QUEUED', 'RETRY') AND f.failure_count < ?
+                         AND r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?"""
+                    + scope + " ORDER BY f.rowid ASC LIMIT 1",
+                    (self.MAX_WORK_ATTEMPTS, self.MAX_WORK_ATTEMPTS),
+                ).fetchone()
+                if blocker is not None:
+                    scope += " AND f.rowid < ?"
+                    params.append(blocker[0])
             params.append(limit)
             rows = conn.execute(
                 f"""
@@ -304,7 +366,7 @@ class IndexDB:
                 JOIN reports r ON r.report_code = f.report_code
                 WHERE r.archive_status = 'UNARCHIVED' AND f.status IN ('QUEUED', 'RETRY')
                     AND f.failure_count < ? {scope}
-                ORDER BY f.failure_count ASC, f.keystone_level DESC, f.duration_ms ASC, f.fight_uid ASC
+                ORDER BY f.rowid ASC
                 LIMIT ?
                 """,
                 params,

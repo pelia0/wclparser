@@ -121,7 +121,7 @@ def test_persistent_bounded_retries_and_terminal_report_dependencies(tmp_path):
     _enqueue(db, "bad")
     db.mark_report_failed("bad", "upstream unavailable")
     _enqueue(db, "fresh")
-    assert db.get_pending_reports_for_unarchive(limit=1) == ["fresh"]
+    assert db.get_pending_reports_for_unarchive(limit=1) == ["bad"]
     assert db.get_queue_counts()["retryable_reports"] == 1
     db = IndexDB(path)
     for _ in range(2):
@@ -138,13 +138,13 @@ def test_persistent_bounded_retries_and_terminal_report_dependencies(tmp_path):
     assert set(db.get_pending_reports_for_unarchive()) == {"bad", "fresh"}
 
 
-def test_fight_retry_fairness_saved_reasons_and_budget_reset(tmp_path):
+def test_fight_retry_retains_fifo_position_saved_reasons_and_budget_reset(tmp_path):
     db = IndexDB(tmp_path / "index.db")
     _enqueue(db, "r", 1, keystone_level=40)
     _enqueue(db, "r", 2, keystone_level=1)
     db.mark_report_unarchived("r")
     db.mark_fight_failed("r", 1, "disk failure")
-    assert db.get_unarchived_pending_fights(limit=1)[0]["fight_id"] == 2
+    assert db.get_unarchived_pending_fights(limit=1)[0]["fight_id"] == 1
     assert db.get_queue_counts()["retryable_fights"] == 1
     for _ in range(2):
         db.mark_fight_failed("r", 1, "disk failure")

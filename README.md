@@ -33,6 +33,8 @@ For browser rankings, collection ends after the current page when there are fewe
 
 Only one harvest or report import can run at a time. Stop waits for the active collection task to finish its cancellation cleanup; another start or import is rejected while collection or cleanup is active. Shutdown also closes the collection browser and pipeline resources.
 
+Automatic collection gives queued **Mythic+ priority over raids** at both report preparation and fight downloading. A raid harvest first finishes eligible queued Mythic+ work before requesting raid ranking pages. Within each category, fights are dispatched in their SQLite insertion order; duplicate discoveries and status updates do not move them. A report is prepared according to its oldest remaining fight, rather than its code or its first-ever discovery. An older fight awaiting report preparation also holds its FIFO position through the existing bounded retries. Failed records remain visible and can be retried on a later run. Parallel workers can finish at different times; FIFO governs dispatch. A direct report import remains scoped to the explicitly requested report.
+
 Failed work records an attempt count and reason. Retries are bounded within a run. A zero-result packing batch does not finish the job while pending or retryable work remains. Exhausted failures are reported as **incomplete**, with failed report/fight counts. Starting a new collection run makes failed work eligible for another bounded set of attempts.
 
 Exhausted ranking-page failures remain visible without cancelling unrelated fight downloads. The activity log reports download time separately from packing and verification time, so a long network wait is distinguishable from local archive processing.

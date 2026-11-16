@@ -37,6 +37,72 @@ def _retry_pipeline(tmp_path, client):
     return db, HarvesterPipeline(tmp_path, db, MasterDictDB(tmp_path / "master.db"), client)
 
 
+@pytest.mark.asyncio
+async def test_mplus_backlog_blocks_ready_raid_even_when_report_retry_is_needed(tmp_path):
+    client = RetryWorkClient(report_failures=1)
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    db.enqueue_fight("Raid", 1, "raid", 17, 1, 2092, "argus")
+    db.mark_report_unarchived("Raid")
+    db.enqueue_fight("bad", 1, "mplus", 9, 5, 11492, "maw-of-souls")
+    try:
+        assert await pipeline.drain_queue_batch(batch_size=1) == 0
+        assert client.event_calls == {}
+        assert await pipeline.drain_queue_batch(batch_size=1) == 1
+        assert client.event_calls == {"bad": 1}
+        assert await pipeline.drain_queue_batch(batch_size=1) == 1
+        assert client.event_calls == {"bad": 1, "Raid": 1}
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_full_batch_does_not_download_younger_key_before_old_report_retry(tmp_path):
+    client = RetryWorkClient(report_failures=1)
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    pipeline.download_concurrency = 1
+    for code in ("bad", "fresh"):
+        db.enqueue_fight(code, 1, "mplus", 9, 5, 11492, "maw-of-souls")
+    try:
+        assert await pipeline.drain_queue_batch(batch_size=25) == 0
+        assert client.event_calls == {}
+        assert await pipeline.drain_queue_batch(batch_size=25) == 2
+        assert list(client.event_calls) == ["bad", "fresh"]
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_raid_discovery_waits_until_queued_mplus_is_packed(tmp_path, monkeypatch):
+    client = RetryWorkClient(report_failures=1)
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    db.enqueue_fight("bad", 1, "mplus", 9, 5, 11492, "maw-of-souls")
+    scans = []
+    async def discover(**kwargs):
+        assert db.search_fights(status="PACKED")[0]["report_code"] == "bad"
+        scans.append(1)
+        return 7
+    monkeypatch.setattr(pipeline, "_run_discovery_pool", discover)
+    try:
+        assert await pipeline.discover_and_enqueue_raids(pack_as_discovered=True) == 7
+        assert scans == [1]
+        assert client.report_calls == {"bad": 2}
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_mplus_precedes_any_raid_discovery(tmp_path, monkeypatch):
+    db, pipeline = _retry_pipeline(tmp_path, RetryWorkClient())
+    db.enqueue_fight("Key", 1, "mplus", 9, 5, 11492, "maw-of-souls")
+    async def unexpected(**kwargs):
+        pytest.fail("Raid discovery ran while the job was stopped")
+    monkeypatch.setattr(pipeline, "_run_discovery_pool", unexpected)
+    try:
+        assert await pipeline.discover_and_enqueue_raids(pack_as_discovered=True, should_stop=lambda: True) == 0
+    finally:
+        pipeline.close()
+
+
 class DiscoveryPage(list):
     def __init__(self, refs=(), row_count=None, has_next=False):
         super().__init__(refs)
@@ -223,8 +289,9 @@ async def test_empty_failed_batch_preserves_later_pending_and_recovers(tmp_path)
         assert await pipeline.drain_queue_batch(batch_size=1) == 0
         assert db.get_queue_counts()["pending_reports"] == 1
         assert await pipeline.drain_queue_batch(batch_size=1) == 1
-        assert client.report_calls["fresh"] == 1
+        assert client.report_calls["bad"] == 2
         assert await pipeline.drain_queue_batch(batch_size=1) == 1
+        assert client.report_calls["fresh"] == 1
         assert {r["duration_ms"] for r in db.search_fights(status="PACKED")} == {12545}
     finally:
         pipeline.close()
