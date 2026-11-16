@@ -1,0 +1,30 @@
+# Download controls and independent disk-backed packing
+
+User requirements: expose download concurrency on the page (including 10 and the ability to lower it); continue discovery independently; keep Mythic+ download priority and FIFO; remove the per-batch wait for packing. The user explicitly authorizes temporary raw staging on disk, deleted only after a verified archive is committed. Preserve every source field and all existing data.
+
+## Architecture and interfaces
+
+- Download concurrency range 1–16, default 4, with an Apply control usable during a run and persistence in ignored data/harvester_settings.json. Each fight has two canonical streams, so the shared browser JSON request ceiling follows 2 × download workers (existing default 8 is preserved). Resizing the HTTP limiter must not replace a semaphore with active waiters. Keep shared 429 cooldown and discovery concurrency unchanged. Worker count changes affect subsequent batches without cancelling current downloads.
+- StagingStore(data_dir) in codec/staging.py owns verified atomic raw MessagePack snapshots under data/staging. Snapshots include complete FightArchive capture data and packing metadata, with digest and version header. Full numeric types, unknown fields, canonical/replay fields and provenance survive. stage_fight(archive, fight_row, fight_meta, actors, abilities, out_path) returns a validated Path and releases capture buffers only after durable publication. load(path, compression='compact') returns (job_metadata, restored_archive); job_metadata includes fight_row, fight_meta, actors, abilities, out_rel_path and a transient raw_events list reconstructed from the captured pages. list_jobs(), delete(path), stats() support recovery and accounting. Paths must remain confined; corrupt or mismatched snapshots are retained and reported.
+- Add nullable staging_rel_path and STAGED status in place. Download selectors continue to select only QUEUED/RETRY. Successfully downloaded fights become STAGED after their file exists. Four persistent background pack workers read snapshots from disk; they keep only currently packing fights in RAM. Their in-memory claim set prevents duplicates; database remains STAGED while packing so restart naturally recovers it. No PACKING database state is needed. Staged failures retain raw and become FAILED; new Start returns them to STAGED when a path exists, otherwise to QUEUED. Existing completed archives/scan history remain unchanged.
+- Automatic drain downloads new batches without waiting for previous packing. It must return a work-progress count and include STAGED in completion checks. Explicit report import remains synchronous from the caller's perspective. Legacy/no-archive paths can retain their existing compatibility behavior. Staging I/O uses a separate executor from CPU pack work.
+- Pipeline exposes async start_background_packing(on_progress=None), async finish_background_packing(cancel=False), and sync get_staging_stats(). Normal finish waits for pending packs. Cancellation finishes active atomic writers/commits, leaves queued raw snapshots for the next run, and awaits quiescence before raw capture buffers clear. Recover valid orphan snapshots after a crash between file write and database update. Already PACKED leftovers are removed only after archive integrity and source fetch identity match.
+- Delete raw only after full WCLF verification and a successful PACKED database commit; clear its path after deletion. Packing, catalogue or deletion failures must retain recoverable raw. No redownload of valid staged fights. A disk-space failure is explicit and cannot silently discard a saved snapshot.
+
+## Tasks
+
+- [x] Staging codec and lossless roundtrip/corruption/path/atomicity tests.
+- [x] Schema, durable stage recovery, independent pipeline workers, cancellation/crash/failure/concurrency tests, and compatibility checks.
+- [x] Persistent API settings, browser live limiter resizing, job lifecycle integration and validation tests.
+- [x] UI worker input, Apply action, effective limits and separate staging/packing indicators; browser/Node behavior tests.
+- [x] Root integration on temporary fixtures and copies only, full suite, fresh review and README. Source-only publication excludes all local runtime data; preserve the running user-started collector without a reset or automatic restart.
+
+Do not reintroduce a wait for Mythic+ completion before discovery. The staging queue is disk-backed; only network buffers and currently packing records use RAM. Avoid claiming a linear speedup before measurement.
+
+## Verification evidence
+
+The full suite passes with 329 tests. The final staged-dispatch index has a RED/GREEN SQLite VM-budget regression with 5,000 queued fights; lookups must reach a staged fight without scanning the download backlog. A partial expression index preserves the existing Mythic+ priority and insertion order without rebuilding the fights table. Independent source review approved the pipeline, lifecycle, limiter, staging format and final index.
+
+A read-only real-data proof reconstructed a temporary source capture from one existing standalone fight (59,710 canonical events, 205 source responses), staged it, loaded it into a fresh archive instance, and wrote a compact archive. All four logical section SHA-256 digests matched exactly and the original file hash remained unchanged. The temporary raw snapshot and result were removed after verification. Measured on that copy: 33,375,396 raw bytes, 1,080,543 archive bytes, 1.074 seconds staging and 3.882 seconds packing; this is one local sample, not a collection-wide speed estimate.
+
+An isolated headless Chrome session with mocked API responses exercised Apply at 10 workers, verified the 20-request limit and separate raw/packing counters, and produced a visually inspected screenshot without page errors. It did not access the live collector or WarcraftLogs. The existing running server remains on its previous loaded backend until the user restarts it manually.

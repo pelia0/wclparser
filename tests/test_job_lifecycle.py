@@ -174,3 +174,53 @@ async def test_shutdown_closes_open_browser_even_when_no_job_was_started(tmp_pat
             response = await client.post("/api/browser/open")
             assert response.status_code == 200
     assert closed == [True]
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+async def test_job_awaits_pack_quiescence_before_clearing_capture_buffers(tmp_path, monkeypatch, cancel):
+    from wcl_archiver.codec.fight_archive import FightArchive
+    working, work_release = asyncio.Event(), asyncio.Event()
+    cleaning, cleanup_release = asyncio.Event(), asyncio.Event()
+    finishes, cleared = [], []
+    async def discover(self, **kwargs):
+        working.set()
+        await work_release.wait()
+    async def drain(self, **kwargs):
+        return 0
+    async def start_packing(self, on_progress=None):
+        pass
+    async def finish_packing(self, cancel=False):
+        finishes.append(cancel)
+        cleaning.set()
+        await cleanup_release.wait()
+    monkeypatch.setattr(HarvesterPipeline, 'discover_and_enqueue_raids', discover)
+    monkeypatch.setattr(HarvesterPipeline, 'drain_queue_batch', drain)
+    monkeypatch.setattr(HarvesterPipeline, 'start_background_packing', start_packing)
+    monkeypatch.setattr(HarvesterPipeline, 'finish_background_packing', finish_packing)
+    monkeypatch.setattr(FightArchive, 'clear', lambda self: cleared.append(True))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url='http://test') as client:
+        payload = {'mode': 'raids', 'rankings_source': 'protocol'}
+        await client.post('/api/harvester/start', json=payload)
+        await working.wait()
+        stop = None
+        if cancel:
+            stop = asyncio.create_task(client.post('/api/harvester/stop'))
+        else:
+            work_release.set()
+        try:
+            await asyncio.wait_for(cleaning.wait(), 1)
+            assert finishes == [cancel]
+            assert cleared == []
+            assert (await client.post('/api/harvester/start', json=payload)).status_code == 409
+            assert (await client.post('/api/harvester/import-report', json={'report': 'abcdefghij'})).status_code == 409
+            if stop is not None:
+                assert not stop.done()
+        finally:
+            cleanup_release.set()
+            if stop is not None:
+                await stop
+            for _ in range(100):
+                if cleared:
+                    break
+                await asyncio.sleep(0.01)
+        assert cleared == [True]

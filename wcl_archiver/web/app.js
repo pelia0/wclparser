@@ -5,6 +5,8 @@ let replayPlayer = null;
 let fightsOffset = 0;
 const fightsPageSize = 100;
 let fightsRequest = 0;
+let downloadSettingsSupported = false;
+let downloadSettingsApplying = false;
 let eventsState = {
   eventType: "all",
   tStartSec: "",
@@ -119,6 +121,13 @@ async function initApp() {
   document.getElementById("btn-harvest-mplus").addEventListener("click", () => startHarvest("mplus_s5"));
   document.getElementById("btn-harvest-raids").addEventListener("click", () => startHarvest("raids"));
   document.getElementById("btn-harvest-stop").addEventListener("click", stopHarvest);
+  const applyDownloads = document.getElementById("btn-apply-download-threads");
+  if (applyDownloads) applyDownloads.addEventListener("click", applyDownloadConcurrency);
+  const downloadThreads = document.getElementById("harvest-download-threads");
+  if (downloadThreads) downloadThreads.addEventListener("input", () => {
+    downloadThreads.dataset.dirty = "1";
+    downloadThreads.setCustomValidity("");
+  });
   document.getElementById("btn-import-report").addEventListener("click", importSingleReport);
   const btnBrowserOpen = document.getElementById("btn-browser-open");
   if (btnBrowserOpen) btnBrowserOpen.addEventListener("click", openBrowserWindow);
@@ -235,6 +244,28 @@ async function submitAuth() {
 }
 
 function renderHarvesterState(st) {
+  const downloadThreads = document.getElementById("harvest-download-threads");
+  const applyDownloads = document.getElementById("btn-apply-download-threads");
+  const settingsFeedback = document.getElementById("download-settings-feedback");
+  downloadSettingsSupported = Number.isInteger(st.download_concurrency);
+  if (downloadThreads) {
+    downloadThreads.disabled = !downloadSettingsSupported;
+    if (downloadSettingsSupported && document.activeElement !== downloadThreads && !downloadThreads.dataset.dirty) {
+      downloadThreads.value = String(st.download_concurrency);
+    }
+  }
+  if (applyDownloads) applyDownloads.disabled = downloadSettingsApplying || !downloadSettingsSupported;
+  if (!downloadSettingsSupported && settingsFeedback) {
+    settingsFeedback.textContent = "Restart server to enable download controls.";
+  }
+  const workerSummary = document.getElementById("download-worker-summary");
+  if (workerSummary && downloadSettingsSupported) {
+    workerSummary.textContent = `${st.download_concurrency} downloads · ${st.browser_request_concurrency} request limit · ${st.pack_workers} pack workers`;
+  }
+  const staging = document.getElementById("stat-staging");
+  if (staging) staging.textContent = `${st.staging_files || 0} files / ${(Number(st.staging_bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
+  const packing = document.getElementById("stat-packing");
+  if (packing) packing.textContent = `${st.packing_fights || 0} / ${st.pack_workers || 4} workers`;
   const errBanner = document.getElementById("harvester-error-banner");
   if (errBanner) {
     if (st.last_error) {
@@ -373,6 +404,8 @@ async function closeBrowserWindow() {
 }
 
 async function startHarvest(mode) {
+  const downloadConcurrency = downloadSettingsSupported ? readDownloadConcurrency() : undefined;
+  if (downloadConcurrency === null) return;
   const rawVal = document.getElementById("harvest-pages").value.trim();
   const pages = rawVal === "" ? 2 : Math.max(0, parseInt(rawVal, 10));
   const rankings_source = getSelectedSourceMode();
@@ -386,6 +419,7 @@ async function startHarvest(mode) {
       pages_per_spec: isNaN(pages) ? 2 : pages,
       rankings_source,
       raid_difficulty,
+      download_concurrency: downloadConcurrency,
     }),
   });
   const st = await res.json();
@@ -395,7 +429,48 @@ async function startHarvest(mode) {
     banner.textContent = st.detail || "Unable to start harvest";
     return;
   }
+  const threads = document.getElementById("harvest-download-threads");
+  if (threads) threads.dataset.dirty = "";
   renderHarvesterState(st);
+}
+
+function readDownloadConcurrency() {
+  const input = document.getElementById("harvest-download-threads");
+  const raw = input ? input.value.trim() : "";
+  const value = Number(raw);
+  const valid = /^\d+$/.test(raw) && Number.isInteger(value) && value >= 1 && value <= 16;
+  if (input) {
+    input.setCustomValidity(valid ? "" : "Enter a whole number from 1 to 16.");
+    if (!valid) input.reportValidity();
+  }
+  return valid ? value : null;
+}
+
+async function applyDownloadConcurrency() {
+  if (!downloadSettingsSupported || downloadSettingsApplying) return;
+  const value = readDownloadConcurrency();
+  if (value === null) return;
+  const button = document.getElementById("btn-apply-download-threads");
+  const feedback = document.getElementById("download-settings-feedback");
+  downloadSettingsApplying = true;
+  if (button) button.disabled = true;
+  if (feedback) feedback.textContent = "Applying…";
+  try {
+    const response = await fetch("/api/harvester/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ download_concurrency: value }),
+    });
+    const state = await response.json();
+    if (!response.ok) throw new Error(typeof state.detail === "string" ? state.detail : "Unable to apply download workers");
+    document.getElementById("harvest-download-threads").dataset.dirty = "";
+    renderHarvesterState(state);
+    if (feedback) feedback.textContent = "Applied. Following batches use this worker count.";
+  } catch (error) {
+    if (feedback) feedback.textContent = String(error.message || error);
+  } finally {
+    downloadSettingsApplying = false;
+    if (button) button.disabled = !downloadSettingsSupported;
+  }
 }
 
 async function stopHarvest() {

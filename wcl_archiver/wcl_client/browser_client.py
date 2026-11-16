@@ -59,6 +59,45 @@ class NavigationHTTPError(RuntimeError):
     pass
 
 
+class ResizableRequestLimiter:
+    """Keep acquired slots when the ceiling changes, including during a shrink."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.active = 0
+        self._condition = asyncio.Condition()
+
+    async def acquire(self):
+        async with self._condition:
+            await self._condition.wait_for(lambda: self.active < self.limit)
+            self.active += 1
+        return True
+
+    async def _notify(self):
+        async with self._condition:
+            self._condition.notify_all()
+
+    def release(self):
+        if self.active <= 0:
+            raise ValueError("Request limiter released without an active request")
+        self.active -= 1
+        asyncio.get_running_loop().create_task(self._notify())
+
+    async def resize(self, limit: int):
+        async with self._condition:
+            self.limit = limit
+            self._condition.notify_all()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        async with self._condition:
+            self.active -= 1
+            self._condition.notify_all()
+
+
 def _validated_canonical_rows(body, start, end):
     if not isinstance(body, dict) or not isinstance(body.get("events"), list):
         raise RuntimeError("Invalid canonical event page structure")
@@ -288,7 +327,7 @@ class BrowserClient:
         self._report_master_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._master_cache_limit: int = 256
         self._master_inflight: Dict[str, asyncio.Task[Dict[str, Any]]] = {}
-        self._req_sem: Optional[asyncio.Semaphore] = None
+        self._req_sem: Optional[ResizableRequestLimiter] = None
         self._nav_lock: Optional[asyncio.Lock] = None
         self._start_lock: Optional[asyncio.Lock] = None
         self._challenge_lock: Optional[asyncio.Lock] = None
@@ -300,9 +339,9 @@ class BrowserClient:
         self.state: str = "not_started"
         self.status_message: str = "Browser not started"
 
-    def _ensure_bg_sync(self) -> tuple[asyncio.Semaphore, asyncio.Lock, asyncio.Condition]:
+    def _ensure_bg_sync(self) -> tuple[ResizableRequestLimiter, asyncio.Lock, asyncio.Condition]:
         if self._req_sem is None:
-            self._req_sem = asyncio.Semaphore(self.max_concurrent_requests)
+            self._req_sem = ResizableRequestLimiter(self.max_concurrent_requests)
         if self._nav_lock is None:
             self._nav_lock = asyncio.Lock()
         if self._start_lock is None:
@@ -312,6 +351,15 @@ class BrowserClient:
         if self._eval_cond is None:
             self._eval_cond = asyncio.Condition()
         return self._req_sem, self._nav_lock, self._eval_cond
+
+    async def set_request_concurrency(self, limit: int) -> None:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("Request concurrency must be a positive integer")
+        async def resize():
+            limiter, _, _ = self._ensure_bg_sync()
+            await limiter.resize(limit)
+            self.max_concurrent_requests = limit
+        await self._run_in_browser_loop(resize())
 
     def _cache_master(self, report_code: str, data: Dict[str, Any]) -> None:
         for f in data.get("fights", []):

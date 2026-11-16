@@ -1,12 +1,13 @@
 import asyncio
+import json
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from wcl_archiver.codec.wclz_format import WCLZWriter
-from wcl_archiver.codec.fight_archive import FightArchive
+from wcl_archiver.codec.fight_archive import FightArchive, PackedFightReader
+from wcl_archiver.codec.staging import StagingStore
 from wcl_archiver.config import (
     LEGION_MPLUS_S5_DUNGEONS,
     LEGION_MPLUS_S5_PARTITION,
@@ -94,7 +95,7 @@ class HarvesterPipeline:
         self.raw_archive = raw_archive
         self.zstd_level = int(zstd_level)
         self.download_concurrency = max(1, int(download_concurrency))
-        default_pack = max(2, min(6, os.cpu_count() or 4))
+        default_pack = 4
         self.pack_workers = max(1, int(pack_workers if pack_workers is not None else default_pack))
         self.scan_concurrency = max(1, int(scan_concurrency))
         self._master_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
@@ -103,6 +104,221 @@ class HarvesterPipeline:
         self._seen_spells: Dict[int, str] = {}
         self._scan_retry_base_delay: float = 2.0
         self._pack_executor: Optional[ThreadPoolExecutor] = None
+        self.staging_store = StagingStore(self.data_dir)
+        self._background_pack_tasks: List[asyncio.Task] = []
+        self._packing_claims: set = set()
+        self._download_claims: set = set()
+        self._unlinked_staging: Dict[str, Path] = {}
+        self._packing_stop = False
+        self._packing_finish = False
+        self._packing_wakeup: Optional[asyncio.Event] = None
+        self._packing_progress = None
+
+    def get_staging_stats(self) -> Dict[str, int]:
+        return {**self.staging_store.stats(), 'packing_fights': len(self._packing_claims)}
+
+    def _pack_log(self, message: str) -> None:
+        if self._packing_progress:
+            self._packing_progress({'log': message, **self.get_staging_stats()})
+
+    def _raise_background_failure(self) -> None:
+        for task in self._background_pack_tasks:
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                error = task.exception()
+                raise RuntimeError(f'Background packing failed: {error}') from error
+
+    def _verify_staged_archive(self, path: Path, job: Dict[str, Any]) -> None:
+        sections = PackedFightReader.read_sections(path)
+        manifest = sections['metadata']['manifest']
+        if manifest != job['manifest']:
+            raise ValueError('Packed archive source fetch identity does not match durable raw')
+        if sections['events']['count'] != manifest['event_count']:
+            raise ValueError('Packed archive event count does not match durable raw')
+
+    def _recover_staging(self) -> List[str]:
+        """Recover the file-before-catalogue crash window without network access."""
+        messages = []
+        for path in self.staging_store.list_jobs():
+            try:
+                job, archive = self.staging_store.load(path)
+                archive.clear()
+                row = job['fight_row']
+                code, fid = row['report_code'], int(row['fight_id'])
+                saved = self.index_db.get_fight(code, fid)
+                rel = path.relative_to(self.data_dir.resolve()).as_posix()
+                if saved is None:
+                    self.index_db.enqueue_fight(code, fid, row['content_type'], row['zone_id'], row['partition'],
+                        row['encounter_id'], row['encounter_slug'], keystone_level=row.get('keystone_level', 0),
+                        difficulty=row.get('difficulty', 0), affixes=json.loads(row.get('affixes_json') or '[]'),
+                        duration_ms=row.get('duration_ms', 0))
+                    saved = self.index_db.get_fight(code, fid)
+                if saved['status'] == 'PACKED':
+                    out = (self.data_dir / (saved['file_rel_path'] or '')).resolve()
+                    out.relative_to(self.data_dir.resolve())
+                    self._verify_staged_archive(out, job)
+                    self.staging_store.delete(path)
+                    self.index_db.clear_fight_staging(code, fid, rel)
+                elif saved.get('staging_rel_path') and saved['staging_rel_path'] != rel:
+                    messages.append(f'Raw retained for {code}#{fid}: another source fetch is linked')
+                elif saved['status'] != 'FAILED' or not saved.get('staging_rel_path'):
+                    self.index_db.mark_fight_staged(code, fid, rel)
+                    self.index_db.mark_report_unarchived(code)
+            except Exception as exc:
+                messages.append(f'Raw retained at {path.name}: {exc}')
+        return messages
+
+    async def start_background_packing(self, on_progress=None) -> None:
+        if not isinstance(self.raw_archive, FightArchive):
+            return
+        if on_progress is not None:
+            self._packing_progress = on_progress
+        if self._background_pack_tasks:
+            self._raise_background_failure()
+            return
+        self._packing_stop = self._packing_finish = False
+        self._packing_wakeup = asyncio.Event()
+        for message in await asyncio.to_thread(self._recover_staging):
+            self._pack_log(message)
+        self._background_pack_tasks = [asyncio.create_task(self._background_pack_worker())
+                                       for _ in range(self.pack_workers)]
+
+    async def finish_background_packing(self, cancel: bool = False) -> None:
+        if not self._background_pack_tasks:
+            return
+        self._packing_stop = self._packing_stop or cancel
+        self._packing_finish = True
+        self._packing_wakeup.set()
+        waiter = asyncio.gather(*self._background_pack_tasks, return_exceptions=True)
+        try:
+            results = await asyncio.shield(waiter)
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise RuntimeError(f'Background packing failed: {errors[0]}') from errors[0]
+        except asyncio.CancelledError:
+            self._packing_stop = True
+            self._packing_wakeup.set()
+            await waiter
+            raise
+        finally:
+            self._background_pack_tasks = []
+
+    def _pack_staged_cpu(self, path: Path, expected_row: Dict[str, Any]):
+        job, archive = self.staging_store.load(path, compression=self.raw_archive.compression)
+        row = job['fight_row']
+        if row['fight_uid'] != expected_row['fight_uid']:
+            raise ValueError('Durable raw belongs to a different fight')
+        out = self.data_dir / job['out_rel_path']
+        result = _analyze_and_pack_cpu(out, job['fight_meta'], job['actors'], job['abilities'],
+                                       job['raw_events'], self.zstd_level, archive)
+        self._verify_staged_archive(out, job)
+        # Drop the reconstructed event list before returning to the event loop.
+        job.pop('raw_events', None)
+        return out, job, result
+
+    async def _background_pack_worker(self) -> None:
+        while not self._packing_stop:
+            rows = self.index_db.get_staged_fights(limit=self.pack_workers + 1)
+            row = next((row for row in rows if row['fight_uid'] not in self._packing_claims), None)
+            if row is None:
+                if self._packing_finish:
+                    return
+                self._packing_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._packing_wakeup.wait(), timeout=.25)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            uid = row['fight_uid']
+            self._packing_claims.add(uid)
+            code, fid = row['report_code'], int(row['fight_id'])
+            try:
+                if not row.get('staging_rel_path'):
+                    raise ValueError('Staged fight has no durable raw path')
+                path = self.data_dir / row['staging_rel_path']
+                out, job, result = await asyncio.shield(asyncio.get_running_loop().run_in_executor(
+                    self._get_pack_executor(), self._pack_staged_cpu, path, row))
+                comp_bytes, count, summary_abilities = result
+                self._commit_fight_result(code, fid, out, job['abilities'], summary_abilities,
+                    comp_bytes, count, job['fight_meta']['end_time'] - job['fight_meta']['start_time'])
+                try:
+                    await asyncio.to_thread(self.staging_store.delete, path)
+                    self.index_db.clear_fight_staging(code, fid, row['staging_rel_path'])
+                except Exception as exc:
+                    self._pack_log(f'Packed {code}#{fid}; durable raw retained for cleanup: {exc}')
+                self._pack_log(f'Saved {out.name} (packed and verified)')
+            except Exception as exc:
+                self.index_db.mark_fight_failed(code, fid, str(exc))
+                self._pack_log(f'Packing failed for {code}#{fid}; durable raw retained: {exc}')
+            finally:
+                self._packing_claims.discard(uid)
+                self._packing_wakeup.set()
+
+    async def _download_rows_to_staging(self, pending, on_progress=None, should_stop=None) -> int:
+        await self.start_background_packing(on_progress=on_progress)
+        sem = asyncio.Semaphore(self.download_concurrency)
+        async def download(row):
+            uid = row['fight_uid']
+            if uid in self._download_claims:
+                return 0
+            self._download_claims.add(uid)
+            try:
+                async with sem:
+                    if should_stop and should_stop():
+                        return 0
+                    fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
+                    if fresh is None or fresh['status'] not in ('QUEUED', 'RETRY'):
+                        return 0
+                    if uid in self._unlinked_staging:
+                        path = self._unlinked_staging[uid]
+                        rel = path.relative_to(self.data_dir.resolve()).as_posix()
+                        self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
+                        self._unlinked_staging.pop(uid)
+                        self._packing_wakeup.set()
+                        return 1
+                    master = await self._get_report_master(row['report_code'])
+                    out, meta, actors, abilities, start, end = self._prepare_fight_payload(row, master)
+                    events = await self.client.fetch_all_fight_events(row['report_code'], int(row['fight_id']), start, end)
+                    del events
+                    async def stage_and_link():
+                        path = await asyncio.to_thread(self.staging_store.stage_fight,
+                            self.raw_archive, row, meta, actors, abilities, out)
+                        self._unlinked_staging[uid] = path
+                        rel = path.relative_to(self.data_dir.resolve()).as_posix()
+                        self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
+                        self._unlinked_staging.pop(uid)
+                        self._packing_wakeup.set()
+                    task = asyncio.create_task(stage_and_link())
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        await task
+                        raise
+                    self._pack_log(f'Downloaded {uid}; durable raw queued for packing')
+                    return 1
+            except Exception as exc:
+                self.index_db.mark_fight_failed(row['report_code'], int(row['fight_id']), str(exc))
+                self._pack_log(f'Download/staging failed for {uid}: {exc}')
+                return 0
+            finally:
+                self._download_claims.discard(uid)
+        tasks = [asyncio.create_task(download(row)) for row in pending]
+        try:
+            return sum(await asyncio.gather(*tasks))
+        finally:
+            # gather may deliver one child's cancellation before its siblings'
+            # shielded staging writes finish. Never let capture clear race them.
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _wait_for_staged_rows(self, rows) -> List[Path]:
+        while any((self.index_db.get_fight(row['report_code'], int(row['fight_id'])) or {}).get('status') == 'STAGED'
+                  for row in rows):
+            self._raise_background_failure()
+            await asyncio.sleep(.05)
+        saved = [self.index_db.get_fight(row['report_code'], int(row['fight_id'])) for row in rows]
+        return [self.data_dir / row['file_rel_path'] for row in saved if row and row['status'] == 'PACKED']
 
     def _get_pack_executor(self) -> ThreadPoolExecutor:
         if self._pack_executor is None:
@@ -113,6 +329,8 @@ class HarvesterPipeline:
         return self._pack_executor
 
     def close(self) -> None:
+        if self._background_pack_tasks:
+            raise RuntimeError('Await finish_background_packing() before closing the pipeline')
         if self._pack_executor is not None:
             self._pack_executor.shutdown(wait=True)
             self._pack_executor = None
@@ -306,6 +524,11 @@ class HarvesterPipeline:
             raise
 
     async def _process_single_fight(self, fight_row: Dict[str, Any]) -> Path:
+        if isinstance(self.raw_archive, FightArchive):
+            _, paths = await self._process_rows_pipeline([fight_row])
+            if not paths:
+                raise RuntimeError('Fight download or durable packing failed')
+            return paths[0]
         report_code = fight_row["report_code"]
         fight_id = int(fight_row["fight_id"])
 
@@ -349,6 +572,15 @@ class HarvesterPipeline:
     ) -> Tuple[int, List[Path]]:
         if not pending:
             return 0, []
+        if isinstance(self.raw_archive, FightArchive):
+            owns_workers = not self._background_pack_tasks
+            try:
+                await self._download_rows_to_staging(pending, on_progress, should_stop)
+                paths = await self._wait_for_staged_rows(pending)
+                return len(paths), paths
+            finally:
+                if owns_workers:
+                    await self.finish_background_packing(cancel=bool(should_stop and should_stop()))
 
         download_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
         for row in pending:
@@ -515,6 +747,28 @@ class HarvesterPipeline:
         if not target_fight_ids:
             return []
 
+        if isinstance(self.raw_archive, FightArchive):
+            owns_workers = not self._background_pack_tasks
+            await self.start_background_packing()
+            try:
+                while True:
+                    rows = self.index_db.get_unarchived_pending_fights(limit=100, report_code=report_code)
+                    if not rows:
+                        break
+                    await self._download_rows_to_staging(rows)
+                rows = [row for row in self.index_db.search_fights(report_code=report_code,
+                            limit=max(100, len(target_fight_ids))) if int(row['fight_id']) in target_fight_ids]
+                paths = await self._wait_for_staged_rows(rows)
+                failed = [row for row in self.index_db.search_fights(report_code=report_code,
+                            limit=max(100, len(target_fight_ids)))
+                          if int(row['fight_id']) in target_fight_ids and row['status'] != 'PACKED']
+                if failed:
+                    raise ImportIncompleteError(report_code, paths, failed)
+                return paths
+            finally:
+                if owns_workers:
+                    await self.finish_background_packing()
+
         packed_paths: List[Path] = []
         while True:
             fight_rows = [
@@ -580,8 +834,9 @@ class HarvesterPipeline:
         specs_total = len(units)
         specs_done = 0
         pages_scanned = self.index_db.get_scanned_pages_count()
-        inline_pack = pack_as_discovered and self.scan_concurrency <= 1
-        concurrent_pack = pack_as_discovered and self.scan_concurrency > 1
+        independent_packing = isinstance(self.raw_archive, FightArchive)
+        inline_pack = pack_as_discovered and self.scan_concurrency <= 1 and not independent_packing
+        concurrent_pack = pack_as_discovered and (self.scan_concurrency > 1 or independent_packing)
 
         if inline_pack:
             await self.drain_queue_batch(
@@ -839,7 +1094,7 @@ class HarvesterPipeline:
                 if scan_finished.is_set() and packed == 0:
                     counts = self.index_db.get_queue_counts()
                     if not any(counts[key] for key in (
-                        "pending_reports", "queued_fights", "retryable_reports", "retryable_fights"
+                        "pending_reports", "queued_fights", "retryable_reports", "retryable_fights", "staged_fights"
                     )):
                         return
                 if packed == 0:
@@ -962,6 +1217,7 @@ class HarvesterPipeline:
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> int:
+        self._raise_background_failure()
         if should_stop and should_stop():
             return 0
         await self.warm_unarchive_batch(limit=batch_size, should_stop=should_stop)
@@ -970,6 +1226,8 @@ class HarvesterPipeline:
         pending = self.index_db.get_unarchived_pending_fights(limit=batch_size)
         if not pending:
             return 0
+        if isinstance(self.raw_archive, FightArchive):
+            return await self._download_rows_to_staging(pending, on_progress, should_stop)
         packed, _ = await self._process_rows_pipeline(
             pending, on_progress=on_progress, should_stop=should_stop
         )
