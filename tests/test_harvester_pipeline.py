@@ -72,20 +72,57 @@ async def test_full_batch_does_not_download_younger_key_before_old_report_retry(
 
 
 @pytest.mark.asyncio
-async def test_raid_discovery_waits_until_queued_mplus_is_packed(tmp_path, monkeypatch):
+async def test_raid_discovery_starts_without_waiting_for_queued_mplus(tmp_path, monkeypatch):
     client = RetryWorkClient(report_failures=1)
     db, pipeline = _retry_pipeline(tmp_path, client)
     db.enqueue_fight("bad", 1, "mplus", 9, 5, 11492, "maw-of-souls")
     scans = []
     async def discover(**kwargs):
-        assert db.search_fights(status="PACKED")[0]["report_code"] == "bad"
+        assert db.search_fights(status="QUEUED")[0]["report_code"] == "bad"
+        assert client.report_calls == {}
         scans.append(1)
         return 7
     monkeypatch.setattr(pipeline, "_run_discovery_pool", discover)
     try:
         assert await pipeline.discover_and_enqueue_raids(pack_as_discovered=True) == 7
         assert scans == [1]
-        assert client.report_calls == {"bad": 2}
+        assert client.report_calls == {}
+    finally:
+        pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_raid_discovery_and_key_download_make_progress_concurrently(tmp_path, monkeypatch):
+    import asyncio
+    class ConcurrentClient(RetryWorkClient):
+        def __init__(self):
+            super().__init__()
+            self.download_started = asyncio.Event()
+            self.scan_started = asyncio.Event()
+
+        async def fetch_rankings_fight_refs(self, **kwargs):
+            self.scan_started.set()
+            await self.download_started.wait()
+            return DiscoveryPage()
+
+        async def fetch_all_fight_events(self, *args):
+            self.download_started.set()
+            await self.scan_started.wait()
+            return await super().fetch_all_fight_events(*args)
+
+    client = ConcurrentClient()
+    db, pipeline = _retry_pipeline(tmp_path, client)
+    pipeline.scan_concurrency = 2
+    db.enqueue_fight("Key", 1, "mplus", 9, 5, 11492, "maw-of-souls")
+    original_pool = pipeline._run_discovery_pool
+    async def one_unit(units, **kwargs):
+        return await original_pool(units[:1], **kwargs)
+    monkeypatch.setattr(pipeline, "_run_discovery_pool", one_unit)
+    try:
+        assert await asyncio.wait_for(pipeline.discover_and_enqueue_raids(pack_as_discovered=True), 3) == 0
+        assert client.scan_started.is_set() and client.download_started.is_set()
+        assert client.event_calls == {"Key": 1}
+        assert db.search_fights(status="PACKED")[0]["report_code"] == "Key"
     finally:
         pipeline.close()
 

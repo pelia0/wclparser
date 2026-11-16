@@ -913,23 +913,8 @@ class HarvesterPipeline:
         should_stop: Optional[Callable[[], bool]] = None,
         pack_as_discovered: bool = False,
     ) -> int:
-        if pack_as_discovered:
-            announced = False
-            while self.index_db.has_pending_mplus():
-                if should_stop and should_stop():
-                    return 0
-                if on_progress and not announced:
-                    on_progress({"current_task": "Finishing queued Mythic+ before raid discovery...",
-                                 "log": "Queued Mythic+ takes priority; raid discovery waits until these fights are processed."})
-                    announced = True
-                packed = await self.drain_queue_batch(
-                    batch_size=max(25, self.download_concurrency * 6),
-                    on_progress=on_progress, should_stop=should_stop,
-                )
-                if packed == 0:
-                    await asyncio.sleep(0.5)
-            if should_stop and should_stop():
-                return 0
+        if should_stop and should_stop():
+            return 0
         target_diffs = [
             int(d)
             for d in (difficulties or [5, 4, 3, 1])
