@@ -147,7 +147,9 @@ class HarvesterPipeline:
 
     def _pack_log(self, message: str) -> None:
         if self._packing_progress:
-            self._packing_progress({'log': message, **self.get_staging_stats()})
+            # Status polling collects disk/DB counters separately. Logging every
+            # worker transition must not stall the network loop on those reads.
+            self._packing_progress({'log': message})
 
     def _raise_background_failure(self) -> None:
         tasks = [*self._background_pack_tasks]

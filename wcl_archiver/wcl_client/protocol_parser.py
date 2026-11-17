@@ -26,6 +26,10 @@ class WCLProtocolClient:
     ):
         self.auth_manager = auth_manager
         self._transport = transport
+        # Load HTTPX's normal environment-aware CA trust once, before requests.
+        # Request clients retain separate lifetimes without blocking the loop on
+        # repeated synchronous trust-store initialization for every page/report.
+        self._ssl_context = httpx.create_ssl_context()
         self.raw_archive = raw_archive
         self._report_master_cache = OrderedDict()
         self._quota_until = 0.0
@@ -146,6 +150,7 @@ class WCLProtocolClient:
             headers=headers,
             cookies=cookies,
             transport=self._transport,
+            verify=self._ssl_context,
             follow_redirects=True,
             timeout=45.0,
             event_hooks={'response':[self._capture_response]},

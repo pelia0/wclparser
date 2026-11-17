@@ -322,6 +322,28 @@ def supplement_windows(api_events, replay_events):
     return [(timestamp, timestamp) for timestamp in sorted(timestamps)]
 
 
+def _encoded_equal(target, source):
+    """Compare common leaves without changing their MessagePack equality semantics."""
+    value_type = type(target)
+    if value_type is type(source):
+        if value_type is int:
+            if -(1 << 63) <= target < (1 << 64) and -(1 << 63) <= source < (1 << 64):
+                return target == source
+        elif value_type in (bool, bytes, type(None)):
+            return target == source
+        elif value_type is str:
+            # Non-ASCII values retain the encoder's validation, including errors
+            # for unpaired surrogates. API scalar strings are usually ASCII.
+            if target.isascii() and source.isascii():
+                return target == source
+        elif value_type is Decimal:
+            # The extension stores text, so scale, signed zero and NaN payloads
+            # remain distinct even when numeric equality would say otherwise.
+            return str(target) == str(source)
+    # Keep float bit patterns, cross-type encodings and less common values exact.
+    return _pack(target) == _pack(source)
+
+
 def _merge_missing(target, source, *, index, capture_id, conflicts, path=()):
     if isinstance(target, dict) and isinstance(source, dict):
         for key, value in source.items():
@@ -337,7 +359,7 @@ def _merge_missing(target, source, *, index, capture_id, conflicts, path=()):
             else:
                 _merge_missing(target[key], value, index=index, capture_id=capture_id,
                                conflicts=conflicts, path=(*path, key))
-    elif _pack(target) != _pack(source) and conflicts is not None:
+    elif not _encoded_equal(target, source) and conflicts is not None:
         conflicts.append({'index': index, 'path': list(path), 'source_capture': capture_id})
 
 
