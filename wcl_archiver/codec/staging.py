@@ -228,14 +228,15 @@ class StagingStore:
         finally:
             tmp.unlink(missing_ok=True)
 
-    def load(self, path, compression="compact"):
+    def load(self, path, compression="compact", *, include_events=True):
         path = self._path(path)
         payload = self._read(path)
         job, completed = payload["job"], payload["capture"]
         archive = FightArchive(self.data_dir, compression=compression)
         manifest = completed["manifest"]
         archive._completed[(manifest["report_code"], manifest["fight_id"])] = completed
-        job["raw_events"] = archive.full_fight_events(manifest['report_code'], manifest['fight_id'])
+        if include_events:
+            job["raw_events"] = archive.full_fight_events(manifest['report_code'], manifest['fight_id'])
         return job, archive
 
     def list_jobs(self):

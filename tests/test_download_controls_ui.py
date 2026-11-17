@@ -89,3 +89,22 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'
     result = subprocess.run([shutil.which('node') or 'node', '-e', script,
                              str(BASE_DIR / 'wcl_archiver/web/app.js')], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_resource_and_retry_labels_and_old_server_fallback():
+    from test_stop_controls_ui import run_ui
+    run_ui(r'''
+render({...state,hybrid_strict:true,processing_concurrency:2,processing_active:1,
+ processing_waiting:11,packing_fights:1,rankings_source:'hybrid',
+ api_quota_wait_seconds:50,api_retry_wait_seconds:3});
+assert(fields['download-worker-summary'].textContent.includes('2 shared processing slots'));
+assert(!fields['download-worker-summary'].textContent.includes('32 browser workers'));
+assert.equal(fields['stat-processing'].textContent,'1 / 2 active · 11 waiting');
+assert(fields['api-quota-wait'].textContent.includes('quota'));
+assert(fields['api-retry-wait'].textContent.includes('server/network'));
+assert(fields['api-retry-wait'].textContent.includes('3s'));
+render(state);
+assert(fields['stat-processing'].textContent.includes('unavailable'));
+assert(fields['download-worker-summary'].textContent.includes('unavailable'));
+assert.equal(fields['api-retry-wait'].style.display,'none');
+''')

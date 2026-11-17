@@ -328,19 +328,17 @@ class IndexDB:
     def get_queue_counts(self) -> Dict[str, int]:
         with self._connect() as conn:
             counts = {}
-            for key, table, column, status in (
-                ("pending_reports", "reports", "archive_status", "PENDING"),
-                ("queued_fights", "fights", "status", "QUEUED"),
-                ("retryable_reports", "reports", "archive_status", "RETRY"),
-                ("retryable_fights", "fights", "status", "RETRY"),
-                ("failed_reports", "reports", "archive_status", "FAILED"),
-                ("failed_fights", "fights", "status", "FAILED"),
-                ("staged_fights", "fights", "status", "STAGED"),
-                ("api_staged_fights", "fights", "status", "API_STAGED"),
+            for table, column, states in (
+                ('reports', 'archive_status', (('pending_reports', 'PENDING'),
+                    ('retryable_reports', 'RETRY'), ('failed_reports', 'FAILED'))),
+                ('fights', 'status', (('queued_fights', 'QUEUED'), ('retryable_fights', 'RETRY'),
+                    ('failed_fights', 'FAILED'), ('staged_fights', 'STAGED'),
+                    ('api_staged_fights', 'API_STAGED'))),
             ):
-                counts[key] = int(conn.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (status,)
-                ).fetchone()[0])
+                expressions = ', '.join(f"COUNT(CASE WHEN {column} = ? THEN 1 END)" for _ in states)
+                row = conn.execute(f'SELECT {expressions} FROM {table}',
+                                   tuple(status for _, status in states)).fetchone()
+                counts.update((key, int(row[i])) for i, (key, _) in enumerate(states))
             counts["failed_scan_pages"] = int(conn.execute("SELECT COUNT(*) FROM scan_failures").fetchone()[0])
             return counts
 

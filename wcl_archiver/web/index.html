@@ -196,7 +196,7 @@
           <button id="btn-harvest-stop" class="nav-btn">Stop Harvester</button>
         </div>
         <div style="margin-top: 8px; font-size: 13px; color: #94a3b8;">
-          <span id="download-worker-summary">4 downloads · 8 request limit · 4 pack workers</span>
+          <span id="download-worker-summary">Loading worker and processing limits...</span>
           <span id="download-settings-feedback" role="status" aria-live="polite" style="margin-left: 10px;"></span>
           <div style="margin-top: 4px;">Apply changes without stopping discovery. Active downloads finish normally; free workers immediately take the next fight.</div>
         </div>
@@ -207,6 +207,7 @@
 
         <div id="harvester-error-banner" style="margin-top: 12px; padding: 10px 12px; border-radius: 6px; display: none; background: #3b181e; border: 1px solid #ef4444; color: #fca5a5;"></div>
         <div id="api-quota-wait" role="status" style="display: none; margin-top: 10px; color: #fbbf24; font-size: 13px;"></div>
+        <div id="api-retry-wait" role="status" style="display: none; margin-top: 10px; color: #fbbf24; font-size: 13px;"></div>
         <div id="hybrid-source-notice" style="display: none; margin-top: 10px; color: #fbbf24; font-size: 13px;"></div>
 
         <!-- Visual Progress Bar -->
@@ -250,7 +251,9 @@
               Preparing reports: <span id="stat-preparing">0</span> |
               Browser enrichment: <span id="stat-browser-enrichment">0 active / 0 queued</span> |
               Raw on disk: <span id="stat-staging">0 files / 0.00 MB</span> |
-              Packing: <span id="stat-packing">0 / 4 workers</span>
+              Packing: <span id="stat-packing">0 / 4 workers</span> |
+              Shared processing: <span id="stat-processing">Loading...</span>
+              <div id="status-counter-freshness"></div>
             </div>
           </div>
         </div>
@@ -262,6 +265,6 @@
   </main>
 
   <script src="/replay2d.js?v=6"></script>
-  <script src="/app.js?v=13"></script>
+  <script src="/app.js?v=14"></script>
 </body>
 </html>

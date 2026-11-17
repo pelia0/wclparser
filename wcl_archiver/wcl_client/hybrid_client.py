@@ -59,7 +59,8 @@ class HybridClient:
         try:
             return await getattr(provider, method)(*args, **kwargs)
         except Exception as exc:
-            raise RuntimeError(f'Hybrid {source} {method} failed: {exc}') from exc
+            detail = str(exc).strip() or type(exc).__name__
+            raise RuntimeError(f'Hybrid {source} {method} failed: {detail}') from exc
 
     async def unarchive_report(self, report_code: str) -> bool:
         valid, = await _gather_owned(

@@ -386,10 +386,19 @@ function renderHarvesterState(st) {
   }
   const workerSummary = document.getElementById("download-worker-summary");
   if (workerSummary && downloadSettingsSupported) {
-    workerSummary.textContent = st.hybrid_strict
-      ? `${st.download_concurrency} API workers · ${st.download_concurrency} browser workers · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers`
-      : `${st.download_concurrency} downloads · ${st.browser_request_concurrency} request limit · ${st.pack_workers} pack workers`;
+    const processing = Number.isInteger(st.processing_concurrency)
+      ? `${st.processing_concurrency} shared processing slots (browser + packing)`
+      : "Processing cap unavailable on this server";
+    workerSummary.textContent = `${st.download_concurrency} ${st.hybrid_strict ? 'API workers' : 'downloads'} · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers · ${processing}`;
   }
+  const processing = document.getElementById("stat-processing");
+  if (processing) processing.textContent = Number.isInteger(st.processing_concurrency)
+    ? `${st.processing_active || 0} / ${st.processing_concurrency} active · ${st.processing_waiting || 0} waiting`
+    : "Processing counters unavailable";
+  const freshness = document.getElementById("status-counter-freshness");
+  if (freshness) freshness.textContent = typeof st.status_cache_age_seconds === "number"
+    ? `Catalogue counters: ${st.status_cache_age_seconds.toFixed(1)}s old${st.status_cache_refreshing ? ' (refreshing)' : ''}${st.status_cache_error ? `; refresh failed: ${st.status_cache_error}` : ''}`
+    : "";
   const staging = document.getElementById("stat-staging");
   if (staging) staging.textContent = `${st.staging_files || 0} files / ${(Number(st.staging_bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
   const packing = document.getElementById("stat-packing");
@@ -399,6 +408,12 @@ function renderHarvesterState(st) {
     const seconds = ["api", "hybrid"].includes(st.rankings_source) ? Number(st.api_quota_wait_seconds || 0) : 0;
     apiWait.style.display = seconds > 0 ? "block" : "none";
     apiWait.textContent = seconds > 0 ? `WCL API quota cooldown: ${seconds}s until retry. API workers wait; browser enrichment and packing can continue.` : "";
+  }
+  const retryWait = document.getElementById("api-retry-wait");
+  if (retryWait) {
+    const seconds = ["api", "hybrid"].includes(st.rankings_source) ? Number(st.api_retry_wait_seconds || 0) : 0;
+    retryWait.style.display = seconds > 0 ? "block" : "none";
+    retryWait.textContent = seconds > 0 ? `WCL API server/network cooldown: ${seconds}s until retry. Browser enrichment and packing can continue.` : "";
   }
   const hybridNotice = document.getElementById("hybrid-source-notice");
   if (hybridNotice) {

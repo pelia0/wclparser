@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -102,7 +103,16 @@ class HarvesterPipeline:
         pack_workers: Optional[int] = None,
         scan_concurrency: int = 1,
         raw_archive=None,
+        processing_concurrency: int = 2,
     ):
+        self.processing_concurrency = int(processing_concurrency)
+        if self.processing_concurrency < 1:
+            raise ValueError('processing_concurrency must be positive')
+        self._processing_slots = asyncio.Semaphore(self.processing_concurrency)
+        self._processing_waiting = 0
+        self._processing_active = 0
+        self._packing_active: set = set()
+        self._browser_active: set = set()
         self.data_dir = Path(data_dir)
         self.index_db = index_db
         self.master_db = master_db
@@ -147,12 +157,48 @@ class HarvesterPipeline:
         self._db_reads = 0
         self._download_stop = False
 
-    def get_staging_stats(self) -> Dict[str, int]:
-        return {**self.staging_store.stats(), 'packing_fights': len(self._packing_claims),
+    def get_runtime_stats(self) -> Dict[str, int]:
+        """In-memory counters only; safe for frequent status polling."""
+        return {'processing_concurrency': self.processing_concurrency,
+                'processing_active': self._processing_active,
+                'processing_waiting': self._processing_waiting,
+                'packing_fights': len(self._packing_active),
                 'downloading_fights': len(self._download_claims),
-                'browser_enriching_fights': len(self._browser_claims),
-                'api_staged_fights': self.index_db.count_api_staged_fights(),
+                'browser_enriching_fights': len(self._browser_active),
                 'preparing_reports': len(self._report_preparations)}
+
+    def get_staging_stats(self) -> Dict[str, int]:
+        return {**self.staging_store.stats(), **self.get_runtime_stats(),
+                'api_staged_fights': self.index_db.count_api_staged_fights()}
+
+    @asynccontextmanager
+    async def _processing_admission(self, active, uid, should_stop):
+        # Claims prevent duplicate selection, while admission bounds resident
+        # snapshot work. Stop abandons waiters without restoring their events.
+        acquired = False
+        self._processing_waiting += 1
+        try:
+            while not should_stop():
+                try:
+                    await asyncio.wait_for(self._processing_slots.acquire(), .1)
+                    acquired = True
+                    break
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            self._processing_waiting -= 1
+        admitted = acquired and not should_stop()
+        if admitted:
+            self._processing_active += 1
+            active.add(uid)
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                active.discard(uid)
+                self._processing_active -= 1
+            if acquired:
+                self._processing_slots.release()
 
     def _pack_log(self, message: str) -> None:
         if self._packing_progress:
@@ -185,7 +231,7 @@ class HarvesterPipeline:
         snapshots = []
         for path in self.staging_store.list_jobs():
             try:
-                job, archive = self.staging_store.load(path)
+                job, archive = self.staging_store.load(path, include_events=False)
                 archive.clear()
                 snapshots.append((path, job['fight_row'], job['manifest']))
                 del job
@@ -352,8 +398,19 @@ class HarvesterPipeline:
             self._packing_wakeup.set()
 
     async def _enrich_one_staged(self, row, worker_id):
-        uid, code, fid = row['fight_uid'], row['report_code'], int(row['fight_id'])
+        uid = row['fight_uid']
         self._browser_claims.add(uid)
+        try:
+            async with self._processing_admission(
+                    self._browser_active, uid, lambda: self._browser_stop) as admitted:
+                if admitted:
+                    await self._enrich_admitted_staged(row, worker_id)
+        finally:
+            self._browser_claims.discard(uid)
+            self._browser_wakeup.set()
+
+    async def _enrich_admitted_staged(self, row, worker_id):
+        uid, code, fid = row['fight_uid'], row['report_code'], int(row['fight_id'])
         archive = None
         try:
             self._pack_log(f'Started browser enrichment for {uid} (browser worker #{worker_id})')
@@ -401,8 +458,6 @@ class HarvesterPipeline:
         finally:
             if archive is not None:
                 archive.clear()
-            self._browser_claims.discard(uid)
-            self._browser_wakeup.set()
 
     async def _browser_manager(self):
         try:
@@ -535,16 +590,41 @@ class HarvesterPipeline:
 
     def _pack_staged_cpu(self, path: Path, expected_row: Dict[str, Any]):
         job, archive = self.staging_store.load(path, compression=self.raw_archive.compression)
-        row = job['fight_row']
-        if row['fight_uid'] != expected_row['fight_uid']:
-            raise ValueError('Durable raw belongs to a different fight')
-        out = self.data_dir / job['out_rel_path']
-        result = _analyze_and_pack_cpu(out, job['fight_meta'], job['actors'], job['abilities'],
-                                       job['raw_events'], self.zstd_level, archive)
-        self._verify_staged_archive(out, job)
-        # Drop the reconstructed event list before returning to the event loop.
-        job.pop('raw_events', None)
-        return out, job, result
+        try:
+            row = job['fight_row']
+            if row['fight_uid'] != expected_row['fight_uid']:
+                raise ValueError('Durable raw belongs to a different fight')
+            out = self.data_dir / job['out_rel_path']
+            result = _analyze_and_pack_cpu(out, job['fight_meta'], job['actors'], job['abilities'],
+                                           job['raw_events'], self.zstd_level, archive)
+            self._verify_staged_archive(out, job)
+            return out, job, result
+        finally:
+            # Release both source captures and the analyzer's view while still
+            # holding admission, including on validation or packing failure.
+            job.pop('raw_events', None)
+            archive.clear()
+
+    async def _pack_admitted_staged(self, row):
+        code, fid = row['report_code'], int(row['fight_id'])
+        try:
+            if not row.get('staging_rel_path'):
+                raise ValueError('Staged fight has no durable raw path')
+            path = self.data_dir / row['staging_rel_path']
+            out, job, result = await _await_pack(asyncio.get_running_loop().run_in_executor(
+                self._get_pack_executor(), self._pack_staged_cpu, path, row))
+            comp_bytes, count, summary_abilities = result
+            self._commit_fight_result(code, fid, out, job['abilities'], summary_abilities,
+                comp_bytes, count, job['fight_meta']['end_time'] - job['fight_meta']['start_time'])
+            try:
+                await self._raw_io(self.staging_store.delete, path)
+                self.index_db.clear_fight_staging(code, fid, row['staging_rel_path'])
+            except Exception as exc:
+                self._pack_log(f'Packed {code}#{fid}; durable raw retained for cleanup: {exc}')
+            self._pack_log(f'Saved {out.name} (packed and verified)')
+        except Exception as exc:
+            self.index_db.mark_fight_failed(code, fid, str(exc))
+            self._pack_log(f'Packing failed for {code}#{fid}; durable raw retained: {exc}')
 
     async def _background_pack_worker(self) -> None:
         while not self._packing_stop:
@@ -568,25 +648,12 @@ class HarvesterPipeline:
                 continue
             uid = row['fight_uid']
             self._packing_claims.add(uid)
-            code, fid = row['report_code'], int(row['fight_id'])
             try:
-                if not row.get('staging_rel_path'):
-                    raise ValueError('Staged fight has no durable raw path')
-                path = self.data_dir / row['staging_rel_path']
-                out, job, result = await _await_pack(asyncio.get_running_loop().run_in_executor(
-                    self._get_pack_executor(), self._pack_staged_cpu, path, row))
-                comp_bytes, count, summary_abilities = result
-                self._commit_fight_result(code, fid, out, job['abilities'], summary_abilities,
-                    comp_bytes, count, job['fight_meta']['end_time'] - job['fight_meta']['start_time'])
-                try:
-                    await asyncio.to_thread(self.staging_store.delete, path)
-                    self.index_db.clear_fight_staging(code, fid, row['staging_rel_path'])
-                except Exception as exc:
-                    self._pack_log(f'Packed {code}#{fid}; durable raw retained for cleanup: {exc}')
-                self._pack_log(f'Saved {out.name} (packed and verified)')
-            except Exception as exc:
-                self.index_db.mark_fight_failed(code, fid, str(exc))
-                self._pack_log(f'Packing failed for {code}#{fid}; durable raw retained: {exc}')
+                async with self._processing_admission(
+                        self._packing_active, uid, lambda: self._packing_stop) as admitted:
+                    if not admitted:
+                        return
+                    await self._pack_admitted_staged(row)
             finally:
                 self._packing_claims.discard(uid)
                 self._packing_wakeup.set()
@@ -604,7 +671,7 @@ class HarvesterPipeline:
                 return 0
             if uid in self._unlinked_staging:
                 path = self._unlinked_staging[uid]
-                job, restored = await self._raw_io(self.staging_store.load, path)
+                job, restored = await self._raw_io(self.staging_store.load, path, include_events=False)
                 restored.clear()
                 self._link_staging(path, row['report_code'], int(row['fight_id']), job['manifest'])
                 self._unlinked_staging.pop(uid)

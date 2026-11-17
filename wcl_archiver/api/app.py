@@ -35,6 +35,7 @@ from wcl_archiver.wcl_client.auth import WCLAuthManager
 from wcl_archiver.wcl_client.browser_client import BrowserClient
 from wcl_archiver.wcl_client.protocol_parser import WCLProtocolClient
 from wcl_archiver.wcl_client.hybrid_client import HybridClient
+from wcl_archiver.api.status_cache import StatusSnapshotCache
 
 REPORT_CODE_RE = re.compile(r"(?:reports/)?([A-Za-z0-9]{10,20})")
 
@@ -103,6 +104,7 @@ def create_app(
         zstd_level=cfg.zstd_level,
         download_concurrency=cfg.download_concurrency,
         pack_workers=cfg.pack_workers,
+        processing_concurrency=cfg.processing_concurrency,
         scan_concurrency=cfg.scan_concurrency,
         raw_archive=raw_archive,
     )
@@ -249,6 +251,7 @@ def create_app(
                 await cleanup
             finally:
                 if job_task is asyncio.current_task():
+                    status_cache.invalidate()
                     harvester_state["running"] = False
                     raw_archive.clear()
                     if hybrid_browser_ref['instance'] is not None:
@@ -271,6 +274,7 @@ def create_app(
                 _append_log(harvester_state["last_error"])
                 raise
             finally:
+                status_cache.invalidate()
                 harvester_state["stopping"] = False
         if stop_task is None or stop_task.done():
             # Set the admission fence before yielding or acknowledging the request.
@@ -300,7 +304,10 @@ def create_app(
                 try:
                     await _close_collection_browsers()
                 finally:
-                    harvester.close()
+                    try:
+                        await status_cache.close()
+                    finally:
+                        harvester.close()
 
     app = FastAPI(title="WCL Legion Archiver & Offline Viewer", lifespan=lifespan)
 
@@ -825,50 +832,59 @@ def create_app(
             "events": filtered[safe_offset : safe_offset + safe_limit],
         }
 
-    @app.get("/api/harvester/status")
-    def get_harvester_status() -> Dict[str, Any]:
+    def _collect_status_counters() -> Dict[str, Any]:
         with index_db._connect() as conn:
-            queued = conn.execute("SELECT COUNT(*) AS c FROM fights WHERE status = 'QUEUED'").fetchone()["c"]
-            packed = conn.execute("SELECT COUNT(*) AS c FROM fights WHERE status = 'PACKED'").fetchone()["c"]
-            total_bytes = conn.execute(
-                "SELECT COALESCE(SUM(compressed_bytes), 0) AS b FROM fights WHERE status = 'PACKED'"
-            ).fetchone()["b"]
+            row = conn.execute("""SELECT COUNT(*) AS c, COALESCE(SUM(compressed_bytes), 0) AS b
+                FROM fights WHERE status = 'PACKED'""").fetchone()
+        source_stats = {'source_bytes': 0, 'source_responses': 0}
+        if (data_dir / 'raw' / 'manifest.db').is_file():
+            source_stats = RawArchive(data_dir / 'raw').stats()
+        return {**index_db.get_queue_counts(), **harvester.get_staging_stats(),
+                **source_stats, 'packed_fights': int(row['c']), 'archive_bytes': int(row['b']),
+                'db_pages_scanned': index_db.get_scanned_pages_count()}
+
+    status_cache = StatusSnapshotCache(_collect_status_counters)
+    app.state.status_cache = status_cache
+
+    @app.get("/api/harvester/status")
+    async def get_harvester_status() -> Dict[str, Any]:
+        try:
+            counters = await status_cache.get()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=f'Status counters unavailable: {exc}') from exc
         active_browser = hybrid_browser_ref if harvester_state['rankings_source'] == 'hybrid' else browser_client_ref
         if active_browser['instance'] is not None:
             harvester_state['browser_state'] = active_browser['instance'].state
             harvester_state['browser_message'] = active_browser['instance'].status_message
-        db_scanned = index_db.get_scanned_pages_count()
-        if db_scanned > int(harvester_state.get("pages_scanned", 0)):
-            harvester_state["pages_scanned"] = db_scanned
-        source_stats = raw_archive.stats()
-        if (data_dir/'raw'/'manifest.db').is_file():
-            source_stats = {**source_stats,**RawArchive(data_dir/'raw').stats()}
+        harvester_state['pages_scanned'] = max(int(harvester_state.get('pages_scanned', 0)),
+                                                counters.pop('db_pages_scanned'))
+        # Only the buffered values are live here: standalone source_bytes=0 must
+        # never overwrite the legacy archive's persisted source totals.
+        buffered = {key: value for key, value in raw_archive.stats().items() if key.startswith('buffered_')}
+        total_bytes, source_bytes = counters['archive_bytes'], counters['source_bytes']
         return {
+            **counters,
             **harvester_state,
-            **index_db.get_queue_counts(),
-            **harvester.get_staging_stats(),
+            **buffered,
+            **harvester.get_runtime_stats(),
             **protocol_client.get_quota_status(),
-            "download_concurrency": harvester.download_concurrency,
-            "browser_request_concurrency": 2 * harvester.download_concurrency,
-            "pack_workers": harvester.pack_workers,
-            "hybrid_strict": harvester_state['rankings_source'] == 'hybrid',
-            "hybrid_strategy": 'selective' if harvester_state['rankings_source'] == 'hybrid' else None,
-            "supports_async_stop": True,
-            "queued_fights": int(queued),
-            "packed_fights": int(packed),
-            **source_stats,
-            'archive_mode':'standalone',
-            'archive_bytes':int(total_bytes),
-            "source_mb": round(source_stats['source_bytes']/(1024*1024),2),
-            "analysis_mb": round(int(total_bytes)/(1024*1024),2),
-            "compressed_mb": round((int(total_bytes)+source_stats['source_bytes']) / (1024 * 1024), 2),
-            "recent_logs": list(harvester_logs),
+            'download_concurrency': harvester.download_concurrency,
+            'browser_request_concurrency': 2 * harvester.download_concurrency,
+            'pack_workers': harvester.pack_workers,
+            'hybrid_strict': harvester_state['rankings_source'] == 'hybrid',
+            'hybrid_strategy': 'selective' if harvester_state['rankings_source'] == 'hybrid' else None,
+            'supports_async_stop': True,
+            'archive_mode': 'standalone',
+            'source_mb': round(source_bytes / (1024 * 1024), 2),
+            'analysis_mb': round(total_bytes / (1024 * 1024), 2),
+            'compressed_mb': round((total_bytes + source_bytes) / (1024 * 1024), 2),
+            'recent_logs': list(harvester_logs),
         }
 
     @app.post('/api/harvester/settings')
     async def post_harvester_settings(req: HarvesterSettingsRequest) -> Dict[str, Any]:
         await _apply_download_concurrency(req.download_concurrency)
-        return get_harvester_status()
+        return await get_harvester_status()
 
     @app.post("/api/browser/open")
     async def post_browser_open() -> Dict[str, Any]:
@@ -881,14 +897,14 @@ def create_app(
             harvester_state["last_error"] = f"Browser open failed: {exc}"
             _append_log(f"ERROR opening browser: {exc}")
             raise HTTPException(status_code=500, detail=str(exc))
-        return get_harvester_status()
+        return await get_harvester_status()
 
     @app.post("/api/browser/close")
     async def post_browser_close() -> Dict[str, Any]:
         _require_idle()
         await _close_collection_browsers()
         _append_log("Closed visible browser window.")
-        return get_harvester_status()
+        return await get_harvester_status()
 
     @app.post("/api/harvester/import-report")
     async def post_import_report(req: ImportReportRequest) -> Dict[str, Any]:
@@ -970,7 +986,7 @@ def create_app(
                         packed = await harvester.drain_queue_batch(
                             batch_size=40, on_progress=_on_progress, should_stop=should_stop, continuous=True
                         )
-                        counts = index_db.get_queue_counts()
+                        counts = await harvester._db_read(index_db.get_queue_counts)
                         pending = sum(counts.get(key, 0) for key in (
                             "pending_reports", "queued_fights", "retryable_reports", "retryable_fights", "staged_fights"
                         ))
@@ -1013,7 +1029,7 @@ def create_app(
                         await asyncio.sleep(min(0.5, max(0.02, deadline - time.monotonic())))
 
             if harvester_state["running"]:
-                counts = index_db.get_queue_counts()
+                counts = await harvester._db_read(index_db.get_queue_counts)
                 failed_pages = counts.get('failed_scan_pages',0)
                 failed = counts["failed_reports"] + counts["failed_fights"] + failed_pages
                 waiting_browser = counts.get('api_staged_fights', 0)
@@ -1035,6 +1051,7 @@ def create_app(
                 harvester_state["current_task"] = "Stopped by user"
                 _append_log("Harvester stopped by user.")
         finally:
+            status_cache.invalidate()
             harvester_state["running"] = False
 
     @app.post("/api/harvester/start")
@@ -1075,7 +1092,7 @@ def create_app(
             job_task = asyncio.create_task(
                 _run_job(_background_harvest_worker(req.mode, req.pages_per_spec, source, req.raid_difficulty))
             )
-        return get_harvester_status()
+        return await get_harvester_status()
 
     @app.post("/api/harvester/stop")
     async def post_stop_harvest(wait: bool = Query(default=True)) -> Any:
@@ -1089,7 +1106,7 @@ def create_app(
                 "stop_request_accepted": True, "recent_logs": list(harvester_logs),
             })
         await _stop_job()
-        return get_harvester_status()
+        return await get_harvester_status()
 
     web_dir = BASE_DIR / "wcl_archiver" / "web"
     if web_dir.exists():

@@ -226,3 +226,26 @@ def test_terminal_scan_clears_only_superseded_failures_and_preserves_history(tmp
     with db._connect() as conn:
         failures = {(row["difficulty"],row["page"]) for row in conn.execute("SELECT * FROM scan_failures")}
     assert failures == {(5,1),(4,3)}
+
+
+def test_queue_counts_empty_unknown_and_three_scans(tmp_path, monkeypatch):
+    from wcl_archiver.db.schema import IndexDB
+    db = IndexDB(tmp_path / 'queue.db')
+    keys = ('pending_reports', 'queued_fights', 'retryable_reports', 'retryable_fights',
+            'failed_reports', 'failed_fights', 'staged_fights', 'api_staged_fights', 'failed_scan_pages')
+    assert db.get_queue_counts() == dict.fromkeys(keys, 0)
+    db.enqueue_fight('abcdefghij', 1, 'raid', 10, 1, 1853, 'nythendra')
+    with db._connect() as conn:
+        conn.execute("UPDATE fights SET status = 'UNKNOWN'")
+        conn.execute("UPDATE reports SET archive_status = 'UNKNOWN'")
+    statements = []
+    original = db._connect
+    from contextlib import contextmanager
+    @contextmanager
+    def traced():
+        with original() as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+    monkeypatch.setattr(db, '_connect', traced)
+    assert db.get_queue_counts() == dict.fromkeys(keys, 0)
+    assert len([sql for sql in statements if sql.lstrip().upper().startswith('SELECT')]) == 3

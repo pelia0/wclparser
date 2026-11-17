@@ -33,6 +33,7 @@ class WCLProtocolClient:
         self.raw_archive = raw_archive
         self._report_master_cache = OrderedDict()
         self._quota_until = 0.0
+        self._retry_until = 0.0
         self._quota_wait_lock = asyncio.Lock()
 
     async def _capture_response(self, response):
@@ -69,9 +70,21 @@ class WCLProtocolClient:
             # Resolve after waiting and for each page/retry: refresh supersedes
             # headers copied when this HTTP client was opened.
             endpoint, token = await self.auth_manager.get_api_auth()
-            response = await client.post(
-                endpoint, json={'query': query, 'variables': variables},
-                headers={'Authorization': f'Bearer {token}' if token else ''})
+            try:
+                response = await client.post(
+                    endpoint, json={'query': query, 'variables': variables},
+                    headers={'Authorization': f'Bearer {token}' if token else ''})
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+                self._retry_until = max(self._retry_until, time.monotonic() + 2 ** attempt)
+                if attempt == 2:
+                    raise
+                continue
+            if response.status_code in (408, 500, 502, 503, 504):
+                delay = max(2 ** attempt, self._retry_after(response.headers.get('Retry-After', '')))
+                self._retry_until = max(self._retry_until, time.monotonic() + delay)
+                if attempt == 2:
+                    return response  # Preserve the caller's contextual HTTP error.
+                continue
             if response.status_code == 429:
                 delay = self._retry_after(response.headers.get('Retry-After', ''))
                 self._quota_until = max(self._quota_until, time.monotonic() + delay)
@@ -104,11 +117,13 @@ class WCLProtocolClient:
         # independently. Known cooldowns pause work without consuming queued
         # reports' failure attempts; task cancellation interrupts either wait.
         async with self._quota_wait_lock:
-            while (delay := self._quota_until - time.monotonic()) > 0:
+            while (delay := max(self._quota_until, self._retry_until) - time.monotonic()) > 0:
                 await asyncio.sleep(min(delay, 30.0))
 
     def get_quota_status(self):
-        return {'api_quota_wait_seconds': math.ceil(max(0, self._quota_until - time.monotonic()))}
+        now = time.monotonic()
+        return {'api_quota_wait_seconds': math.ceil(max(0, self._quota_until - now)),
+                'api_retry_wait_seconds': math.ceil(max(0, self._retry_until - now))}
 
     @staticmethod
     def _retry_after(value):

@@ -162,4 +162,10 @@ class AppConfig:
     download_concurrency: int = 4
     browser_request_concurrency: int = 8
     pack_workers: int = 4
+    processing_concurrency: int = 2
     archive_compression: str = field(default_factory=lambda: os.environ.get("WCL_ARCHIVE_COMPRESSION", "compact"))
+
+    def __post_init__(self):
+        self.processing_concurrency = int(self.processing_concurrency)
+        if self.processing_concurrency < 1:
+            raise ValueError('processing_concurrency must be positive')
