@@ -55,6 +55,8 @@ For browser rankings, collection ends after the current page when there are fewe
 
 Only one harvest or report import can run at a time. Stop waits for the active collection task to finish its cancellation cleanup; another start or import is rejected while collection or cleanup is active. Shutdown also closes the collection browser and pipeline resources.
 
+The browser UI acknowledges Stop immediately with **STOPPING**, disables competing actions, and confirms completion through status polling. API, browser and pack worker admission freezes as soon as the server accepts Stop; active atomic file writers remain owned until they finish, and queued snapshots stay on disk. Status polling permits one in-flight request per page, aborts outdated requests when Stop changes state, and retries after a bounded 15-second timeout. Large catalogue selectors run in a separate bounded read pool so they cannot block the application's control loop.
+
 Automatic downloading gives queued **Mythic+ priority over raids** at both report preparation and fight downloading. Discovery runs independently: raid ranking pages continue to be scanned and queued while Mythic+ fights download. Discovery does not wait for the Mythic+ backlog to finish. Within each download category, fights are dispatched in their SQLite insertion order; duplicate discoveries and status updates do not move them. A report is prepared according to its oldest remaining fight, rather than its code or its first-ever discovery. An older fight awaiting report preparation also holds its FIFO position through the existing bounded retries. Failed records remain visible and can be retried on a later run. Parallel workers can finish at different times; FIFO governs dispatch. A direct report import remains scoped to the explicitly requested report.
 
 Failed work records an attempt count and reason. Retries are bounded within a run. A zero-result packing batch does not finish the job while pending or retryable work remains. Exhausted failures are reported as **incomplete**, with failed report/fight counts. Starting a new collection run makes failed work eligible for another bounded set of attempts.
@@ -113,6 +115,7 @@ The local API exposes the source evidence separately from viewer analysis:
 | `GET /api/fights/{fight_uid}/summary` | Derived viewer summary. |
 | `GET /api/fights/{fight_uid}/events` | Filtered, normalized viewer events. |
 | `GET /api/harvester/status` | Current job state, progress, queue/failure counters, and archive size information. |
+| `POST /api/harvester/stop?wait=false` | Acknowledge Stop with HTTP 202 and `stopping=true` without waiting for file cleanup or catalogue statistics. Poll status until cleanup completes. Omitting `wait=false` retains the synchronous Stop contract. |
 | `POST /api/harvester/settings` | Save/apply `{"download_concurrency": 64}`; accepts positive integers with no fixed upper cap. Status also reports request limit, staged fight count, temporary raw file count/bytes, and active pack workers. |
 
 `fight_uid` is the report code followed by an underscore and fight ID, for example `aBcDeFg123_2`. Source and full-event exports read the file itself and do not depend on downloader memory or a separate raw store. Legacy viewer-only archives may have no full source records to export.

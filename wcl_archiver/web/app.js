@@ -8,6 +8,13 @@ let fightsRequest = 0;
 let downloadSettingsSupported = false;
 let downloadSettingsApplying = false;
 let oauthPollingTimer = null;
+let lastHarvesterState = null;
+let harvesterStatusRequest = null;
+let harvesterStatusEpoch = 0;
+let harvesterRequestError = "";
+let stopRequestPending = false;
+let stopAwaitingCompletion = false;
+let reportImportPending = false;
 let eventsState = {
   eventType: "all",
   tStartSec: "",
@@ -334,7 +341,35 @@ async function submitAuth() {
   }
 }
 
+function harvesterIsStopping() {
+  return stopRequestPending || stopAwaitingCompletion || Boolean(lastHarvesterState?.stopping);
+}
+
+function renderHarvesterControls() {
+  const stopping = harvesterIsStopping();
+  for (const id of ["btn-harvest-mplus", "btn-harvest-raids", "btn-import-report"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = stopping || (id === "btn-import-report" && reportImportPending);
+  }
+  const stop = document.getElementById("btn-harvest-stop");
+  if (stop) {
+    stop.disabled = stopping;
+    stop.textContent = stopRequestPending ? "Stop requested…" : stopping ? "Stopping…" : "Stop Harvester";
+  }
+}
+
+function renderHarvesterError() {
+  const banner = document.getElementById("harvester-error-banner");
+  if (banner) {
+    const error = harvesterRequestError || lastHarvesterState?.last_error;
+    banner.style.display = error ? "block" : "none";
+    banner.textContent = error || "";
+  }
+}
+
 function renderHarvesterState(st) {
+  lastHarvesterState = st;
+  renderHarvesterControls();
   const downloadThreads = document.getElementById("harvest-download-threads");
   const applyDownloads = document.getElementById("btn-apply-download-threads");
   const settingsFeedback = document.getElementById("download-settings-feedback");
@@ -382,15 +417,7 @@ function renderHarvesterState(st) {
     : "Restart server for active count";
   const preparing = document.getElementById("stat-preparing");
   if (preparing) preparing.textContent = Number.isInteger(st.preparing_reports) ? String(st.preparing_reports) : "—";
-  const errBanner = document.getElementById("harvester-error-banner");
-  if (errBanner) {
-    if (st.last_error) {
-      errBanner.style.display = "block";
-      errBanner.textContent = st.last_error;
-    } else {
-      errBanner.style.display = "none";
-    }
-  }
+  renderHarvesterError();
 
   const bState = st.browser_state || "not_started";
   const bLabel = document.getElementById("browser-state-label");
@@ -420,7 +447,10 @@ function renderHarvesterState(st) {
   }
 
   const taskLabel = document.getElementById("harvest-task-label");
-  if (taskLabel) taskLabel.textContent = st.current_task || "Idle";
+  if (taskLabel) taskLabel.textContent = stopRequestPending
+    ? "Stop requested; waiting for server acknowledgement…"
+    : harvesterIsStopping() ? (st.stopping && st.current_task || "Stopping; waiting for cleanup status…")
+    : st.current_task || "Idle";
 
   const pct = Number(st.progress_pct || 0);
   const pctLabel = document.getElementById("harvest-pct-label");
@@ -435,7 +465,10 @@ function renderHarvesterState(st) {
 
   const statState = document.getElementById("stat-state");
   if (statState) {
-    if (st.running) {
+    if (harvesterIsStopping()) {
+      statState.textContent = "STOPPING";
+      statState.style.color = "#fbbf24";
+    } else if (st.running) {
       statState.textContent = "RUNNING";
       statState.style.color = "#4ade80";
     } else if (st.last_error) {
@@ -470,10 +503,50 @@ function renderHarvesterState(st) {
   }
 }
 
-async function refreshHarvesterStatus() {
-  const res = await fetch("/api/harvester/status");
-  const st = await res.json();
-  renderHarvesterState(st);
+function invalidateHarvesterStatus() {
+  // Invalidate before aborting so the abandoned request cannot show AbortError.
+  harvesterStatusEpoch++;
+  const request = harvesterStatusRequest;
+  harvesterStatusRequest = null;
+  if (request) {
+    clearTimeout(request.timeout);
+    request.controller.abort();
+  }
+}
+
+function refreshHarvesterStatus() {
+  // Timer ticks and direct callers share one request. Stop releases an outdated
+  // request immediately, and the timeout bounds outages between Stop requests.
+  if (harvesterStatusRequest) return harvesterStatusRequest.promise;
+  const epoch = harvesterStatusEpoch;
+  const request = { controller: new AbortController(), timeout: null, timedOut: false, promise: null };
+  harvesterStatusRequest = request;
+  request.timeout = setTimeout(() => {
+    request.timedOut = true;
+    request.controller.abort();
+  }, 15000);
+  request.promise = (async () => {
+    try {
+      const res = await fetch("/api/harvester/status", { signal: request.controller.signal });
+      const st = await res.json();
+      if (epoch !== harvesterStatusEpoch) return;
+      if (!res.ok) throw new Error(typeof st.detail === "string" ? st.detail : "Unable to refresh harvester status");
+      harvesterRequestError = "";
+      if (!stopRequestPending && !st.running && !st.stopping) stopAwaitingCompletion = false;
+      renderHarvesterState(st);
+      return st;
+    } catch (error) {
+      if (epoch !== harvesterStatusEpoch) return;
+      harvesterRequestError = request.timedOut ? "Status refresh failed: request timed out after 15 seconds."
+        : "Status refresh failed: " + String(error.message || error);
+      renderHarvesterError();
+    } finally {
+      clearTimeout(request.timeout);
+      // An aborted request may settle after Stop has already started a new one.
+      if (harvesterStatusRequest === request) harvesterStatusRequest = null;
+    }
+  })();
+  return request.promise;
 }
 
 function getSelectedSourceMode() {
@@ -520,6 +593,7 @@ async function closeBrowserWindow() {
 }
 
 async function startHarvest(mode) {
+  if (harvesterIsStopping()) return;
   const downloadConcurrency = downloadSettingsSupported ? readDownloadConcurrency() : undefined;
   if (downloadConcurrency === null) return;
   const rawVal = document.getElementById("harvest-pages").value.trim();
@@ -590,15 +664,37 @@ async function applyDownloadConcurrency() {
 }
 
 async function stopHarvest() {
-  const res = await fetch("/api/harvester/stop", { method: "POST" });
-  const st = await res.json();
-  renderHarvesterState(st);
+  if (harvesterIsStopping()) return;
+  const asyncStop = lastHarvesterState?.supports_async_stop === true;
+  stopRequestPending = true;
+  invalidateHarvesterStatus();
+  harvesterRequestError = "";
+  renderHarvesterState(lastHarvesterState || {});
+  try {
+    const res = await fetch(asyncStop ? "/api/harvester/stop?wait=false" : "/api/harvester/stop", { method: "POST" });
+    const st = await res.json();
+    if (!res.ok) throw new Error(typeof st.detail === "string" ? st.detail : "Unable to stop harvester");
+    // Only Stop acknowledgements are partial. Normal status renders must still
+    // detect missing capabilities when connected to an older server.
+    invalidateHarvesterStatus();
+    stopRequestPending = false;
+    stopAwaitingCompletion = asyncStop || Boolean(st.stopping);
+    renderHarvesterState({ ...lastHarvesterState, ...st });
+  } catch (error) {
+    invalidateHarvesterStatus();
+    stopRequestPending = false;
+    stopAwaitingCompletion = false;
+    harvesterRequestError = "Stop request failed: " + String(error.message || error) + ". Retry Stop or wait for a fresh status.";
+    renderHarvesterState(lastHarvesterState || {});
+  }
 }
 
 async function importSingleReport() {
+  if (harvesterIsStopping()) return;
   const report = document.getElementById("import-report-input").value.trim();
   if (!report) return;
   const btn = document.getElementById("btn-import-report");
+  reportImportPending = true;
   btn.disabled = true;
   btn.textContent = "Importing...";
   const rankings_source = getSelectedSourceMode();
@@ -618,8 +714,9 @@ async function importSingleReport() {
     await refreshHarvesterStatus();
     await loadFightsList();
   } finally {
-    btn.disabled = false;
+    reportImportPending = false;
     btn.textContent = "Import Single Report Now";
+    renderHarvesterControls();
   }
 }
 

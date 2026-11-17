@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode, urlsplit
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response, FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import Response, FileResponse, HTMLResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel, conint
 
 from wcl_archiver.codec.wclz_format import WCLZReader
@@ -256,22 +256,36 @@ def create_app(
                 if hasattr(work, 'close'):
                     work.close()
 
-    async def _stop_job() -> None:
+    def _request_stop() -> asyncio.Task:
         nonlocal stop_task
         async def finish_stop():
-            harvester_state["stopping"] = True
-            harvester_state["running"] = False
             try:
                 if job_task is not None and not job_task.done():
                     job_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await job_task
                 harvester_state["current_task"] = "Stopped by user"
+            except Exception as exc:
+                harvester_state["last_error"] = f"Stop cleanup failed: {exc}"
+                harvester_state["current_task"] = "Stop failed; see activity log"
+                _append_log(harvester_state["last_error"])
+                raise
             finally:
                 harvester_state["stopping"] = False
         if stop_task is None or stop_task.done():
+            # Set the admission fence before yielding or acknowledging the request.
+            harvester_state["stopping"] = True
+            harvester_state["running"] = False
+            harvester_state["current_task"] = "Stopping: finishing active writes and preserving queued files"
+            harvester.request_stop()
             stop_task = asyncio.create_task(finish_stop())
-        await asyncio.shield(stop_task)
+            # A fast acknowledgement or disconnected caller must not leave an
+            # unobserved task error. Synchronous callers can still await/raise it.
+            stop_task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        return stop_task
+
+    async def _stop_job() -> None:
+        await asyncio.shield(_request_stop())
 
     @asynccontextmanager
     async def lifespan(app):
@@ -839,6 +853,7 @@ def create_app(
             "pack_workers": harvester.pack_workers,
             "hybrid_strict": harvester_state['rankings_source'] == 'hybrid',
             "hybrid_strategy": 'selective' if harvester_state['rankings_source'] == 'hybrid' else None,
+            "supports_async_stop": True,
             "queued_fights": int(queued),
             "packed_fights": int(packed),
             **source_stats,
@@ -1063,8 +1078,16 @@ def create_app(
         return get_harvester_status()
 
     @app.post("/api/harvester/stop")
-    async def post_stop_harvest() -> Dict[str, Any]:
+    async def post_stop_harvest(wait: bool = Query(default=True)) -> Any:
         _append_log("Stop requested by user.")
+        if not wait:
+            _request_stop()
+            # Do not wait for catalogue scans or source writers to acknowledge
+            # control intent; the status endpoint reports the eventual completion.
+            return JSONResponse(status_code=202, content={
+                **harvester_state, "supports_async_stop": True,
+                "stop_request_accepted": True, "recent_logs": list(harvester_logs),
+            })
         await _stop_job()
         return get_harvester_status()
 
