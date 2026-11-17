@@ -266,6 +266,12 @@ function renderHarvesterState(st) {
   if (staging) staging.textContent = `${st.staging_files || 0} files / ${(Number(st.staging_bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
   const packing = document.getElementById("stat-packing");
   if (packing) packing.textContent = `${st.packing_fights || 0} / ${st.pack_workers || 4} workers`;
+  const downloading = document.getElementById("stat-downloading");
+  if (downloading) downloading.textContent = Number.isInteger(st.downloading_fights)
+    ? `${st.downloading_fights} / ${st.download_concurrency || 4} workers`
+    : "Restart server for active count";
+  const preparing = document.getElementById("stat-preparing");
+  if (preparing) preparing.textContent = Number.isInteger(st.preparing_reports) ? String(st.preparing_reports) : "—";
   const errBanner = document.getElementById("harvester-error-banner");
   if (errBanner) {
     if (st.last_error) {
@@ -464,7 +470,7 @@ async function applyDownloadConcurrency() {
     if (!response.ok) throw new Error(typeof state.detail === "string" ? state.detail : "Unable to apply download workers");
     document.getElementById("harvest-download-threads").dataset.dirty = "";
     renderHarvesterState(state);
-    if (feedback) feedback.textContent = "Applied. Following batches use this worker count.";
+    if (feedback) feedback.textContent = "Applied. Free download slots use this worker count.";
   } catch (error) {
     if (feedback) feedback.textContent = String(error.message || error);
   } finally {

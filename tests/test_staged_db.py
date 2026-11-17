@@ -70,3 +70,30 @@ def test_packing_queue_lookup_does_not_scan_the_download_backlog(tmp_path, monke
 
     monkeypatch.setattr(db, '_connect', bounded_connect)
     assert [row['report_code'] for row in db.get_staged_fights(limit=5)] == ['ready']
+
+
+def test_key_priority_probe_skips_raid_backlog_and_completed_key_history(tmp_path, monkeypatch):
+    db = IndexDB(tmp_path / 'index.db')
+    with db._connect() as conn:
+        conn.executemany('''INSERT INTO fights
+            (fight_uid, report_code, fight_id, content_type, zone_id, partition, encounter_id, encounter_slug)
+            VALUES (?, ?, 1, 'raid', 1, 1, 1, 'boss')''',
+            [(f'queued_{i}', f'queued{i}') for i in range(5000)])
+        conn.executemany('''INSERT INTO fights
+            (fight_uid, report_code, fight_id, content_type, zone_id, partition, encounter_id, encounter_slug, status)
+            VALUES (?, ?, 1, 'mplus', 9, 5, 42, 'boss', 'PACKED')''',
+            [(f'packed_{i}', f'packed{i}') for i in range(5000)])
+    connect = db._connect
+    steps = []
+
+    @contextmanager
+    def bounded_connect():
+        with connect() as conn:
+            def budget():
+                steps.append(1)
+                return len(steps) > 20
+            conn.set_progress_handler(budget, 100)
+            yield conn
+
+    monkeypatch.setattr(db, '_connect', bounded_connect)
+    assert not db.has_pending_mplus()

@@ -182,7 +182,7 @@
         <div style="margin-top: 8px; font-size: 13px; color: #94a3b8;">
           <span id="download-worker-summary">4 downloads · 8 request limit · 4 pack workers</span>
           <span id="download-settings-feedback" role="status" aria-live="polite" style="margin-left: 10px;"></span>
-          <div style="margin-top: 4px;">Apply changes without stopping discovery. Active downloads finish normally; following batches use the selected worker count.</div>
+          <div style="margin-top: 4px;">Apply changes without stopping discovery. Active downloads finish normally; free workers immediately take the next fight.</div>
         </div>
         <div class="filter-bar" style="margin-top: 12px;">
           <input type="text" id="import-report-input" placeholder="Paste WCL Report URL or Code (e.g. aBcDeFg123)" style="min-width: 340px;" />
@@ -228,6 +228,8 @@
             Pending: <span id="stat-pending">0 reports / 0 retries</span> |
             Failed: <span id="stat-failures">0 reports / 0 fights</span>
             <div style="margin-top: 5px;">
+              Downloading: <span id="stat-downloading">0 / 4 workers</span> |
+              Preparing reports: <span id="stat-preparing">0</span> |
               Raw on disk: <span id="stat-staging">0 files / 0.00 MB</span> |
               Packing: <span id="stat-packing">0 / 4 workers</span>
             </div>
@@ -241,6 +243,6 @@
   </main>
 
   <script src="/replay2d.js?v=6"></script>
-  <script src="/app.js?v=7"></script>
+  <script src="/app.js?v=8"></script>
 </body>
 </html>

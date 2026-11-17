@@ -788,7 +788,7 @@ def create_app(
                             f"{harvester.pack_workers}x CPU)..."
                         )
                         packed = await harvester.drain_queue_batch(
-                            batch_size=40, on_progress=_on_progress, should_stop=should_stop
+                            batch_size=40, on_progress=_on_progress, should_stop=should_stop, continuous=True
                         )
                         counts = index_db.get_queue_counts()
                         pending = sum(counts.get(key, 0) for key in (
@@ -816,6 +816,9 @@ def create_app(
                     _append_log(
                         f"Auto-restarting harvest (scan + pack) in {backoff_label} (attempt #{restart_attempt})..."
                     )
+                    # Finish capture cleanup before closing/replacing its browser.
+                    with suppress(Exception):
+                        await harvester.stop_background_downloading()
                     if source == "browser" and browser_client_ref["instance"] is not None:
                         try:
                             await browser_client_ref["instance"].stop()

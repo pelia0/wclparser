@@ -66,6 +66,16 @@ async def _await_pack(future):
         raise
 
 
+async def _finish_cleanup(future):
+    """Repeated cancellation must not detach a file writer from its owner."""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            continue
+    return future.result()
+
+
 class ImportIncompleteError(RuntimeError):
     def __init__(self, report_code: str, successful_paths: List[Path], failed_rows: List[Dict[str, Any]]):
         self.successful_paths = list(successful_paths)
@@ -113,19 +123,31 @@ class HarvesterPipeline:
         self._packing_finish = False
         self._packing_wakeup: Optional[asyncio.Event] = None
         self._packing_progress = None
+        self._download_scheduler_task: Optional[asyncio.Task] = None
+        self._continuous_downloads: Dict[int, Tuple[str, asyncio.Task]] = {}
+        self._report_preparations: Dict[str, asyncio.Task] = {}
+        self._download_wakeup: Optional[asyncio.Event] = None
+        self._download_progress: Optional[asyncio.Event] = None
+        self._download_completed = 0
+        self._download_reported = 0
 
     def get_staging_stats(self) -> Dict[str, int]:
-        return {**self.staging_store.stats(), 'packing_fights': len(self._packing_claims)}
+        return {**self.staging_store.stats(), 'packing_fights': len(self._packing_claims),
+                'downloading_fights': len(self._download_claims),
+                'preparing_reports': len(self._report_preparations)}
 
     def _pack_log(self, message: str) -> None:
         if self._packing_progress:
             self._packing_progress({'log': message, **self.get_staging_stats()})
 
     def _raise_background_failure(self) -> None:
-        for task in self._background_pack_tasks:
+        tasks = [*self._background_pack_tasks]
+        if self._download_scheduler_task is not None:
+            tasks.append(self._download_scheduler_task)
+        for task in tasks:
             if task.done() and not task.cancelled() and task.exception() is not None:
                 error = task.exception()
-                raise RuntimeError(f'Background packing failed: {error}') from error
+                raise RuntimeError(f'Background collection failed: {error}') from error
 
     def _verify_staged_archive(self, path: Path, job: Dict[str, Any]) -> None:
         sections = PackedFightReader.read_sections(path)
@@ -182,8 +204,28 @@ class HarvesterPipeline:
         self._background_pack_tasks = [asyncio.create_task(self._background_pack_worker())
                                        for _ in range(self.pack_workers)]
 
+    async def stop_background_downloading(self) -> None:
+        # Download cancellation may still be publishing a durable snapshot.
+        # Await those writers before allowing packers or capture storage to close.
+        if self._download_scheduler_task is not None:
+            task = self._download_scheduler_task
+            task.cancel()
+            try:
+                await _finish_cleanup(task)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._download_scheduler_task = None
+
     async def finish_background_packing(self, cancel: bool = False) -> None:
+        download_error = None
+        try:
+            await self.stop_background_downloading()
+        except Exception as exc:
+            download_error = exc
         if not self._background_pack_tasks:
+            if download_error:
+                raise download_error
             return
         self._packing_stop = self._packing_stop or cancel
         self._packing_finish = True
@@ -194,6 +236,8 @@ class HarvesterPipeline:
             errors = [result for result in results if isinstance(result, BaseException)]
             if errors:
                 raise RuntimeError(f'Background packing failed: {errors[0]}') from errors[0]
+            if download_error:
+                raise download_error
         except asyncio.CancelledError:
             self._packing_stop = True
             self._packing_wakeup.set()
@@ -253,55 +297,63 @@ class HarvesterPipeline:
                 self._packing_claims.discard(uid)
                 self._packing_wakeup.set()
 
+    async def _download_one_to_staging(self, row, worker_id, should_stop=None) -> int:
+        uid = row['fight_uid']
+        if uid in self._download_claims:
+            return 0
+        self._download_claims.add(uid)
+        try:
+            if should_stop and should_stop():
+                return 0
+            fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
+            if fresh is None or fresh['status'] not in ('QUEUED', 'RETRY'):
+                return 0
+            if uid in self._unlinked_staging:
+                path = self._unlinked_staging[uid]
+                rel = path.relative_to(self.data_dir.resolve()).as_posix()
+                self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
+                self._unlinked_staging.pop(uid)
+                self._packing_wakeup.set()
+                return 1
+            self._pack_log(f'Started downloading {uid} (download worker #{worker_id}; '
+                           f'{row.get("encounter_slug", "fight")})')
+            master = await self._get_report_master(row['report_code'])
+            out, meta, actors, abilities, start, end = self._prepare_fight_payload(row, master)
+            events = await self.client.fetch_all_fight_events(row['report_code'], int(row['fight_id']), start, end)
+            del events
+            async def stage_and_link():
+                path = await asyncio.to_thread(self.staging_store.stage_fight,
+                    self.raw_archive, row, meta, actors, abilities, out)
+                self._unlinked_staging[uid] = path
+                rel = path.relative_to(self.data_dir.resolve()).as_posix()
+                self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
+                self._unlinked_staging.pop(uid)
+                self._packing_wakeup.set()
+            task = asyncio.create_task(stage_and_link())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await _finish_cleanup(task)
+                raise
+            self._pack_log(f'Downloaded {uid} (download worker #{worker_id}); durable raw queued for packing')
+            return 1
+        except Exception as exc:
+            self.index_db.mark_fight_failed(row['report_code'], int(row['fight_id']), str(exc))
+            self._pack_log(f'Download/staging failed for {uid} (download worker #{worker_id}): {exc}')
+            return 0
+        finally:
+            self._download_claims.discard(uid)
+
     async def _download_rows_to_staging(self, pending, on_progress=None, should_stop=None) -> int:
         await self.start_background_packing(on_progress=on_progress)
-        sem = asyncio.Semaphore(self.download_concurrency)
-        async def download(row):
-            uid = row['fight_uid']
-            if uid in self._download_claims:
-                return 0
-            self._download_claims.add(uid)
-            try:
-                async with sem:
-                    if should_stop and should_stop():
-                        return 0
-                    fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
-                    if fresh is None or fresh['status'] not in ('QUEUED', 'RETRY'):
-                        return 0
-                    if uid in self._unlinked_staging:
-                        path = self._unlinked_staging[uid]
-                        rel = path.relative_to(self.data_dir.resolve()).as_posix()
-                        self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
-                        self._unlinked_staging.pop(uid)
-                        self._packing_wakeup.set()
-                        return 1
-                    master = await self._get_report_master(row['report_code'])
-                    out, meta, actors, abilities, start, end = self._prepare_fight_payload(row, master)
-                    events = await self.client.fetch_all_fight_events(row['report_code'], int(row['fight_id']), start, end)
-                    del events
-                    async def stage_and_link():
-                        path = await asyncio.to_thread(self.staging_store.stage_fight,
-                            self.raw_archive, row, meta, actors, abilities, out)
-                        self._unlinked_staging[uid] = path
-                        rel = path.relative_to(self.data_dir.resolve()).as_posix()
-                        self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
-                        self._unlinked_staging.pop(uid)
-                        self._packing_wakeup.set()
-                    task = asyncio.create_task(stage_and_link())
-                    try:
-                        await asyncio.shield(task)
-                    except asyncio.CancelledError:
-                        await task
-                        raise
-                    self._pack_log(f'Downloaded {uid}; durable raw queued for packing')
-                    return 1
-            except Exception as exc:
-                self.index_db.mark_fight_failed(row['report_code'], int(row['fight_id']), str(exc))
-                self._pack_log(f'Download/staging failed for {uid}: {exc}')
-                return 0
-            finally:
-                self._download_claims.discard(uid)
-        tasks = [asyncio.create_task(download(row)) for row in pending]
+        rows = iter(pending)
+        async def worker(worker_id):
+            completed = 0
+            for row in rows:
+                completed += await self._download_one_to_staging(row, worker_id, should_stop)
+            return completed
+        tasks = [asyncio.create_task(worker(i + 1))
+                 for i in range(min(self.download_concurrency, len(pending)))]
         try:
             return sum(await asyncio.gather(*tasks))
         finally:
@@ -310,7 +362,94 @@ class HarvesterPipeline:
             for task in tasks:
                 if not task.done() and not task.cancelling():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+
+    async def _prepare_download_report(self, code):
+        try:
+            if await self.client.unarchive_report(code):
+                self.index_db.mark_report_unarchived(code)
+                return
+            self.index_db.mark_report_failed(code, 'Unarchive request was not successful')
+        except Exception as exc:
+            self.index_db.mark_report_failed(code, str(exc))
+
+    async def _continuous_download_loop(self, should_stop):
+        """Refill individual slots; report preparation never joins a download batch."""
+        try:
+            while not (should_stop and should_stop()):
+                for slot, (uid, task) in list(self._continuous_downloads.items()):
+                    if task.done():
+                        self._download_completed += task.result()
+                        del self._continuous_downloads[slot]
+                        self._download_progress.set()
+                for code, task in list(self._report_preparations.items()):
+                    if task.done():
+                        task.result()
+                        del self._report_preparations[code]
+                        self._download_progress.set()
+
+                limit = self.download_concurrency
+                ready = self.index_db.get_unarchived_pending_fights(
+                    limit=max(2 * limit, len(self._continuous_downloads) + limit))
+                claimed = {uid for uid, task in self._continuous_downloads.values()}
+                free_slots = iter(i for i in range(1, limit + 1) if i not in self._continuous_downloads)
+                for row in ready:
+                    if row['fight_uid'] in claimed or len(self._continuous_downloads) >= limit:
+                        continue
+                    slot = next(free_slots)
+                    self._continuous_downloads[slot] = (row['fight_uid'], asyncio.create_task(
+                        self._download_one_to_staging(row, slot, should_stop)))
+                    claimed.add(row['fight_uid'])
+
+                # Bound metadata lookahead: keep enough prepared fights ahead
+                # without unarchiving the entire historical collection in RAM.
+                if len(ready) < 2 * limit and len(self._report_preparations) < limit:
+                    codes = self.index_db.get_pending_reports_for_unarchive(
+                        limit=limit + len(self._report_preparations))
+                    for code in codes:
+                        if len(self._report_preparations) >= limit:
+                            break
+                        if code not in self._report_preparations:
+                            self._report_preparations[code] = asyncio.create_task(self._prepare_download_report(code))
+
+                self._download_wakeup.clear()
+                wake = asyncio.create_task(self._download_wakeup.wait())
+                try:
+                    active = [task for uid, task in self._continuous_downloads.values()]
+                    active.extend(self._report_preparations.values())
+                    await asyncio.wait([*active, wake], timeout=.5, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    wake.cancel()
+                    await asyncio.gather(wake, return_exceptions=True)
+        finally:
+            tasks = [task for uid, task in self._continuous_downloads.values()]
+            tasks.extend(self._report_preparations.values())
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await _finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+            self._continuous_downloads.clear()
+            self._report_preparations.clear()
+            self._download_progress.set()
+
+    async def _continuous_download_step(self, on_progress, should_stop):
+        await self.start_background_packing(on_progress=on_progress)
+        if self._download_scheduler_task is None:
+            self._download_wakeup, self._download_progress = asyncio.Event(), asyncio.Event()
+            self._download_completed = self._download_reported = 0
+            self._download_scheduler_task = asyncio.create_task(self._continuous_download_loop(should_stop))
+        self._raise_background_failure()
+        self._download_wakeup.set()
+        if self._download_completed == self._download_reported:
+            self._download_progress.clear()
+            try:
+                await asyncio.wait_for(self._download_progress.wait(), timeout=.25)
+            except asyncio.TimeoutError:
+                pass
+        self._raise_background_failure()
+        completed = self._download_completed - self._download_reported
+        self._download_reported = self._download_completed
+        return completed
 
     async def _wait_for_staged_rows(self, rows) -> List[Path]:
         while any((self.index_db.get_fight(row['report_code'], int(row['fight_id'])) or {}).get('status') == 'STAGED'
@@ -329,7 +468,7 @@ class HarvesterPipeline:
         return self._pack_executor
 
     def close(self) -> None:
-        if self._background_pack_tasks:
+        if self._background_pack_tasks or self._download_scheduler_task is not None:
             raise RuntimeError('Await finish_background_packing() before closing the pipeline')
         if self._pack_executor is not None:
             self._pack_executor.shutdown(wait=True)
@@ -1090,6 +1229,7 @@ class HarvesterPipeline:
                     batch_size=max(25, self.download_concurrency * 6),
                     on_progress=on_progress,
                     should_stop=should_stop,
+                    continuous=True,
                 )
                 if scan_finished.is_set() and packed == 0:
                     counts = self.index_db.get_queue_counts()
@@ -1216,10 +1356,13 @@ class HarvesterPipeline:
         batch_size: int = 25,
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        continuous: bool = False,
     ) -> int:
         self._raise_background_failure()
         if should_stop and should_stop():
             return 0
+        if continuous and isinstance(self.raw_archive, FightArchive):
+            return await self._continuous_download_step(on_progress, should_stop)
         await self.warm_unarchive_batch(limit=batch_size, should_stop=should_stop)
         if should_stop and should_stop():
             return 0

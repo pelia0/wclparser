@@ -18,13 +18,15 @@ const fields={};
 const document={activeElement:null,getElementById(id){return fields[id] ||= new Element();}};
 const calls=[];
 let response={download_concurrency:10,browser_request_concurrency:20,pack_workers:4,
-              staged_fights:7,staging_files:8,staging_bytes:2097152,packing_fights:3};
+              staged_fights:7,staging_files:8,staging_bytes:2097152,packing_fights:3,
+              downloading_fights:6,preparing_reports:2};
 let ok=true;
 const context={document,window:{addEventListener(){}},console,URLSearchParams,
  fetch:async(url,options)=>{calls.push({url,options});return {ok,json:async()=>response};}};
 vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
 (async()=>{
   vm.runInContext('renderHarvesterState({download_concurrency:4,browser_request_concurrency:8,pack_workers:4})',context);
+  assert.equal(fields['stat-downloading'].textContent,'Restart server for active count');
   const input=fields['harvest-download-threads'];
   assert.equal(input.value,'4');
   input.value='10';input.dataset.dirty='1';
@@ -39,6 +41,8 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'
   assert(fields['stat-staging'].textContent.includes('8'));
   assert(fields['stat-staging'].textContent.includes('2.00'));
   assert(fields['stat-packing'].textContent.includes('3'));
+  assert.equal(fields['stat-downloading'].textContent,'6 / 10 workers');
+  assert.equal(fields['stat-preparing'].textContent,'2');
   const count=calls.length;
   for(const value of ['0','17','1.5','abc','']){
     input.value=value;await vm.runInContext('applyDownloadConcurrency()',context);

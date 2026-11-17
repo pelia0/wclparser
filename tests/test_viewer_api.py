@@ -256,7 +256,7 @@ def test_harvester_auto_restarts_scan_and_pack_on_error(tmp_path: Path, monkeypa
             raise TimeoutError("Page.goto: Timeout 30000ms exceeded.")
         return 0
 
-    async def fake_drain(self, batch_size: int = 25, on_progress=None, should_stop=None) -> int:
+    async def fake_drain(self, batch_size: int = 25, on_progress=None, should_stop=None, continuous=False) -> int:
         if attempts["count"] >= 2 and not packed_on_retry["done"]:
             packed_on_retry["done"] = True
             return 1

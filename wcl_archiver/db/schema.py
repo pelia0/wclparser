@@ -116,6 +116,9 @@ class IndexDB:
                 ):
                     if column not in columns:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_pending_mplus
+                ON fights(report_code)
+                WHERE content_type = 'mplus' AND status IN ('QUEUED', 'RETRY')""")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(fights)")}
             if "staging_rel_path" not in columns:
                 conn.execute("ALTER TABLE fights ADD COLUMN staging_rel_path TEXT DEFAULT NULL")
@@ -322,8 +325,11 @@ class IndexDB:
                 WHERE status IN ('RETRY', 'FAILED')""" + scope, params)
 
     def _has_pending_mplus(self, conn: sqlite3.Connection) -> bool:
+        # The general content index also contains completed historical keys.
+        # Frequent scheduler probes must read only the small pending-key index.
         return conn.execute(
-            """SELECT 1 FROM fights f JOIN reports r ON r.report_code = f.report_code
+            """SELECT 1 FROM fights f INDEXED BY idx_fights_pending_mplus
+               JOIN reports r ON r.report_code = f.report_code
                WHERE f.content_type = 'mplus' AND f.status IN ('QUEUED', 'RETRY')
                  AND f.failure_count < ? AND
                  (r.archive_status = 'UNARCHIVED' OR
