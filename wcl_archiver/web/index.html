@@ -140,6 +140,20 @@
           <label>Optional XSRF-TOKEN Cookie: <input type="text" id="auth-xsrf" placeholder="Optional XSRF-TOKEN value" /></label>
         </div>
         <button id="btn-save-auth" class="btn-primary">Sign In &amp; Save Session</button>
+        <div style="margin-top: 16px; border-top: 1px solid #2a364b; padding-top: 12px;">
+          <h3 style="margin: 0 0 8px;">WCL account authorization for archived logs</h3>
+          <p style="color: #94a3b8; font-size: 13px;">Save your Client ID and Secret above, then connect the WCL account with archive access. Approve access on the official WCL page. A client token or password login alone does not grant user API archive access.</p>
+          <p style="font-size: 13px;">Client API: <strong id="auth-client-api-status">Not checked</strong> | Account API: <strong id="auth-user-api-status">Not connected</strong></p>
+          <label style="font-size: 13px;">Registered redirect URL:
+            <input type="url" id="auth-redirect-uri" value="http://localhost:8080/" style="width: 330px; max-width: 100%; margin: 0 8px 10px;" />
+          </label>
+          <div style="color: #94a3b8; font-size: 12px; margin-bottom: 10px;">Must exactly match the Redirect URL in your WCL API client settings and use this server's port.</div>
+          <button id="btn-oauth-connect" class="btn-primary" disabled>Connect WCL account</button>
+          <button id="btn-oauth-check" class="nav-btn" disabled>Check archive access</button>
+          <button id="btn-oauth-disconnect" class="nav-btn" disabled>Disconnect WCL account</button>
+          <div id="oauth-feedback" role="status" aria-live="polite" style="margin-top: 10px; font-size: 13px; color: #94a3b8;"></div>
+          <a id="oauth-manual-link" hidden target="_blank" rel="noopener noreferrer" style="font-size: 13px; color: #60a5fa;">Open WCL authorization</a>
+        </div>
         <div id="auth-feedback-banner" style="margin-top: 12px; padding: 10px 12px; border-radius: 6px; display: none;"></div>
         <pre id="auth-status-box"></pre>
       </div>
@@ -190,6 +204,7 @@
         </div>
 
         <div id="harvester-error-banner" style="margin-top: 12px; padding: 10px 12px; border-radius: 6px; display: none; background: #3b181e; border: 1px solid #ef4444; color: #fca5a5;"></div>
+        <div id="api-quota-wait" role="status" style="display: none; margin-top: 10px; color: #fbbf24; font-size: 13px;"></div>
 
         <!-- Visual Progress Bar -->
         <div style="margin-top: 14px; background: #0f141c; border: 1px solid #2a364b; border-radius: 8px; padding: 12px;">
@@ -243,6 +258,6 @@
   </main>
 
   <script src="/replay2d.js?v=6"></script>
-  <script src="/app.js?v=9"></script>
+  <script src="/app.js?v=10"></script>
 </body>
 </html>

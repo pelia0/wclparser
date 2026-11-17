@@ -6,11 +6,13 @@ import time
 import json
 import os
 import tempfile
+import secrets
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Query
+from urllib.parse import urlencode, urlsplit
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, conint
 
 from wcl_archiver.codec.wclz_format import WCLZReader
@@ -270,6 +272,122 @@ def create_app(
     @app.get("/api/auth/status")
     def get_auth_status() -> Dict[str, Any]:
         return auth_manager.get_auth_status()
+
+    oauth_cookie = 'wcl_oauth_state'
+
+    def _oauth_failure(message, status=400):
+        response = HTMLResponse('<!doctype html><html lang="en"><meta charset="utf-8">'
+            '<title>WCL authorization</title><h1>WCL authorization</h1><p>' + message +
+            '</p><p><a href="/">Return to the archiver</a></p></html>', status_code=status,
+            headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+        response.delete_cookie(oauth_cookie, path='/', httponly=True, samesite='lax')
+        return response
+
+    @app.get('/api/auth/oauth/start')
+    async def start_user_oauth(request: Request, redirect_uri: str = 'http://localhost:8080/'):
+        try:
+            target = urlsplit(redirect_uri)
+            if (any(ord(c) <= 32 for c in redirect_uri) or '\\' in redirect_uri
+                    or target.scheme != 'http' or target.hostname not in ('localhost', '127.0.0.1')
+                    or target.username is not None or target.password is not None
+                    or target.query or target.fragment
+                    or target.path not in ('/', '/api/auth/oauth/callback')
+                    or (target.port or 80) != (request.url.port or 80)):
+                raise ValueError('Invalid loopback redirect')
+            # Set the cookie on the callback's host even when the app was opened
+            # using its other loopback alias. No authorization state exists yet.
+            if target.hostname != request.url.hostname:
+                return RedirectResponse(target._replace(path='/api/auth/oauth/start',
+                    query=urlencode({'redirect_uri': redirect_uri})).geturl(), status_code=307)
+            flow = auth_manager.begin_user_oauth(redirect_uri)
+        except ValueError:
+            return _oauth_failure('Save your Client ID and Secret, and use a loopback redirect URL on this server port.')
+        response = RedirectResponse(flow['authorization_url'], status_code=303,
+            headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+        response.set_cookie(oauth_cookie, flow['state'], max_age=flow['expires_in'],
+                            httponly=True, samesite='lax', path='/')
+        return response
+
+    async def _complete_user_oauth(request: Request):
+        query = request.query_params
+        state, cookie = query.get('state', ''), request.cookies.get(oauth_cookie, '')
+        if (any(len(query.getlist(name)) > 1 for name in ('state', 'code', 'error'))
+                or not state or not cookie or not secrets.compare_digest(state, cookie)):
+            return _oauth_failure('Authorization state is missing or invalid. Start Connect WCL account again.')
+        try:
+            if query.get('error'):
+                auth_manager.cancel_user_oauth(state)
+                return _oauth_failure('WCL authorization was declined. Your existing login is unchanged.')
+            if not query.get('code'):
+                return _oauth_failure('WCL did not return an authorization code. Connect again.')
+            await auth_manager.complete_user_oauth(query['code'], state)
+        except ValueError:
+            return _oauth_failure('This authorization has expired or was already used. Connect again.')
+        except RuntimeError:
+            return _oauth_failure('WCL could not complete the token exchange. Check the registered redirect URL and reconnect.', 502)
+        response = RedirectResponse('/?oauth=connected', status_code=303,
+            headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+        response.delete_cookie(oauth_cookie, path='/', httponly=True, samesite='lax')
+        return response
+
+    @app.get('/api/auth/oauth/callback')
+    async def user_oauth_callback(request: Request):
+        return await _complete_user_oauth(request)
+
+    @app.get('/')
+    async def root_or_oauth_callback(request: Request):
+        if any(name in request.query_params for name in ('code', 'state', 'error')):
+            return await _complete_user_oauth(request)
+        return FileResponse(BASE_DIR / 'wcl_archiver' / 'web' / 'index.html',
+                            headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+    @app.post('/api/auth/oauth/disconnect')
+    async def disconnect_user_oauth():
+        _require_idle()
+        return auth_manager.disconnect_user_oauth()
+
+    @app.post('/api/auth/oauth/check')
+    async def check_user_oauth_access():
+        if not auth_manager.get_auth_status().get('has_user_oauth_token'):
+            raise HTTPException(status_code=409, detail='Connect your WCL account first.')
+        with index_db._connect() as conn:
+            sample = conn.execute("SELECT report_code FROM fights WHERE status = 'PACKED' ORDER BY rowid LIMIT 1").fetchone()
+        rate = 'rateLimitData {limitPerHour pointsSpentThisHour pointsResetIn}'
+        query = ('query($code:String!) {' + rate +
+                 ' reportData {report(code:$code) {code archiveStatus {isArchived isAccessible}}}}') if sample else 'query {' + rate + '}'
+        variables = {'code': sample['report_code']} if sample else {}
+        try:
+            endpoint, token = await auth_manager.get_api_auth()
+            if not endpoint.endswith('/api/v2/user'):
+                raise HTTPException(status_code=409, detail='Connect your WCL account first.')
+            # Interactive check is bounded and does not enter a background quota wait.
+            async with protocol_client._make_client() as client:
+                response = await client.post(endpoint, json={'query': query, 'variables': variables},
+                    headers={'Authorization': f'Bearer {token}'}, timeout=30)
+            if response.status_code in (401, 403):
+                raise HTTPException(status_code=401, detail='WCL rejected user authorization. Reconnect your WCL account.')
+            if response.status_code == 429:
+                raise HTTPException(status_code=429, detail='WCL API quota is exhausted. Try again after its reset.')
+            if response.status_code != 200:
+                raise RuntimeError('User API check failed')
+            body = protocol_client._json_payload(response, 'user API')
+            if body.get('errors') or not isinstance(body.get('data'), dict):
+                raise RuntimeError('User API check failed')
+            quota = body['data'].get('rateLimitData')
+            if not isinstance(quota, dict):
+                raise RuntimeError('User API quota response missing')
+            report = None
+            if sample:
+                source = (body['data'].get('reportData') or {}).get('report') or {}
+                archive_status = source.get('archiveStatus')
+                if not isinstance(archive_status, dict) or type(archive_status.get('isAccessible')) is not bool:
+                    raise RuntimeError('Report access response missing')
+                report = {'report_code': sample['report_code'], **archive_status}
+            return {'api_endpoint': '/api/v2/user', 'quota': quota, 'report': report}
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=502, detail='Could not verify WCL user API access. Reconnect or try again later.') from None
 
     @app.post("/api/auth/login")
     async def post_login(req: LoginRequest) -> Dict[str, Any]:
@@ -675,6 +793,7 @@ def create_app(
             **harvester_state,
             **index_db.get_queue_counts(),
             **harvester.get_staging_stats(),
+            **protocol_client.get_quota_status(),
             "download_concurrency": harvester.download_concurrency,
             "browser_request_concurrency": 2 * harvester.download_concurrency,
             "pack_workers": harvester.pack_workers,

@@ -1,5 +1,11 @@
 import re
 import json
+import asyncio
+import math
+import time
+from collections import OrderedDict
+from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 import httpx
 from wcl_archiver.wcl_client.auth import WCLAuthManager
@@ -21,17 +27,117 @@ class WCLProtocolClient:
         self.auth_manager = auth_manager
         self._transport = transport
         self.raw_archive = raw_archive
+        self._report_master_cache = OrderedDict()
+        self._quota_until = 0.0
+        self._quota_wait_lock = asyncio.Lock()
 
     async def _capture_response(self, response):
         if self.raw_archive is None:
             return
         await response.aread()
         request_json = None
-        if response.request.url.path == '/api/v2/client' and response.request.content:
+        if response.request.url.path in ('/api/v2/client', '/api/v2/user') and response.request.content:
             request_json = json.loads(response.request.content)
         self.raw_archive.capture(response.request.method, str(response.request.url),
                                  response.content, status=response.status_code,
                                  request_json=request_json)
+
+    @staticmethod
+    def _json_payload(response, context):
+        if '_wcl_payload' in response.extensions:
+            return response.extensions['_wcl_payload']
+        try:
+            payload = response.json(parse_float=Decimal)
+        except (ValueError, UnicodeError):
+            raise RuntimeError(f'Invalid {context} JSON response') from None
+        if not isinstance(payload, dict):
+            raise RuntimeError(f'Invalid {context} response')
+        return payload
+
+    async def _graphql_post(self, client, query, variables):
+        # Every query carries application quota data; all workers share one gate.
+        if not re.search(r'\brateLimitData\b', query):
+            opening = query.index('{') + 1
+            query = (query[:opening] + '\n rateLimitData { limitPerHour pointsSpentThisHour pointsResetIn }\n'
+                     + query[opening:])
+        for attempt in range(3):
+            await self._wait_for_quota()
+            # Resolve after waiting and for each page/retry: refresh supersedes
+            # headers copied when this HTTP client was opened.
+            endpoint, token = await self.auth_manager.get_api_auth()
+            response = await client.post(
+                endpoint, json={'query': query, 'variables': variables},
+                headers={'Authorization': f'Bearer {token}' if token else ''})
+            if response.status_code == 429:
+                delay = self._retry_after(response.headers.get('Retry-After', ''))
+                self._quota_until = max(self._quota_until, time.monotonic() + delay)
+                if attempt == 2:
+                    raise RuntimeError('WarcraftLogs API quota remained exhausted after bounded retries')
+                continue
+            if response.status_code == 200:
+                try:
+                    payload = response.json(parse_float=Decimal)
+                except (ValueError, UnicodeError):
+                    payload = None  # The caller reports its contextual JSON error.
+                if isinstance(payload, dict):
+                    response.extensions['_wcl_payload'] = payload
+                data = payload.get('data') if isinstance(payload, dict) else None
+                quota = data.get('rateLimitData') if isinstance(data, dict) else None
+                if isinstance(quota, dict):
+                    try:
+                        limit = float(quota.get('limitPerHour', 0))
+                        spent = float(quota.get('pointsSpentThisHour', 0))
+                        delay = float(quota.get('pointsResetIn', 0))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                    else:
+                        if limit > 0 and spent >= limit and math.isfinite(delay) and delay > 0:
+                            self._quota_until = max(self._quota_until, time.monotonic() + delay)
+            return response
+
+    async def _wait_for_quota(self):
+        # One waiter sleeps, other workers wait on the gate rather than spinning
+        # independently. Known cooldowns pause work without consuming queued
+        # reports' failure attempts; task cancellation interrupts either wait.
+        async with self._quota_wait_lock:
+            while (delay := self._quota_until - time.monotonic()) > 0:
+                await asyncio.sleep(min(delay, 30.0))
+
+    def get_quota_status(self):
+        return {'api_quota_wait_seconds': math.ceil(max(0, self._quota_until - time.monotonic()))}
+
+    @staticmethod
+    def _retry_after(value):
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                delay = parsedate_to_datetime(value).timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                return 1.0
+        return max(0.0, delay) if math.isfinite(delay) else 1.0
+
+    def _has_user_auth(self):
+        status = self.auth_manager.get_auth_status()
+        return bool(status.get('has_user_oauth_token') or status.get('oauth_mode') == 'user')
+
+    def _cached_master(self, report_code):
+        cached = self._report_master_cache.get(report_code)
+        has_source = getattr(self.raw_archive, 'has_report_metadata', None)
+        if cached is not None and callable(has_source) and has_source(report_code):
+            self._report_master_cache.move_to_end(report_code)
+            return cached
+        return None
+
+    @staticmethod
+    def _next_cursor(value, cursor, end_time):
+        if value is None:
+            return None
+        integer = type(value) is int or (isinstance(value, Decimal) and value.is_finite()
+                                       and value == value.to_integral_value())
+        if not integer or not cursor < value <= end_time:
+            raise RuntimeError('Invalid event pagination cursor: must advance within fight bounds')
+        return int(value)
 
     def _make_client(self) -> httpx.AsyncClient:
         headers, cookies = self.auth_manager.get_headers_and_cookies()
@@ -46,15 +152,30 @@ class WCLProtocolClient:
         )
 
     async def unarchive_report(self, report_code: str) -> bool:
+        if self._has_user_auth():
+            # A subscribed user's API access is the archive accessibility check.
+            # Denial propagates; never silently downgrade to a browser session.
+            await self.fetch_report_master_and_fights(report_code)
+            return True
         async with self._make_client() as client:
             resp = await client.post(f"/reports/unarchive/{report_code}")
             return resp.status_code == 200
 
     async def fetch_report_master_and_fights(self, report_code: str) -> Dict[str, Any]:
         async with self._make_client() as client:
+            if self._has_user_auth():
+                cached = self._cached_master(report_code)
+                if cached is not None:
+                    return cached
+                metadata = await self._fetch_report_master_graphql(client, report_code)
+                self._report_master_cache[report_code] = metadata
+                self._report_master_cache.move_to_end(report_code)
+                while len(self._report_master_cache) > 128:
+                    self._report_master_cache.popitem(last=False)
+                return metadata
             resp = await client.get(f"/reports/fights-and-participants/{report_code}/0")
             if resp.status_code == 200:
-                payload = resp.json()
+                payload = self._json_payload(resp, 'report metadata')
                 if not isinstance(payload,dict) or not isinstance(payload.get('fights'),list):
                     raise RuntimeError('Invalid report metadata response')
                 return payload
@@ -72,6 +193,7 @@ class WCLProtocolClient:
         query($code: String!) {
           reportData {
             report(code: $code) {
+              archiveStatus { isArchived isAccessible }
               fights {
                 id
                 startTime
@@ -84,6 +206,9 @@ class WCLProtocolClient:
                 maps { id }
               }
               masterData {
+                logVersion
+                gameVersion
+                lang
                 abilities {
                   gameID
                   name
@@ -94,25 +219,35 @@ class WCLProtocolClient:
                   name
                   type
                   subType
+                  petOwner
+                  gameID
+                  server
                 }
               }
             }
           }
         }
         """
-        gql_resp = await client.post(
-            "/api/v2/client",
-            json={"query": query, "variables": {"code": report_code}},
-        )
+        gql_resp = await self._graphql_post(client, query, {'code': report_code})
         gql_resp.raise_for_status()
-        payload = gql_resp.json()
-        report = ((payload.get("data") or {}).get("reportData") or {}).get("report")
+        payload = self._json_payload(gql_resp, 'GraphQL report metadata')
+        data = payload.get('data')
+        report_data = data.get('reportData') if isinstance(data, dict) else None
+        report = report_data.get('report') if isinstance(report_data, dict) else None
         if (payload.get('errors') or not isinstance(report,dict)
                 or not isinstance(report.get('fights'),list)
                 or not isinstance(report.get('masterData'),dict)
                 or not isinstance(report['masterData'].get('actors'),list)
                 or not isinstance(report['masterData'].get('abilities'),list)):
             raise RuntimeError('Incomplete GraphQL report metadata')
+        if any(not isinstance(item, dict) for records in (
+                report['fights'], report['masterData']['actors'], report['masterData']['abilities'])
+               for item in records):
+            raise RuntimeError('Invalid GraphQL report metadata records')
+        archive_status = report.get('archiveStatus')
+        if (isinstance(archive_status, dict) and archive_status.get('isArchived') is True
+                and archive_status.get('isAccessible') is False):
+            raise RuntimeError('WarcraftLogs archived report is not accessible to this account')
         fights = [
             {
                 "id": f.get("id"),
@@ -134,6 +269,7 @@ class WCLProtocolClient:
             if actor.get("type") == "Player":
                 friendlies.append(
                     {
+                        **actor,
                         "id": actor.get("id"),
                         "name": actor.get("name", ""),
                         "type": actor.get("subType", "Player"),
@@ -143,6 +279,7 @@ class WCLProtocolClient:
             else:
                 enemies.append(
                     {
+                        **actor,
                         "id": actor.get("id"),
                         "name": actor.get("name", ""),
                         "type": actor.get("type", "NPC"),
@@ -174,6 +311,9 @@ class WCLProtocolClient:
         cursor: Optional[int] = int(start_time)
 
         async with self._make_client() as client:
+            if self._has_user_auth():
+                return await self._fetch_all_fight_events_graphql(
+                    client, report_code, fight_id, start_time, end_time)
             while cursor is not None and cursor <= end_time:
                 url = (
                     f"/reports/events/summary/{report_code}/{fight_id}/{cursor}/{end_time}"
@@ -186,18 +326,13 @@ class WCLProtocolClient:
                     )
                     return all_events + tail
                 resp.raise_for_status()
-                data = resp.json()
+                data = self._json_payload(resp, 'canonical event page')
                 if not isinstance(data,dict) or not isinstance(data.get('events'),list):
                     raise RuntimeError('Invalid canonical event page')
                 batch = data.get("events", [])
                 all_events.extend(batch)
                 next_ts = data.get("nextPageTimestamp")
-                if next_ts is not None:
-                    if int(next_ts) <= cursor:
-                        raise RuntimeError('Event pagination cursor did not advance')
-                    cursor = int(next_ts)
-                else:
-                    cursor = None
+                cursor = self._next_cursor(next_ts, cursor, end_time)
 
         return all_events
 
@@ -213,7 +348,7 @@ class WCLProtocolClient:
         query($code: String!, $fightId: Int!, $startTime: Float!, $endTime: Float!) {
           reportData {
             report(code: $code) {
-              events(fightIDs: [$fightId], startTime: $startTime, endTime: $endTime, includeResources: true, limit: 10000) {
+              events(fightIDs: [$fightId], startTime: $startTime, endTime: $endTime, includeResources: true, limit: 20000) {
                 data
                 nextPageTimestamp
               }
@@ -224,38 +359,28 @@ class WCLProtocolClient:
         all_events: List[Dict[str, Any]] = []
         cursor: Optional[int] = int(start_time)
         while cursor is not None and cursor <= end_time:
-            gql_resp = await client.post(
-                "/api/v2/client",
-                json={
-                    "query": query,
-                    "variables": {
+            gql_resp = await self._graphql_post(client, query, {
                         "code": report_code,
                         "fightId": int(fight_id),
                         "startTime": float(cursor),
                         "endTime": float(end_time),
-                    },
-                },
-            )
+                    })
             gql_resp.raise_for_status()
-            payload = gql_resp.json()
+            payload = self._json_payload(gql_resp, 'GraphQL event page')
             if payload.get('errors'):
                 raise RuntimeError('GraphQL event response contains errors')
-            ev_obj = (
-                (((payload.get("data") or {}).get("reportData") or {}).get("report") or {})
-                .get("events")
-                or {}
-            )
-            if not isinstance(ev_obj.get('data'),list):
+            data = payload.get('data')
+            report_data = data.get('reportData') if isinstance(data, dict) else None
+            report = report_data.get('report') if isinstance(report_data, dict) else None
+            ev_obj = report.get('events') if isinstance(report, dict) else None
+            if not isinstance(ev_obj, dict) or not isinstance(ev_obj.get('data'),list):
                 raise RuntimeError('Invalid GraphQL event page')
             batch = ev_obj['data']
+            if any(not isinstance(event, dict) for event in batch):
+                raise RuntimeError('Invalid GraphQL event records')
             all_events.extend(batch)
             next_ts = ev_obj.get("nextPageTimestamp")
-            if next_ts is not None:
-                if int(next_ts) <= cursor:
-                    raise RuntimeError('Event pagination cursor did not advance')
-                cursor = int(next_ts)
-            else:
-                cursor = None
+            cursor = self._next_cursor(next_ts, cursor, end_time)
         return all_events
 
     async def fetch_rankings_fight_refs(
@@ -328,13 +453,11 @@ class WCLProtocolClient:
                 variables["difficulty"] = int(difficulty)
 
         async with self._make_client() as client:
-            resp = await client.post(
-                "/api/v2/client",
-                json={"query": query, "variables": variables},
-            )
+            resp = await self._graphql_post(client, query, variables)
             if resp.status_code in (401, 403):
                 auth_st = self.auth_manager.get_auth_status()
-                if auth_st.get("has_session_cookie") and not auth_st.get("has_oauth_token"):
+                if (auth_st.get("has_session_cookie") and not auth_st.get("has_oauth_token")
+                        and not self._has_user_auth()):
                     web_refs = await self._fetch_rankings_web_table_fallback(
                         client, zone_id, encounter_id, partition, class_name, spec_name, page, difficulty=difficulty
                     )
@@ -342,17 +465,14 @@ class WCLProtocolClient:
                         return web_refs
                 raise RuntimeError(
                     f"WarcraftLogs API v2 rejected the rankings request (HTTP {resp.status_code}). "
-                    "To scan rankings, please provide a valid API v2 Client ID and Client Secret "
-                    "(create free in 10 seconds at https://www.warcraftlogs.com/api/clients) "
-                    "in Section 1 above and click 'Sign In & Save Session'."
+                    "Check your WCL API authorization and account access."
                 )
             if resp.status_code != 200:
                 resp.raise_for_status()
                 raise RuntimeError('Unexpected rankings status')
-            payload = resp.json()
+            payload = self._json_payload(resp, 'GraphQL rankings')
             if payload.get("errors"):
-                err_msg = payload["errors"][0].get("message", "Unknown GraphQL error")
-                raise RuntimeError(f"WarcraftLogs API v2 GraphQL error: {err_msg}")
+                raise RuntimeError('WarcraftLogs API v2 GraphQL rankings response contains errors')
             data = payload.get("data") or {}
             world_data = data.get("worldData") or {}
             encounter = world_data.get("encounter") or {}

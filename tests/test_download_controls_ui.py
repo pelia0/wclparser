@@ -43,6 +43,11 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'
   assert(fields['stat-packing'].textContent.includes('3'));
   assert.equal(fields['stat-downloading'].textContent,'6 / 10 workers');
   assert.equal(fields['stat-preparing'].textContent,'2');
+  vm.runInContext('renderHarvesterState({download_concurrency:10,browser_request_concurrency:20,pack_workers:4,rankings_source:"api",api_quota_wait_seconds:123})',context);
+  assert.equal(fields['api-quota-wait'].style.display,'block');
+  assert(fields['api-quota-wait'].textContent.includes('123s'));
+  vm.runInContext('renderHarvesterState({download_concurrency:10,browser_request_concurrency:20,pack_workers:4,rankings_source:"browser",api_quota_wait_seconds:123})',context);
+  assert.equal(fields['api-quota-wait'].style.display,'none');
   for(const value of [17,32,128,1000]){
     input.value=String(value);
     response={download_concurrency:value,browser_request_concurrency:2*value,pack_workers:4};

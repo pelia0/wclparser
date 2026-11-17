@@ -7,6 +7,7 @@ const fightsPageSize = 100;
 let fightsRequest = 0;
 let downloadSettingsSupported = false;
 let downloadSettingsApplying = false;
+let oauthPollingTimer = null;
 let eventsState = {
   eventType: "all",
   tStartSec: "",
@@ -118,6 +119,9 @@ async function initApp() {
   document.getElementById("btn-fights-prev").addEventListener("click", () => loadFightsList(Math.max(0, fightsOffset - fightsPageSize)));
   document.getElementById("btn-fights-next").addEventListener("click", () => loadFightsList(fightsOffset + fightsPageSize));
   document.getElementById("btn-save-auth").addEventListener("click", submitAuth);
+  document.getElementById("btn-oauth-connect").addEventListener("click", connectUserOAuth);
+  document.getElementById("btn-oauth-disconnect").addEventListener("click", disconnectUserOAuth);
+  document.getElementById("btn-oauth-check").addEventListener("click", checkUserOAuthAccess);
   document.getElementById("btn-harvest-mplus").addEventListener("click", () => startHarvest("mplus_s5"));
   document.getElementById("btn-harvest-raids").addEventListener("click", () => startHarvest("raids"));
   document.getElementById("btn-harvest-stop").addEventListener("click", stopHarvest);
@@ -138,6 +142,10 @@ async function initApp() {
   await refreshAuthStatus();
   await refreshHarvesterStatus();
   await loadFightsList();
+  if (new URLSearchParams(window.location.search).get("oauth") === "connected") {
+    switchView("auth");
+    window.history.replaceState({}, "", window.location.pathname);
+  }
   setInterval(refreshHarvesterStatus, 1000);
 }
 
@@ -183,6 +191,27 @@ function renderAuthState(st) {
   const badge = document.getElementById("auth-badge");
   badge.textContent = st.authenticated ? `Authenticated (${st.email})` : "Not Authenticated";
   badge.style.color = st.authenticated ? "#4ade80" : "#f87171";
+  const supported = typeof st.has_user_oauth_token === "boolean";
+  const clientLabel = document.getElementById("auth-client-api-status");
+  if (clientLabel) clientLabel.textContent = st.has_oauth_token ? "Client token saved" : "No client token";
+  const userLabel = document.getElementById("auth-user-api-status");
+  if (userLabel) userLabel.textContent = st.has_user_oauth_token ? "Connected; check archive access below"
+    : st.oauth_mode === "user" ? "Authorization expired; reconnect or disconnect" : "Not connected";
+  const connect = document.getElementById("btn-oauth-connect");
+  if (connect) connect.disabled = !supported || !st.has_client_credentials;
+  for (const id of ["btn-oauth-disconnect", "btn-oauth-check"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = id === "btn-oauth-disconnect"
+      ? !(st.has_user_oauth_token || st.oauth_mode === "user") : !st.has_user_oauth_token;
+  }
+  if (!supported) {
+    const feedback = document.getElementById("oauth-feedback");
+    if (feedback) feedback.textContent = "Restart server to enable WCL account authorization.";
+  }
+  if (st.has_user_oauth_token && oauthPollingTimer !== null) {
+    clearInterval(oauthPollingTimer);
+    oauthPollingTimer = null;
+  }
 
   const banner = document.getElementById("auth-feedback-banner");
   if (banner) {
@@ -209,6 +238,68 @@ async function refreshAuthStatus() {
   const res = await fetch("/api/auth/status");
   const st = await res.json();
   renderAuthState(st);
+  return st;
+}
+
+function connectUserOAuth() {
+  const feedback = document.getElementById("oauth-feedback");
+  try {
+    const uri = document.getElementById("auth-redirect-uri").value.trim();
+    const callback = new URL(uri);
+    if (callback.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(callback.hostname)
+        || callback.username || callback.password || callback.search || callback.hash
+        || !["/", "/api/auth/oauth/callback"].includes(callback.pathname)) {
+      throw new Error("Use the registered HTTP localhost or 127.0.0.1 redirect URL.");
+    }
+    const start = new URL("/api/auth/oauth/start", callback.origin);
+    start.searchParams.set("redirect_uri", uri);
+    const link = document.getElementById("oauth-manual-link");
+    link.href = start.href;
+    link.hidden = false;
+    window.open(start.href, "_blank", "noopener,noreferrer");
+    feedback.textContent = "Complete authorization on the official WCL page. Use the link below if the tab did not open.";
+    if (oauthPollingTimer !== null) clearInterval(oauthPollingTimer);
+    const deadline = Date.now() + 600000;
+    oauthPollingTimer = setInterval(async () => {
+      if (Date.now() >= deadline) {
+        clearInterval(oauthPollingTimer);
+        oauthPollingTimer = null;
+        return;
+      }
+      try { await refreshAuthStatus(); } catch (_) { /* Keep the visible login page usable. */ }
+    }, 3000);
+  } catch (error) {
+    feedback.textContent = String(error.message || error);
+  }
+}
+
+async function disconnectUserOAuth() {
+  const feedback = document.getElementById("oauth-feedback");
+  try {
+    const response = await fetch("/api/auth/oauth/disconnect", { method: "POST" });
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.detail || "Unable to disconnect WCL account");
+    renderAuthState(state);
+    feedback.textContent = "WCL account disconnected. Client key and browser session are retained.";
+  } catch (error) { feedback.textContent = String(error.message || error); }
+}
+
+async function checkUserOAuthAccess() {
+  const feedback = document.getElementById("oauth-feedback");
+  const button = document.getElementById("btn-oauth-check");
+  button.disabled = true;
+  feedback.textContent = "Checking WCL user API and archive access…";
+  try {
+    const response = await fetch("/api/auth/oauth/check", { method: "POST" });
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.detail || "Unable to verify user API access");
+    const quota = state.quota || {};
+    const report = state.report;
+    const access = report ? (report.isAccessible ? "Sample report is accessible." : "Sample report is not accessible; check the authorized account's archive subscription.")
+      : "No saved report is available for an archive access check.";
+    feedback.textContent = `User API verified. Quota: ${quota.limitPerHour} points/hour. ${access}`;
+  } catch (error) { feedback.textContent = String(error.message || error); }
+  finally { button.disabled = false; }
 }
 
 async function submitAuth() {
@@ -266,6 +357,12 @@ function renderHarvesterState(st) {
   if (staging) staging.textContent = `${st.staging_files || 0} files / ${(Number(st.staging_bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
   const packing = document.getElementById("stat-packing");
   if (packing) packing.textContent = `${st.packing_fights || 0} / ${st.pack_workers || 4} workers`;
+  const apiWait = document.getElementById("api-quota-wait");
+  if (apiWait) {
+    const seconds = st.rankings_source === "api" ? Number(st.api_quota_wait_seconds || 0) : 0;
+    apiWait.style.display = seconds > 0 ? "block" : "none";
+    apiWait.textContent = seconds > 0 ? `WCL API quota cooldown: ${seconds}s until retry. Active downloads wait for the quota reset.` : "";
+  }
   const downloading = document.getElementById("stat-downloading");
   if (downloading) downloading.textContent = Number.isInteger(st.downloading_fights)
     ? `${st.downloading_fights} / ${st.download_concurrency || 4} workers`
