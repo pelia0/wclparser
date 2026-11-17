@@ -43,8 +43,15 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'
   assert(fields['stat-packing'].textContent.includes('3'));
   assert.equal(fields['stat-downloading'].textContent,'6 / 10 workers');
   assert.equal(fields['stat-preparing'].textContent,'2');
+  for(const value of [17,32,128,1000]){
+    input.value=String(value);
+    response={download_concurrency:value,browser_request_concurrency:2*value,pack_workers:4};
+    await vm.runInContext('applyDownloadConcurrency()',context);
+    assert.equal(JSON.parse(calls[calls.length-1].options.body).download_concurrency,value);
+    assert.equal(input.value,String(value));
+  }
   const count=calls.length;
-  for(const value of ['0','17','1.5','abc','']){
+  for(const value of ['0','-1','1.5','abc','','9007199254740993']){
     input.value=value;await vm.runInContext('applyDownloadConcurrency()',context);
   }
   assert.equal(calls.length,count,'invalid controls must not issue requests');

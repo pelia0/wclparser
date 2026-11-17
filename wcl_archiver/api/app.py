@@ -51,7 +51,7 @@ class ImportReportRequest(BaseModel):
     rankings_source: str = "browser"
 
 
-DownloadConcurrency = conint(strict=True, ge=1, le=16)
+DownloadConcurrency = conint(strict=True, ge=1)
 
 
 class HarvesterSettingsRequest(BaseModel):

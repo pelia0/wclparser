@@ -39,7 +39,7 @@ Failed work records an attempt count and reason. Retries are bounded within a ru
 
 Exhausted ranking-page failures remain visible without cancelling unrelated fight downloads. The activity log reports download time separately from packing and verification time, so a long network wait is distinguishable from local archive processing.
 
-The **Download workers** field accepts **1–16 simultaneous fights**, defaulting to **4**. Apply saves the setting locally in `data/harvester_settings.json` and changes it during a running collection. Automatic collection keeps a continuous queue: when one worker stages its completed fight on disk, that slot immediately takes the next eligible fight without waiting for the other downloads. Increasing the count opens additional slots; decreasing it lets active downloads finish and admits new work only below the new limit. Browser JSON requests share a limit of twice the selected count, so 10 download workers allow up to 20 JSON requests. Resizing preserves active requests, waiting requests, and the shared rate-limit cooldown. Discovery has its own workers and continues independently.
+The **Download workers** field accepts **any positive whole number without a fixed upper cap**, defaulting to **4**. Apply saves the setting locally in `data/harvester_settings.json` and changes it during a running collection. Automatic collection keeps a continuous queue: when one worker stages its completed fight on disk, that slot immediately takes the next eligible fight without waiting for the other downloads. Increasing the count opens additional slots; decreasing it lets active downloads finish and admits new work only below the new limit. Browser JSON requests share a limit of twice the selected count, so 64 download workers allow up to 128 JSON requests. Resizing preserves active requests, waiting requests, and the shared rate-limit cooldown. Discovery has its own workers and continues independently.
 
 Report preparation runs in a separate bounded pool, so ready fights can download while upcoming reports are being unarchived. Preparation looks ahead by a limited number of fights rather than warming the whole catalogue. Mythic+ priority and FIFO still govern dispatch; an older report awaiting preparation can hold the position of younger fights. Network response time, source availability, and rate limits can therefore leave some slots idle.
 
@@ -91,7 +91,7 @@ The local API exposes the source evidence separately from viewer analysis:
 | `GET /api/fights/{fight_uid}/summary` | Derived viewer summary. |
 | `GET /api/fights/{fight_uid}/events` | Filtered, normalized viewer events. |
 | `GET /api/harvester/status` | Current job state, progress, queue/failure counters, and archive size information. |
-| `POST /api/harvester/settings` | Save/apply `{"download_concurrency": 10}`; accepts integers 1–16. Status also reports request limit, staged fight count, temporary raw file count/bytes, and active pack workers. |
+| `POST /api/harvester/settings` | Save/apply `{"download_concurrency": 64}`; accepts positive integers with no fixed upper cap. Status also reports request limit, staged fight count, temporary raw file count/bytes, and active pack workers. |
 
 `fight_uid` is the report code followed by an underscore and fight ID, for example `aBcDeFg123_2`. Source and full-event exports read the file itself and do not depend on downloader memory or a separate raw store. Legacy viewer-only archives may have no full source records to export.
 

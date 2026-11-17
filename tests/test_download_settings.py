@@ -15,17 +15,19 @@ async def test_settings_default_persist_and_reload(tmp_path):
         assert status['download_concurrency'] == 4
         assert status['browser_request_concurrency'] == 8
         assert status['pack_workers'] == 4
-        status = (await client.post('/api/harvester/settings', json={'download_concurrency': 10})).json()
-        assert status['download_concurrency'] == 10
-        assert status['browser_request_concurrency'] == 20
+        response = await client.post('/api/harvester/settings', json={'download_concurrency': 128})
+        assert response.status_code == 200
+        status = response.json()
+        assert status['download_concurrency'] == 128
+        assert status['browser_request_concurrency'] == 256
         assert status['pack_workers'] == 4
         assert status['staging_bytes'] == status['staging_files'] == status['packing_fights'] == 0
-    assert json.loads((tmp_path / 'harvester_settings.json').read_text()) == {'download_concurrency': 10}
+    assert json.loads((tmp_path / 'harvester_settings.json').read_text()) == {'download_concurrency': 128}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url="http://test") as client:
-        assert (await client.get('/api/harvester/status')).json()['download_concurrency'] == 10
+        assert (await client.get('/api/harvester/status')).json()['download_concurrency'] == 128
 
 
-@pytest.mark.parametrize('invalid', [0, 17, True, False, 1.5, '10', None])
+@pytest.mark.parametrize('invalid', [0, -1, True, False, 1.5, '10', None])
 async def test_invalid_settings_have_no_side_effects(tmp_path, invalid):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url="http://test") as client:
         response = await client.post('/api/harvester/settings', json={'download_concurrency': invalid})
@@ -34,7 +36,7 @@ async def test_invalid_settings_have_no_side_effects(tmp_path, invalid):
         assert (await client.get('/api/harvester/status')).json()['download_concurrency'] == 4
 
 
-@pytest.mark.parametrize('invalid', ['{', '{"download_concurrency": true}', '{"download_concurrency": 40}'])
+@pytest.mark.parametrize('invalid', ['{', '{"download_concurrency": true}', '{"download_concurrency": 0}'])
 async def test_malformed_saved_settings_fall_back_with_log(tmp_path, invalid):
     (tmp_path / 'harvester_settings.json').write_text(invalid)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url="http://test") as client:
@@ -62,7 +64,7 @@ async def test_live_apply_preserves_job_and_resizes_existing_browser(tmp_path, m
         await client.post('/api/harvester/start', json={'mode': 'raids'})
         await entered.wait()
         try:
-            for value in [10, 2]:
+            for value in [32, 128, 2]:
                 response = await client.post('/api/harvester/settings', json={'download_concurrency': value})
                 assert response.status_code == 200
                 status = response.json()
@@ -70,7 +72,7 @@ async def test_live_apply_preserves_job_and_resizes_existing_browser(tmp_path, m
                 assert status['download_concurrency'] == pipelines[0].download_concurrency == value
                 assert status['browser_request_concurrency'] == 2 * value
             assert len(pipelines) == len(browsers) == 1
-            assert limits == [20, 4]
+            assert limits == [64, 256, 4]
             response = await client.post('/api/harvester/start', json={'mode': 'raids', 'download_concurrency': 16})
             assert response.status_code == 409
             assert pipelines[0].download_concurrency == 2
@@ -90,7 +92,7 @@ async def test_first_browser_uses_previously_selected_concurrency(tmp_path, monk
     assert limits == [20]
 
 
-@pytest.mark.parametrize('invalid', [0, 17, True, 1.5, '10'])
+@pytest.mark.parametrize('invalid', [0, -1, True, 1.5, '10'])
 async def test_start_rejects_invalid_worker_setting_without_persisting(tmp_path, invalid):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url="http://test") as client:
         response = await client.post('/api/harvester/start', json={'download_concurrency': invalid})
@@ -110,11 +112,23 @@ async def test_start_optional_download_setting_applies_after_idle_guard(tmp_path
         await asyncio.Event().wait()
     monkeypatch.setattr(HarvesterPipeline, 'discover_and_enqueue_raids', discover)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url="http://test") as client:
-        response = await client.post('/api/harvester/start', json={'mode': 'raids', 'rankings_source': 'protocol', 'download_concurrency': 10})
-        assert response.json()['download_concurrency'] == 10
+        response = await client.post('/api/harvester/start', json={'mode': 'raids', 'rankings_source': 'protocol', 'download_concurrency': 128})
+        assert response.status_code == 200
+        assert response.json()['download_concurrency'] == 128
         await entered.wait()
         await client.post('/api/harvester/stop')
-        assert values == [10]
+        assert values == [128]
+
+
+@pytest.mark.parametrize('value', [17, 32, 128, 1000, 100000])
+async def test_settings_accept_positive_counts_above_the_former_cap(tmp_path, value):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(create_app(tmp_path)), base_url='http://test') as client:
+        response = await client.post('/api/harvester/settings', json={'download_concurrency': value})
+        assert response.status_code == 200
+        status = response.json()
+        assert status['download_concurrency'] == value
+        assert status['browser_request_concurrency'] == 2 * value
+        assert status['pack_workers'] == 4
 
 
 async def test_start_setting_reserves_job_during_browser_resize(tmp_path, monkeypatch):

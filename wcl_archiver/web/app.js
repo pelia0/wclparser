@@ -444,9 +444,9 @@ function readDownloadConcurrency() {
   const input = document.getElementById("harvest-download-threads");
   const raw = input ? input.value.trim() : "";
   const value = Number(raw);
-  const valid = /^\d+$/.test(raw) && Number.isInteger(value) && value >= 1 && value <= 16;
+  const valid = /^\d+$/.test(raw) && Number.isSafeInteger(value) && value >= 1;
   if (input) {
-    input.setCustomValidity(valid ? "" : "Enter a whole number from 1 to 16.");
+    input.setCustomValidity(valid ? "" : "Enter a positive whole number.");
     if (!valid) input.reportValidity();
   }
   return valid ? value : null;
