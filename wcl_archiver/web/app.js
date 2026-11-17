@@ -368,7 +368,11 @@ function renderHarvesterState(st) {
   const hybridNotice = document.getElementById("hybrid-source-notice");
   if (hybridNotice) {
     hybridNotice.style.display = st.hybrid_strict ? "block" : "none";
-    hybridNotice.textContent = st.hybrid_strict ? "Strict hybrid preserves API responses plus complete browser canonical and replay sources. API downloads queue on disk and continue without waiting for the browser. Browser verification still downloads all canonical pages; temporary disk usage can grow." : "";
+    hybridNotice.textContent = st.hybrid_strict
+      ? (st.hybrid_strategy === "selective"
+        ? "API downloads events independently. Browser supplements metadata, replay and targeted event gaps; full event-page crawling is disabled. Waiting fights stay on disk until enrichment and validation finish."
+        : "Restart server to enable selective browser supplements. This running backend uses the previous full browser verification strategy.")
+      : "";
   }
   const browserEnrichment = document.getElementById("stat-browser-enrichment");
   if (browserEnrichment) browserEnrichment.textContent = `${st.browser_enriching_fights || 0} active / ${st.api_staged_fights || 0} queued`;

@@ -10,7 +10,7 @@ An omitted bitmap means every record has the field. Explicit null remains a
 normal value; padding bits must be zero. Readers also accept earlier dense
 columns with the reserved missing-value extension.
 """
-from collections import OrderedDict, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -293,6 +293,35 @@ def _capture_events(captures):
     return [event for cap in captures for event in _at(cap['body'], cap['event_path'])]
 
 
+def _integral(value):
+    return type(value) is int or (isinstance(value, Decimal) and value.is_finite()
+                                 and value == value.to_integral_value())
+
+
+def _validate_event_bounds(events, start=None, end=None):
+    for event in events:
+        _event_identity(event)
+        timestamp = event['timestamp']
+        if not _integral(timestamp) or (start is not None and not start <= timestamp <= end):
+            raise ValueError('Selective source event timestamp is invalid or outside fight bounds')
+
+
+def supplement_windows(api_events, replay_events):
+    """Select all deaths and API occurrences absent from replay, without deduping rows."""
+    _validate_event_bounds(api_events)
+    _validate_event_bounds(replay_events)
+    available = Counter(_event_identity(event) for event in replay_events)
+    timestamps = set()
+    for event in api_events:
+        identity = _event_identity(event)
+        represented = available[identity] > 0
+        if represented:
+            available[identity] -= 1
+        if str(event['type']).lower() == 'death' or not represented:
+            timestamps.add(int(event['timestamp']))
+    return [(timestamp, timestamp) for timestamp in sorted(timestamps)]
+
+
 def _merge_missing(target, source, *, index, capture_id, conflicts, path=()):
     if isinstance(target, dict) and isinstance(source, dict):
         for key, value in source.items():
@@ -312,16 +341,27 @@ def _merge_missing(target, source, *, index, capture_id, conflicts, path=()):
         conflicts.append({'index': index, 'path': list(path), 'source_capture': capture_id})
 
 
-def _full_event_view(primary, canonical_captures, replay_captures, conflicts=None):
+def _full_event_view(primary, canonical_captures, replay_captures, conflicts=None, *, selective=False):
     canonical = [(event, cap['info']['id']) for cap in canonical_captures
                  for event in _at(cap['body'], cap['event_path'])]
-    if len(primary) != len(canonical):
+    if not selective and len(primary) != len(canonical):
         raise ValueError('Hybrid canonical event count mismatch')
     result = deepcopy(primary)
-    for index, (event, (other, cid)) in enumerate(zip(result, canonical)):
-        if _event_identity(event) != _event_identity(other):
-            raise ValueError(f'Hybrid canonical event identity/order mismatch at index {index}')
-        _merge_missing(event, other, index=index, capture_id=cid, conflicts=conflicts)
+    canonical_indices = defaultdict(deque)
+    if selective:
+        for index, event in enumerate(primary):
+            canonical_indices[_event_identity(event)].append(index)
+    for offset, (other, cid) in enumerate(canonical):
+        if selective:
+            queue = canonical_indices.get(_event_identity(other))
+            if not queue:
+                raise ValueError('Selective canonical event is absent from API primary')
+            index = queue.popleft()
+        else:
+            index = offset
+            if _event_identity(result[index]) != _event_identity(other):
+                raise ValueError(f'Hybrid canonical event identity/order mismatch at index {index}')
+        _merge_missing(result[index], other, index=index, capture_id=cid, conflicts=conflicts)
     # Preserve repeated identical event identities by matching each occurrence once.
     indices = defaultdict(deque)
     for index, event in enumerate(primary):
@@ -527,6 +567,53 @@ class FightArchive:
             self._drop_attempt(old["manifest"]["fetch_id"])
         self._completed[key] = {"manifest": manifest, "master": master, "pages": pages, "replay": supplemental}
 
+    def supplement_replay_events(self, report_code, fight_id, fetch_id, start, end):
+        """Return only this attempt's replay records, on the capture-owning loop."""
+        if not all(type(value) is int for value in (start, end)) or start > end:
+            raise ValueError('Invalid selective replay fight bounds')
+        if fetch_id not in self._attempts:
+            raise ValueError('Unknown selective capture attempt')
+        replay = []
+        for cid in self._attempts[fetch_id]:
+            cap = self._captures[cid]
+            info = cap['info']
+            if (info['report_code'], info['fight_id'], info['fetch_id']) != (report_code, int(fight_id), fetch_id):
+                raise ValueError('Selective replay attempt binding mismatch')
+            if info['kind'] == 'replay':
+                replay.append(cap)
+        replay.sort(key=lambda cap: int(re.search(r'/replaysegment/[^/]+/\d+/(-?\d+)/', cap['info']['url'])[1]))
+        events = _capture_events(replay)
+        _validate_event_bounds(events, start, end)
+        return deepcopy(events)
+
+    def complete_supplement(self, report_code, fight_id, fetch_id, start, end, api_events):
+        """Complete received metadata/replay plus explicitly selected canonical windows."""
+        if not all(type(value) is int for value in (start, end)) or start > end:
+            raise ValueError('Invalid selective source fight bounds')
+        _validate_event_bounds(api_events, start, end)
+        master = self._pinned_masters.get(fetch_id) or self._masters.get(report_code)
+        if master is None:
+            raise ValueError('Selective source report metadata is missing')
+        replay_events = self.supplement_replay_events(report_code, fight_id, fetch_id, start, end)
+        windows = supplement_windows(api_events, replay_events)
+        captures = [self._captures[cid] for cid in self._attempts[fetch_id]]
+        pages = [cap for cap in captures if cap['info']['kind'] == 'events']
+        replay = [cap for cap in captures if cap['info']['kind'] == 'replay']
+        pages.sort(key=lambda cap: int(re.search(r'/(?:summary-events|events/summary)/[^/]+/\d+/(-?\d+)/', cap['info']['url'])[1]))
+        replay.sort(key=lambda cap: int(re.search(r'/replaysegment/[^/]+/\d+/(-?\d+)/', cap['info']['url'])[1]))
+        manifest = {'report_code': report_code, 'fight_id': int(fight_id), 'fetch_id': fetch_id,
+                    'start_time': start, 'end_time': end, 'event_count': len(api_events),
+                    'master_capture': master['info']['id'], 'event_captures': [cap['info']['id'] for cap in pages],
+                    'supplemental_captures': [cap['info']['id'] for cap in replay], 'complete': True,
+                    'source_mode': 'browser_supplement_v1', 'canonical_windows': [list(window) for window in windows]}
+        completed = {'manifest': manifest, 'master': master, 'pages': pages, 'replay': replay}
+        self._validate_provider_capture(completed, report_code, int(fight_id), api_events=api_events)
+        key = (report_code, int(fight_id))
+        old = self._completed.get(key)
+        if old and old['manifest']['fetch_id'] != fetch_id:
+            self._drop_attempt(old['manifest']['fetch_id'])
+        self._completed[key] = completed
+
     def fight_manifest(self, report_code, fight_id):
         try:
             return deepcopy(self._completed[(report_code, int(fight_id))]["manifest"])
@@ -534,10 +621,14 @@ class FightArchive:
             raise ValueError("No complete source archive for this fight") from exc
 
     @staticmethod
-    def _validate_provider_capture(completed, report_code, fight_id):
+    def _validate_provider_capture(completed, report_code, fight_id, *, api_events=None):
         """Certify complete source payloads, rather than trusting a flag alone."""
         try:
             manifest = completed['manifest']
+            mode = manifest.get('source_mode')
+            if mode not in (None, 'browser_supplement_v1'):
+                raise ValueError('Unknown hybrid source mode')
+            selective = mode == 'browser_supplement_v1'
             if (manifest['report_code'] != report_code or manifest['fight_id'] != fight_id
                     or manifest['complete'] is not True or not manifest['fetch_id']):
                 raise ValueError('Hybrid source identity or completeness mismatch')
@@ -545,7 +636,7 @@ class FightArchive:
             if any(type(v) is not int for v in (start, end, count)) or start > end or count < 0:
                 raise ValueError('Hybrid source boundaries or count invalid')
             master, pages, replay = completed['master'], completed['pages'], completed['replay']
-            if not isinstance(pages, list) or not pages or not isinstance(replay, list):
+            if not isinstance(pages, list) or (not pages and not selective) or not isinstance(replay, list):
                 raise ValueError('Hybrid source canonical pages missing')
             captures = [master, *pages, *replay]
             ids = [cap['info']['id'] for cap in captures]
@@ -577,6 +668,9 @@ class FightArchive:
             for names, expected in ((('start_time', 'startTime'), start), (('end_time', 'endTime'), end)):
                 if any(name in fight and fight[name] != expected for name in names):
                     raise ValueError('Hybrid source master fight boundaries mismatch')
+            if selective:
+                FightArchive._validate_supplement_sources(completed, fight, api_events)
+                return captures
             ordered = FightArchive._ordered_canonical_pages(pages, report_code, fight_id, start, end)
             if [cap['info']['id'] for cap in ordered] != manifest['event_captures'] or len(_capture_events(pages)) != count:
                 raise ValueError('Hybrid source canonical count/order mismatch')
@@ -622,6 +716,69 @@ class FightArchive:
             return captures
         except (KeyError, TypeError, IndexError, AttributeError, StopIteration) as exc:
             raise ValueError('Invalid hybrid source capture structure') from exc
+
+    @staticmethod
+    def _validate_supplement_sources(completed, fight, api_events):
+        manifest = completed['manifest']
+        start, end = manifest['start_time'], manifest['end_time']
+        code, fid = manifest['report_code'], manifest['fight_id']
+        if api_events is None or len(api_events) != manifest['event_count']:
+            raise ValueError('Selective source requires its complete API primary event count')
+        _validate_event_bounds(api_events, start, end)
+        master_url = completed['master']['info']['url']
+        boss = fight.get('boss', fight.get('encounterID', 0))
+        if not re.search(r'/reports/fights-and-participants/', master_url) or not _integral(boss) or boss <= 0:
+            raise ValueError('Selective source requires browser metadata with a valid replay boss')
+        cursor = start
+        for cap in completed['replay']:
+            match = re.search(r'/replaysegment/[^/]+/(\d+)/(-?\d+)/(-?\d+)(?:/|\?|$)', cap['info']['url'])
+            if not match:
+                raise ValueError('Selective replay request bounds missing')
+            replay_boss, left, right = map(int, match.groups())
+            if replay_boss != boss or left != cursor or not left <= right <= end:
+                raise ValueError('Selective replay source coverage mismatch')
+            _validate_event_bounds(_at(cap['body'], cap['event_path']), left, right)
+            cursor = right + 1
+        if cursor != end + 1:
+            raise ValueError('Selective replay source coverage incomplete')
+        replay_events = _capture_events(completed['replay'])
+        windows = [list(window) for window in supplement_windows(api_events, replay_events)]
+        declared = manifest['canonical_windows']
+        if (not isinstance(declared, list)
+                or any(not isinstance(window, list) or len(window) != 2
+                       or any(type(value) is not int for value in window) for window in declared)
+                or declared != windows):
+            raise ValueError('Selective canonical windows differ from required API occurrences')
+        pages = completed['pages']
+        if len(pages) != len(windows):
+            raise ValueError('Selective canonical required windows are missing or extra')
+        primary_counts = Counter()
+        expected_windows = {left: Counter() for left, _ in windows}
+        for row in api_events:
+            identity = _event_identity(row)
+            primary_counts[identity] += 1
+            if row['timestamp'] in expected_windows:
+                expected_windows[row['timestamp']][identity] += 1
+        replay_counts = Counter(_event_identity(row) for row in replay_events)
+        if replay_counts - primary_counts:
+            raise ValueError('Selective replay contains occurrences absent from API primary')
+        for cap, (left, right) in zip(pages, windows):
+            # Every selected timestamp is a complete canonical request. A cursor
+            # cannot advance inside this single-timestamp window.
+            match = re.search(r'/reports/(?:summary-events|events/summary)/([^/]+)/(\d+)/(-?\d+)/(-?\d+)(?:/|\?|$)', cap['info']['url'])
+            if not match or (match[1], int(match[2]), int(match[3]), int(match[4])) != (code, fid, left, right):
+                raise ValueError('Selective canonical request does not bind its required window')
+            ordered = FightArchive._ordered_canonical_pages([cap], code, fid, left, right)
+            if ordered != [cap]:
+                raise ValueError('Selective canonical page order mismatch')
+            records = _at(cap['body'], cap['event_path'])
+            _validate_event_bounds(records, left, right)
+            if Counter(_event_identity(row) for row in records) != expected_windows[left]:
+                raise ValueError('Selective canonical window does not match all API occurrences')
+        # Canonical and replay are overlapping views, not additive occurrences.
+        represented = replay_counts | Counter(_event_identity(row) for row in _capture_events(pages))
+        if primary_counts - represented:
+            raise ValueError('Selective browser sources leave API occurrence coverage gaps')
 
     @staticmethod
     def _validate_hybrid_capture(completed):
@@ -675,9 +832,11 @@ class FightArchive:
                         'replay': caps[1 + len(provider_manifest['event_captures']):]}
             api, browser = original(api_manifest, False), original(browser_manifest, True)
             FightArchive._validate_provider_capture(api, code, fid)
-            FightArchive._validate_provider_capture(browser, code, fid)
+            primary_events = _capture_events(api['pages'])
+            FightArchive._validate_provider_capture(browser, code, fid, api_events=primary_events)
             conflicts = []
-            _full_event_view(_capture_events(api['pages']), browser['pages'], browser['replay'], conflicts)
+            _full_event_view(primary_events, browser['pages'], browser['replay'], conflicts,
+                             selective=browser_manifest.get('source_mode') == 'browser_supplement_v1')
             if conflicts != hybrid['conflicts']:
                 raise ValueError('Hybrid conflicts differ from authoritative source payloads')
         except (KeyError, TypeError, IndexError, AttributeError) as exc:
@@ -692,13 +851,15 @@ class FightArchive:
         if browser_archive is self or 'hybrid' in primary['manifest']:
             raise ValueError('Hybrid merge requires independent unmerged provider archives')
         self._validate_provider_capture(primary, *key)
-        self._validate_provider_capture(browser, *key)
+        primary_events = _capture_events(primary['pages'])
+        self._validate_provider_capture(browser, *key, api_events=primary_events)
         api_manifest, browser_manifest = primary['manifest'], browser['manifest']
         if any(api_manifest[name] != browser_manifest[name] for name in
                ('report_code', 'fight_id', 'start_time', 'end_time', 'event_count')):
             raise ValueError('Hybrid provider fight boundaries or event count mismatch')
         conflicts = []
-        _full_event_view(_capture_events(primary['pages']), browser['pages'], browser['replay'], conflicts)
+        _full_event_view(primary_events, browser['pages'], browser['replay'], conflicts,
+                         selective=browser_manifest.get('source_mode') == 'browser_supplement_v1')
         def rebind(cap):
             info = cap['info']
             return {**cap, 'info': {**deepcopy(info), 'original_fetch_id': info['fetch_id'],
@@ -736,12 +897,15 @@ class FightArchive:
         except KeyError as exc:
             raise ValueError('No complete source archive for this fight') from exc
         if 'hybrid' not in completed['manifest']:
+            if completed['manifest'].get('source_mode') == 'browser_supplement_v1':
+                raise ValueError('Browser supplement requires its API primary for a full event view')
             return deepcopy(_capture_events(completed['pages']))
         self._validate_hybrid_capture(completed)
         hybrid = completed['manifest']['hybrid']
         canonical = [cap for cap in completed['auxiliary'] if cap['info']['id'] in hybrid['browser_manifest']['event_captures']]
         replay = [cap for cap in completed['replay'] if cap['info']['id'] in hybrid['browser_manifest']['supplemental_captures']]
-        return _full_event_view(_capture_events(completed['pages']), canonical, replay)
+        return _full_event_view(_capture_events(completed['pages']), canonical, replay,
+                                selective=hybrid['browser_manifest'].get('source_mode') == 'browser_supplement_v1')
 
     def stats(self):
         return {"source_bytes": 0, "source_responses": 0,
@@ -764,6 +928,8 @@ class FightArchive:
             raise ValueError("No complete source archive for this fight") from exc
         if completed['manifest'].get('hybrid_pending') is True:
             raise ValueError('Hybrid source is pending browser enrichment and cannot be packed')
+        if completed['manifest'].get('source_mode') == 'browser_supplement_v1':
+            raise ValueError('Browser supplement requires its API primary before publication')
         try:
             self._validate_hybrid_capture(completed)
             events, replay, capture_rows = [], [], []

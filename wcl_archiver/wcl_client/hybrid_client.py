@@ -1,7 +1,9 @@
-"""Strict API acquisition verified against complete independent browser sources."""
+"""Independent API acquisition with validated selective browser enrichment."""
 
 import asyncio
 from typing import Any, Dict, List, Optional
+
+from wcl_archiver.wcl_client.async_tasks import run_owned_thread as _run_owned_thread
 
 
 async def _gather_owned(*coroutines):
@@ -30,31 +32,11 @@ async def _gather_owned(*coroutines):
             raise asyncio.CancelledError()
 
 
-async def _run_owned_thread(function, *args):
-    """Finish a source-mutating thread before cancellation releases its buffers."""
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Cancelling a thread Future cannot stop its writer. Keep its Task alive
-        # and drain it even under repeated cancellation before cleanup may run.
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                break
-        if not task.cancelled():
-            task.exception()
-        raise
-
-
 class HybridClient:
     """Acquire API sources independently, then enrich their durable snapshots.
 
-    Browser canonical and replay traffic remains necessary for strict field
-    preservation. Each provider owns its capture scope and bounded master cache;
+    Browser replay and selected canonical timestamps supply extra fields.
+    Each provider owns its capture scope and bounded master cache;
     this adapter neither wraps their scopes nor duplicates their metadata cache.
     """
 
@@ -134,8 +116,8 @@ class HybridClient:
             browser_master, = await _gather_owned(self._fetch_master(
                 'browser', self.browser_client, self.browser_archive, report_code))
             await _gather_owned(self._source_call(
-                'browser', self.browser_client, 'fetch_all_fight_events',
-                report_code, fight_id, start, end))
+                'browser', self.browser_client, 'fetch_fight_supplement',
+                report_code, fight_id, start, end, job['raw_events']))
             await _run_owned_thread(
                 restored_api_archive.merge_hybrid_fight, self.browser_archive, report_code, fight_id)
             return browser_master

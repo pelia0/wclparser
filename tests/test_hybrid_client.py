@@ -53,6 +53,7 @@ class Provider:
         self.valid = True
         self.validation_calls = []
         self.fetch_calls = []
+        self.supplement_calls = []
         self.fetch = None
 
     async def unarchive_report(self, code):
@@ -81,6 +82,10 @@ class Provider:
         assert kwargs['difficulty'] == 5
         return [{'report': {'code': 'Report1234', 'fightID': 1}}]
 
+    async def fetch_fight_supplement(self, code, fid, start, end, api_events):
+        self.supplement_calls.append((code, fid, start, end, deepcopy(api_events)))
+        return await self.fetch_all_fight_events(code, fid, start, end)
+
 
 def clients():
     api_archive, browser_archive = Archive(), Archive()
@@ -93,7 +98,8 @@ def restored_fight(api, code='Report1234', fid=1):
     restored.fights[(code, fid)] = deepcopy(api.raw_archive.fights[(code, fid)])
     restored._completed[(code, fid)] = deepcopy(api.raw_archive._completed[(code, fid)])
     job = {'fight_row': {'report_code': code, 'fight_id': fid},
-           'fight_meta': {'report_code': code, 'fight_id': fid, 'start_time': 0, 'end_time': 10}}
+           'fight_meta': {'report_code': code, 'fight_id': fid, 'start_time': 0, 'end_time': 10},
+           'raw_events': deepcopy(restored.fights[(code, fid)])}
     return job, restored
 
 
@@ -159,6 +165,8 @@ async def test_enrichment_uses_private_restored_archive_and_returns_browser_mast
     job, restored = restored_fight(api)
     master = await client.enrich_staged_fight(job, restored)
     assert master is browser.master
+    assert browser.supplement_calls == [
+        ('Report1234', 1, 0, 10, [{'timestamp': 1, 'api': True}])]
     assert restored.full_fight_events('Report1234', 1) == [
         {'timestamp': 1, 'api': True, 'unknown': Decimal('0.12345678901234567890123456789')}]
     assert 'hybrid_pending' not in restored.fight_manifest('Report1234', 1)
@@ -405,7 +413,6 @@ async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_
         'masterData': {'actors': [], 'abilities': []}, 'apiFuture': {'unknown': True}}}}}
     api_events = b'{"data":{"reportData":{"report":{"events":{"data":[{"timestamp":1,"type":"damage","sourceID":1,"targetID":99,"abilityGameID":5,"amount":0.12345678901234567890123456789},{"timestamp":7,"type":"cast","sourceID":1,"abilityGameID":6}],"nextPageTimestamp":null,"apiUnknown":true}}}}}'
     browser_master = b'{"fights":[{"id":1,"start_time":0,"end_time":10,"boss":99}],"friendlies":[],"enemies":[],"abilities":[],"browserUnknown":{"precision":1.0000000000000000001}}'
-    browser_first = '{"events":[{"timestamp":1,"type":"damage","sourceID":1,"targetID":99,"abilityGameID":5,"amount":123,"browserUnknown":{"precision":0.9999999999999999999}}],"nextPageTimestamp":null,"pageUnknown":true}'
     browser_last = '{"events":[{"timestamp":7,"type":"cast","sourceID":1,"abilityGameID":6,"browserUnknown":[null,9007199254740993]}],"nextPageTimestamp":null}'
     replay = '{"events":[{"timestamp":1,"type":"damage","sourceID":1,"targetID":99,"abilityGameID":5,"replayUnknown":{"x":3.1415926535897932384626}}],"replayEnvelope":{"future":true}}'
     captured_http = []
@@ -430,15 +437,16 @@ async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_
             url = arg['url']
             if '/fights-and-participants/' in url:
                 text = browser_master.decode()
-            elif '/summary-events/Report1234/1/0/5/' in url:
+            elif '/summary-events/Report1234/1/7/7/' in url:
                 if fail_browser_once[0]:
                     fail_browser_once[0] = False
                     return {'status': 500, 'text': 'browser unavailable', 'retryAfter': ''}
-                text = browser_first
-            elif '/summary-events/Report1234/1/6/10/' in url:
                 text = browser_last
             elif '/replaysegment/Report1234/99/0/10/' in url:
-                text = replay
+                # Replay supplies the covered event's browser fields; the API
+                # cast missing from replay requires only its timestamp window.
+                text = replay.replace('"replayUnknown":',
+                                      '"browserUnknown":{"precision":0.9999999999999999999},"replayUnknown":')
             else:
                 raise AssertionError(f'Unexpected browser request: {url}')
             captured_browser.append(text)
@@ -497,7 +505,7 @@ async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_
                                     parse_float=Decimal) for record in manifest['captures']]
         original = [json.loads(body, parse_float=Decimal)
                     for body in [*captured_http, *captured_browser]]
-        assert len(reconstructed) == len(original) == 6
+        assert len(reconstructed) == len(original) == 5
         assert all(body in reconstructed for body in original)
         assert primary.stats()['buffered_complete_fights'] == 0
         assert hashlib.sha256(pending.read_bytes()).hexdigest() == original_hash

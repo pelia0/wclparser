@@ -17,6 +17,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Coroutine, Dict, List, Optional, TypeVar
+from wcl_archiver.wcl_client.async_tasks import run_owned_thread
 from wcl_archiver.wcl_client.rankings import REPORT_LINK_RE, RankingsDocument, RankingsPage
 
 T = TypeVar("T")
@@ -1129,6 +1130,38 @@ class BrowserClient:
                 raise asyncio.CancelledError()
             self.raw_archive.complete_fight(report_code,fight_id,fetch_id,start_time,end_time,len(events))
             return events
+
+    async def fetch_fight_supplement(
+        self, report_code: str, fight_id: int, start_time: int, end_time: int,
+        api_events: List[Dict[str, Any]],
+    ) -> None:
+        """Capture full replay plus only the canonical timestamps it cannot cover."""
+        return await self._run_in_browser_loop(self._fetch_fight_supplement_impl(
+            report_code, fight_id, start_time, end_time, api_events))
+
+    async def _fetch_fight_supplement_impl(
+        self, report_code, fight_id, start_time, end_time, api_events,
+    ):
+        from wcl_archiver.codec.fight_archive import supplement_windows
+
+        if self.raw_archive is None:
+            raise ValueError('Selective browser enrichment requires a source archive')
+        boss_id = self._fight_boss_cache.get((report_code, int(fight_id)), 0)
+        if boss_id <= 0:
+            raise ValueError('Selective browser enrichment requires valid fight boss metadata')
+        with self.raw_archive.fight_capture(report_code, fight_id) as fetch_id:
+            await self._fetch_supplemental_replay(report_code, boss_id, start_time, end_time)
+            replay_events = await run_owned_thread(
+                self.raw_archive.supplement_replay_events,
+                report_code, fight_id, fetch_id, start_time, end_time)
+            windows = await run_owned_thread(supplement_windows, api_events, replay_events)
+            await _gather_owned(*(self._fetch_canonical_range(report_code, fight_id, left, right)
+                                  for left, right in windows))
+            if self.should_stop and self.should_stop():
+                raise asyncio.CancelledError()
+            await run_owned_thread(
+                self.raw_archive.complete_supplement,
+                report_code, fight_id, fetch_id, start_time, end_time, api_events)
 
     async def _fetch_canonical_range(self, report_code, fight_id, start, end):
         result = []

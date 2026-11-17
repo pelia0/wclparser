@@ -838,6 +838,7 @@ def create_app(
             "browser_request_concurrency": 2 * harvester.download_concurrency,
             "pack_workers": harvester.pack_workers,
             "hybrid_strict": harvester_state['rankings_source'] == 'hybrid',
+            "hybrid_strategy": 'selective' if harvester_state['rankings_source'] == 'hybrid' else None,
             "queued_fights": int(queued),
             "packed_fights": int(packed),
             **source_stats,
