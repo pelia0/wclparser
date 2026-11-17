@@ -42,6 +42,7 @@
           <option value="PACKED" selected>Packed fights</option>
           <option value="QUEUED">Queued fights</option>
           <option value="STAGED">Downloaded, awaiting packing</option>
+          <option value="API_STAGED">API downloaded, awaiting browser</option>
           <option value="RETRY">Retryable fights</option>
           <option value="FAILED">Failed fights</option>
           <option value="all">All statuses</option>
@@ -165,6 +166,7 @@
             <select id="harvest-source-mode" style="margin-left: 6px;">
               <option value="browser" selected>Visible browser</option>
               <option value="api">API v2</option>
+              <option value="hybrid">Hybrid: API + full browser verification</option>
             </select>
           </label>
           <button id="btn-browser-open" class="btn-primary">Open Browser Window</button>
@@ -205,6 +207,7 @@
 
         <div id="harvester-error-banner" style="margin-top: 12px; padding: 10px 12px; border-radius: 6px; display: none; background: #3b181e; border: 1px solid #ef4444; color: #fca5a5;"></div>
         <div id="api-quota-wait" role="status" style="display: none; margin-top: 10px; color: #fbbf24; font-size: 13px;"></div>
+        <div id="hybrid-source-notice" style="display: none; margin-top: 10px; color: #fbbf24; font-size: 13px;"></div>
 
         <!-- Visual Progress Bar -->
         <div style="margin-top: 14px; background: #0f141c; border: 1px solid #2a364b; border-radius: 8px; padding: 12px;">
@@ -245,6 +248,7 @@
             <div style="margin-top: 5px;">
               Downloading: <span id="stat-downloading">0 / 4 workers</span> |
               Preparing reports: <span id="stat-preparing">0</span> |
+              Browser enrichment: <span id="stat-browser-enrichment">0 active / 0 queued</span> |
               Raw on disk: <span id="stat-staging">0 files / 0.00 MB</span> |
               Packing: <span id="stat-packing">0 / 4 workers</span>
             </div>
@@ -258,6 +262,6 @@
   </main>
 
   <script src="/replay2d.js?v=6"></script>
-  <script src="/app.js?v=10"></script>
+  <script src="/app.js?v=11"></script>
 </body>
 </html>

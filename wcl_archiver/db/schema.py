@@ -122,6 +122,11 @@ class IndexDB:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(fights)")}
             if "staging_rel_path" not in columns:
                 conn.execute("ALTER TABLE fights ADD COLUMN staging_rel_path TEXT DEFAULT NULL")
+            if "needs_browser" not in columns:
+                conn.execute("ALTER TABLE fights ADD COLUMN needs_browser INTEGER NOT NULL DEFAULT 0")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_api_staged_dispatch
+                ON fights(CASE WHEN content_type = 'mplus' THEN 0 ELSE 1 END)
+                WHERE status = 'API_STAGED'""")
             conn.execute("""
                 UPDATE fights SET status = 'FAILED', last_error = 'Report unavailable: ' ||
                     COALESCE((SELECT last_error FROM reports WHERE reports.report_code = fights.report_code), '')
@@ -261,9 +266,34 @@ class IndexDB:
 
     def mark_fight_staged(self, report_code: str, fight_id: int, staging_rel_path: str) -> None:
         with self._connect() as conn:
-            conn.execute("""UPDATE fights SET status = 'STAGED', staging_rel_path = ?, last_error = ''
+            conn.execute("""UPDATE fights SET status = 'STAGED', staging_rel_path = ?, needs_browser = 0, last_error = ''
                 WHERE fight_uid = ? AND status != 'PACKED'""",
                 (staging_rel_path, self.make_fight_uid(report_code, fight_id)))
+
+    def mark_fight_api_staged(self, report_code: str, fight_id: int, staging_rel_path: str) -> None:
+        with self._connect() as conn:
+            conn.execute("""UPDATE fights SET status = 'API_STAGED', staging_rel_path = ?, needs_browser = 1, last_error = ''
+                WHERE fight_uid = ? AND status != 'PACKED'""",
+                (staging_rel_path, self.make_fight_uid(report_code, fight_id)))
+
+    def get_api_staged_fights(self, limit: int = 100, report_code: Optional[str] = None) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+        scope = " AND report_code = ?" if report_code is not None else ""
+        params = [self.MAX_WORK_ATTEMPTS]
+        if report_code is not None:
+            params.append(report_code)
+        params.append(limit)
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute("""SELECT * FROM fights
+                WHERE status = 'API_STAGED' AND failure_count < ?""" + scope + """
+                ORDER BY CASE WHEN content_type = 'mplus' THEN 0 ELSE 1 END, rowid ASC LIMIT ?""", params)]
+
+    def count_api_staged_fights(self, report_code: Optional[str] = None) -> int:
+        with self._connect() as conn:
+            scope = " AND report_code = ?" if report_code is not None else ""
+            return int(conn.execute("SELECT COUNT(*) FROM fights WHERE status = 'API_STAGED'" + scope,
+                                    (report_code,) if report_code is not None else ()).fetchone()[0])
 
     def clear_fight_staging(self, report_code: str, fight_id: int, staging_rel_path: str) -> None:
         with self._connect() as conn:
@@ -306,6 +336,7 @@ class IndexDB:
                 ("failed_reports", "reports", "archive_status", "FAILED"),
                 ("failed_fights", "fights", "status", "FAILED"),
                 ("staged_fights", "fights", "status", "STAGED"),
+                ("api_staged_fights", "fights", "status", "API_STAGED"),
             ):
                 counts[key] = int(conn.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE {column} = ?", (status,)
@@ -320,7 +351,8 @@ class IndexDB:
             params = (report_code,) if report_code is not None else ()
             conn.execute("""UPDATE reports SET archive_status = 'PENDING', failure_count = 0
                 WHERE archive_status IN ('RETRY', 'FAILED')""" + scope, params)
-            conn.execute("""UPDATE fights SET status = CASE WHEN staging_rel_path IS NOT NULL
+            conn.execute("""UPDATE fights SET status = CASE WHEN staging_rel_path IS NOT NULL AND needs_browser = 1
+                THEN 'API_STAGED' WHEN staging_rel_path IS NOT NULL
                 THEN 'STAGED' ELSE 'QUEUED' END, failure_count = 0
                 WHERE status IN ('RETRY', 'FAILED')""" + scope, params)
 

@@ -52,12 +52,12 @@ def _confined(path, root):
     return candidate
 
 
-def _filename(uid, fetch_id):
+def _filename(uid, fetch_id, *, hybrid=False):
     # The fetch identifier is itself hashed so untrusted metadata cannot supply
     # path separators, alternate streams, or reserved device names.
     return hashlib.sha256(uid.encode("utf-8")).hexdigest() + "-" + hashlib.sha256(
         fetch_id.encode("utf-8")
-    ).hexdigest() + ".wcls"
+    ).hexdigest() + ("-hybrid.wcls" if hybrid else ".wcls")
 
 
 class StagingStore:
@@ -103,9 +103,12 @@ class StagingStore:
             if output == self.root or self.root in output.parents:
                 raise ValueError("Archive output cannot replace a staging snapshot")
             master, pages, replay = capture["master"], capture["pages"], capture["replay"]
+            auxiliary = capture.get('auxiliary', [])
+            if not isinstance(auxiliary, list):
+                raise ValueError('Invalid staging auxiliary sources')
             if not isinstance(pages, list) or not pages or not isinstance(replay, list):
                 raise ValueError("Staging source pages are missing")
-            sources = [master, *pages, *replay]
+            sources = [master, *pages, *replay, *auxiliary]
             for cap in sources:
                 info = cap['info']
                 request_report = re.search(
@@ -124,7 +127,7 @@ class StagingStore:
                     or len(set(ids)) != len(ids)
                     or manifest["master_capture"] != ids[0]
                     or manifest["event_captures"] != ids[1:1 + len(pages)]
-                    or manifest["supplemental_captures"] != ids[1 + len(pages):]):
+                    or manifest["supplemental_captures"] != ids[1 + len(pages):1 + len(pages) + len(replay)]):
                 raise ValueError("Staging source capture IDs differ from manifest")
             report = _report(master["body"])
             if (master["info"]["kind"] != "master" or master["info"]["report_code"] != code
@@ -149,6 +152,7 @@ class StagingStore:
             ordered = FightArchive._ordered_canonical_pages(pages, code, fid, start, end)
             if [cap["info"]["id"] for cap in ordered] != manifest["event_captures"]:
                 raise ValueError("Staging source page order differs from manifest")
+            FightArchive._validate_hybrid_capture(capture)
             return uid, fetch
         except (KeyError, TypeError, IndexError, AttributeError) as exc:
             raise ValueError("Invalid staging snapshot structure") from exc
@@ -168,7 +172,7 @@ class StagingStore:
                 raise ValueError("Corrupt staging snapshot checksum")
             payload = _unpack(raw)
             uid, fetch = self._validate(payload)
-            if check_filename and path.name != _filename(uid, fetch):
+            if check_filename and path.name != _filename(uid, fetch, hybrid='hybrid' in payload['capture']['manifest']):
                 raise ValueError("Staging filename identity mismatch")
             return payload
         except (msgpack.UnpackException, UnicodeError, struct.error, OverflowError) as exc:
@@ -188,7 +192,9 @@ class StagingStore:
                            "fetch_id": manifest["fetch_id"], "manifest": manifest},
                    "capture": completed}
         uid, fetch = self._validate(payload)
-        path = self._path(self.root / _filename(uid, fetch))
+        # Advancing enrichment is a new durable publication. The API snapshot stays
+        # intact until its caller has durably relinked the job to this verified file.
+        path = self._path(self.root / _filename(uid, fetch, hybrid='hybrid' in manifest))
         self.root.mkdir(parents=True, exist_ok=True)
         _plain_path(self.root)
         raw = _pack(payload)
@@ -229,8 +235,7 @@ class StagingStore:
         archive = FightArchive(self.data_dir, compression=compression)
         manifest = completed["manifest"]
         archive._completed[(manifest["report_code"], manifest["fight_id"])] = completed
-        job["raw_events"] = [event for cap in completed["pages"]
-                             for event in _at(cap["body"], cap["event_path"])]
+        job["raw_events"] = archive.full_fight_events(manifest['report_code'], manifest['fight_id'])
         return job, archive
 
     def list_jobs(self):

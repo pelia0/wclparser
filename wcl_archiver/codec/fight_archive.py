@@ -10,7 +10,7 @@ An omitted bitmap means every record has the field. Explicit null remains a
 normal value; padding bits must be zero. Readers also accept earlier dense
 columns with the reserved missing-value extension.
 """
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -268,6 +268,73 @@ def _page_template(body, path):
     return result
 
 
+def _event_identity(event):
+    """Normalize only alignment keys; the original objects remain authoritative."""
+    if not isinstance(event, dict) or 'timestamp' not in event or 'type' not in event:
+        raise ValueError('Hybrid event is missing timestamp or type identity')
+    values = [event['timestamp'], event['type']]
+    for flat, inline, nested in (('sourceID', 'source', 'id'), ('targetID', 'target', 'id'),
+                                 ('abilityGameID', 'ability', 'guid')):
+        obj = event.get(inline)
+        alternate = obj.get(nested) if isinstance(obj, dict) else None
+        value = event.get(flat, alternate)
+        if flat in event and isinstance(obj, dict) and nested in obj and value != alternate:
+            raise ValueError('Hybrid event has conflicting identity aliases')
+        values.append(value)
+    try:
+        identity = tuple(values)
+        hash(identity)
+        return identity
+    except TypeError as exc:
+        raise ValueError('Invalid hybrid event identity') from exc
+
+
+def _capture_events(captures):
+    return [event for cap in captures for event in _at(cap['body'], cap['event_path'])]
+
+
+def _merge_missing(target, source, *, index, capture_id, conflicts, path=()):
+    if isinstance(target, dict) and isinstance(source, dict):
+        for key, value in source.items():
+            if key not in target:
+                target[key] = deepcopy(value)
+            else:
+                _merge_missing(target[key], value, index=index, capture_id=capture_id,
+                               conflicts=conflicts, path=(*path, key))
+    elif isinstance(target, list) and isinstance(source, list):
+        for key, value in enumerate(source):
+            if key >= len(target):
+                target.append(deepcopy(value))
+            else:
+                _merge_missing(target[key], value, index=index, capture_id=capture_id,
+                               conflicts=conflicts, path=(*path, key))
+    elif _pack(target) != _pack(source) and conflicts is not None:
+        conflicts.append({'index': index, 'path': list(path), 'source_capture': capture_id})
+
+
+def _full_event_view(primary, canonical_captures, replay_captures, conflicts=None):
+    canonical = [(event, cap['info']['id']) for cap in canonical_captures
+                 for event in _at(cap['body'], cap['event_path'])]
+    if len(primary) != len(canonical):
+        raise ValueError('Hybrid canonical event count mismatch')
+    result = deepcopy(primary)
+    for index, (event, (other, cid)) in enumerate(zip(result, canonical)):
+        if _event_identity(event) != _event_identity(other):
+            raise ValueError(f'Hybrid canonical event identity/order mismatch at index {index}')
+        _merge_missing(event, other, index=index, capture_id=cid, conflicts=conflicts)
+    # Preserve repeated identical event identities by matching each occurrence once.
+    indices = defaultdict(deque)
+    for index, event in enumerate(primary):
+        indices[_event_identity(event)].append(index)
+    for cap in replay_captures:
+        for event in _at(cap['body'], cap['event_path']):
+            queue = indices.get(_event_identity(event))
+            if queue:
+                index = queue.popleft()
+                _merge_missing(result[index], event, index=index, capture_id=cap['info']['id'], conflicts=conflicts)
+    return result
+
+
 class FightArchive:
     supports_parallel_event_pages = True
 
@@ -466,6 +533,216 @@ class FightArchive:
         except KeyError as exc:
             raise ValueError("No complete source archive for this fight") from exc
 
+    @staticmethod
+    def _validate_provider_capture(completed, report_code, fight_id):
+        """Certify complete source payloads, rather than trusting a flag alone."""
+        try:
+            manifest = completed['manifest']
+            if (manifest['report_code'] != report_code or manifest['fight_id'] != fight_id
+                    or manifest['complete'] is not True or not manifest['fetch_id']):
+                raise ValueError('Hybrid source identity or completeness mismatch')
+            start, end, count = (manifest[key] for key in ('start_time', 'end_time', 'event_count'))
+            if any(type(v) is not int for v in (start, end, count)) or start > end or count < 0:
+                raise ValueError('Hybrid source boundaries or count invalid')
+            master, pages, replay = completed['master'], completed['pages'], completed['replay']
+            if not isinstance(pages, list) or not pages or not isinstance(replay, list):
+                raise ValueError('Hybrid source canonical pages missing')
+            captures = [master, *pages, *replay]
+            ids = [cap['info']['id'] for cap in captures]
+            if (len(ids) != len(set(ids)) or manifest['master_capture'] != ids[0]
+                    or manifest['event_captures'] != ids[1:1 + len(pages)]
+                    or manifest['supplemental_captures'] != ids[1 + len(pages):]):
+                raise ValueError('Hybrid source captures differ from manifest')
+            for kind, caps in (('master', [master]), ('events', pages), ('replay', replay)):
+                for cap in caps:
+                    info = cap['info']
+                    if info['kind'] != kind or info['report_code'] != report_code or info['status'] != 200:
+                        raise ValueError('Hybrid source capture identity mismatch')
+                    variables = (info.get('request_json') or {}).get('variables') or {}
+                    match = re.search(r'/reports/(?:fights-and-participants|summary-events|events/summary|replaysegment)/([^/]+)(?:/|$)', info['url'])
+                    if (match and match[1] != report_code or 'code' in variables and variables['code'] != report_code
+                            or kind != 'master' and 'fightId' in variables and variables['fightId'] != fight_id):
+                        raise ValueError('Hybrid source request binding mismatch')
+                    if kind != 'master':
+                        if (info['fight_id'] != fight_id or info['fetch_id'] != manifest['fetch_id']
+                                or cap['event_path'] != _events_path(cap['body'])):
+                            raise ValueError('Hybrid source attempt binding mismatch')
+                        events = _at(cap['body'], cap['event_path'])
+                        if not isinstance(events, list) or any(not isinstance(e, dict) for e in events):
+                            raise ValueError('Hybrid source events invalid')
+            fights = _report(master['body'])['fights']
+            fight = next((row for row in fights if row['id'] == fight_id), None)
+            if fight is None:
+                raise ValueError('Hybrid source master does not bind fight')
+            for names, expected in ((('start_time', 'startTime'), start), (('end_time', 'endTime'), end)):
+                if any(name in fight and fight[name] != expected for name in names):
+                    raise ValueError('Hybrid source master fight boundaries mismatch')
+            ordered = FightArchive._ordered_canonical_pages(pages, report_code, fight_id, start, end)
+            if [cap['info']['id'] for cap in ordered] != manifest['event_captures'] or len(_capture_events(pages)) != count:
+                raise ValueError('Hybrid source canonical count/order mismatch')
+            # GraphQL completeness needs its own full cursor-chain proof. The legacy
+            # browser fallback intentionally remains accepted by the plain codec.
+            graphql = [cap for cap in pages if not re.search(r'/reports/(?:summary-events|events/summary)/', cap['info']['url'])]
+            if graphql:
+                if len(graphql) != len(pages):
+                    raise ValueError('Hybrid mixed canonical transports cannot prove complete coverage')
+                cursor = start
+                for index, cap in enumerate(graphql):
+                    variables = (cap['info'].get('request_json') or {}).get('variables') or {}
+                    if variables.get('startTime') != cursor or variables.get('endTime') != end:
+                        raise ValueError('Hybrid GraphQL canonical request bounds/cursor mismatch')
+                    page = _report(cap['body'])['events']
+                    following = page.get('nextPageTimestamp')
+                    if following is None:
+                        if index != len(graphql) - 1:
+                            raise ValueError('Hybrid canonical page exists after terminal response')
+                    elif (index == len(graphql) - 1 or isinstance(following, bool)
+                          or not isinstance(following, (int, Decimal)) or not cursor < following <= end):
+                        raise ValueError('Hybrid canonical page chain is incomplete')
+                    cursor = following
+            # Browser replay may have fewer events than canonical; completeness is
+            # established from requested segment ranges, including empty responses.
+            browser_master = re.search(r'/reports/fights-and-participants/', master['info']['url'])
+            if browser_master:
+                boss = fight.get('boss', fight.get('encounterID', 0)) or 0
+                if boss > 0 and not replay:
+                    raise ValueError('Hybrid browser replay source missing')
+                if replay:
+                    cursor = start
+                    for cap in replay:
+                        match = re.search(r'/replaysegment/[^/]+/(\d+)/(-?\d+)/(-?\d+)(?:/|\?|$)', cap['info']['url'])
+                        if not match:
+                            raise ValueError('Hybrid replay request bounds missing')
+                        replay_boss, left, right = map(int, match.groups())
+                        if left != cursor or not left <= right <= end or boss > 0 and replay_boss != boss:
+                            raise ValueError('Hybrid replay source coverage mismatch')
+                        cursor = right + 1
+                    if cursor != end + 1:
+                        raise ValueError('Hybrid replay source coverage incomplete')
+            return captures
+        except (KeyError, TypeError, IndexError, AttributeError, StopIteration) as exc:
+            raise ValueError('Invalid hybrid source capture structure') from exc
+
+    @staticmethod
+    def _validate_hybrid_capture(completed):
+        manifest = completed['manifest']
+        hybrid = manifest.get('hybrid')
+        if 'hybrid' in manifest and not isinstance(hybrid, dict):
+            raise ValueError('Invalid hybrid phase manifest')
+        if 'hybrid_pending' in manifest:
+            if manifest['hybrid_pending'] is not True or hybrid is not None:
+                raise ValueError('Invalid or conflicting hybrid pending phase markers')
+            FightArchive._validate_provider_capture(completed, manifest['report_code'], manifest['fight_id'])
+        if hybrid is None:
+            if completed.get('auxiliary'):
+                raise ValueError('Auxiliary sources require hybrid provenance')
+            return
+        try:
+            manifest = completed['manifest']
+            code, fid = manifest['report_code'], manifest['fight_id']
+            api_manifest, browser_manifest = hybrid['api_manifest'], hybrid['browser_manifest']
+            auxiliary = completed['auxiliary']
+            if (not isinstance(auxiliary, list) or not auxiliary
+                    or hybrid['auxiliary_captures'] != [cap['info']['id'] for cap in auxiliary]):
+                raise ValueError('Hybrid auxiliary capture IDs mismatch')
+            by_id = {cap['info']['id']: cap for cap in [completed['master'], *completed['pages'], *completed['replay'], *auxiliary]}
+            if len(by_id) != 1 + len(completed['pages']) + len(completed['replay']) + len(auxiliary):
+                raise ValueError('Duplicate hybrid capture IDs')
+            expected_aux = [browser_manifest['master_capture'], *browser_manifest['event_captures']]
+            if hybrid['auxiliary_captures'] != expected_aux:
+                raise ValueError('Hybrid auxiliary sources differ from original browser manifest')
+            if (any(manifest[key] != api_manifest[key] or api_manifest[key] != browser_manifest[key]
+                    for key in ('report_code', 'fight_id', 'start_time', 'end_time', 'event_count', 'complete'))
+                    or manifest['fetch_id'] != api_manifest['fetch_id']
+                    or manifest['master_capture'] != api_manifest['master_capture']
+                    or manifest['event_captures'] != api_manifest['event_captures']
+                    or manifest['supplemental_captures'] != [*api_manifest['supplemental_captures'], *browser_manifest['supplemental_captures']]):
+                raise ValueError('Hybrid provider manifests differ')
+            def original(provider_manifest, rebind):
+                caps = []
+                for cid in [provider_manifest['master_capture'], *provider_manifest['event_captures'], *provider_manifest['supplemental_captures']]:
+                    cap = by_id[cid]
+                    if rebind:
+                        info = cap['info']
+                        if (info['fetch_id'] != manifest['fetch_id'] or info['fight_id'] != fid
+                                or info['original_kind'] != info['kind']
+                                or info['original_fetch_id'] != (None if info['kind'] == 'master' else provider_manifest['fetch_id'])):
+                            raise ValueError('Hybrid auxiliary provenance mismatch')
+                        cap = {**cap, 'info': {**info, 'fetch_id': info['original_fetch_id']}}
+                    caps.append(cap)
+                return {'manifest': provider_manifest, 'master': caps[0],
+                        'pages': caps[1:1 + len(provider_manifest['event_captures'])],
+                        'replay': caps[1 + len(provider_manifest['event_captures']):]}
+            api, browser = original(api_manifest, False), original(browser_manifest, True)
+            FightArchive._validate_provider_capture(api, code, fid)
+            FightArchive._validate_provider_capture(browser, code, fid)
+            conflicts = []
+            _full_event_view(_capture_events(api['pages']), browser['pages'], browser['replay'], conflicts)
+            if conflicts != hybrid['conflicts']:
+                raise ValueError('Hybrid conflicts differ from authoritative source payloads')
+        except (KeyError, TypeError, IndexError, AttributeError) as exc:
+            raise ValueError('Invalid hybrid auxiliary structure') from exc
+
+    def merge_hybrid_fight(self, browser_archive, report_code, fight_id):
+        key = (report_code, int(fight_id))
+        try:
+            primary, browser = self._completed[key], browser_archive._completed[key]
+        except KeyError as exc:
+            raise ValueError('Both complete hybrid source captures are required') from exc
+        if browser_archive is self or 'hybrid' in primary['manifest']:
+            raise ValueError('Hybrid merge requires independent unmerged provider archives')
+        self._validate_provider_capture(primary, *key)
+        self._validate_provider_capture(browser, *key)
+        api_manifest, browser_manifest = primary['manifest'], browser['manifest']
+        if any(api_manifest[name] != browser_manifest[name] for name in
+               ('report_code', 'fight_id', 'start_time', 'end_time', 'event_count')):
+            raise ValueError('Hybrid provider fight boundaries or event count mismatch')
+        conflicts = []
+        _full_event_view(_capture_events(primary['pages']), browser['pages'], browser['replay'], conflicts)
+        def rebind(cap):
+            info = cap['info']
+            return {**cap, 'info': {**deepcopy(info), 'original_fetch_id': info['fetch_id'],
+                    'original_kind': info['kind'], 'original_fight_id': info['fight_id'],
+                    'fetch_id': api_manifest['fetch_id'], 'fight_id': key[1]}}
+        auxiliary = [rebind(cap) for cap in [browser['master'], *browser['pages']]]
+        replay = [*primary['replay'], *(rebind(cap) for cap in browser['replay'])]
+        manifest = {**api_manifest,
+                    'supplemental_captures': [cap['info']['id'] for cap in replay],
+                    'hybrid': {'api_manifest': deepcopy(api_manifest), 'browser_manifest': deepcopy(browser_manifest),
+                               'auxiliary_captures': [cap['info']['id'] for cap in auxiliary], 'conflicts': conflicts}}
+        # Only a successfully verified combined capture advances the outer phase.
+        # The original API manifest above still records its durable pending state.
+        manifest.pop('hybrid_pending', None)
+        merged = {**primary, 'manifest': manifest, 'replay': replay, 'auxiliary': auxiliary}
+        self._validate_hybrid_capture(merged)
+        self._completed[key] = merged
+        browser_archive.discard_fight(*key)
+        return deepcopy(manifest)
+
+    def discard_fight(self, report_code, fight_id):
+        key = (report_code, int(fight_id))
+        completed = self._completed.pop(key, None)
+        if completed:
+            self._drop_attempt(completed['manifest']['fetch_id'])
+        # Cancellation can occur before complete_fight; release only matching scopes.
+        for fetch, ids in list(self._attempts.items()):
+            if any((self._captures.get(cid, {}).get('info', {}).get('report_code'),
+                    self._captures.get(cid, {}).get('info', {}).get('fight_id')) == key for cid in ids):
+                self._drop_attempt(fetch)
+
+    def full_fight_events(self, report_code, fight_id):
+        try:
+            completed = self._completed[(report_code, int(fight_id))]
+        except KeyError as exc:
+            raise ValueError('No complete source archive for this fight') from exc
+        if 'hybrid' not in completed['manifest']:
+            return deepcopy(_capture_events(completed['pages']))
+        self._validate_hybrid_capture(completed)
+        hybrid = completed['manifest']['hybrid']
+        canonical = [cap for cap in completed['auxiliary'] if cap['info']['id'] in hybrid['browser_manifest']['event_captures']]
+        replay = [cap for cap in completed['replay'] if cap['info']['id'] in hybrid['browser_manifest']['supplemental_captures']]
+        return _full_event_view(_capture_events(completed['pages']), canonical, replay)
+
     def stats(self):
         return {"source_bytes": 0, "source_responses": 0,
                 "buffered_master_captures": len(self._masters),
@@ -485,7 +762,10 @@ class FightArchive:
             completed = self._completed[key]
         except KeyError as exc:
             raise ValueError("No complete source archive for this fight") from exc
+        if completed['manifest'].get('hybrid_pending') is True:
+            raise ValueError('Hybrid source is pending browser enrichment and cannot be packed')
         try:
+            self._validate_hybrid_capture(completed)
             events, replay, capture_rows = [], [], []
             for cap in [completed["master"], *completed["pages"], *completed["replay"]]:
                 record = {**cap["info"], "template": (
@@ -498,6 +778,9 @@ class FightArchive:
                     record["event_path"] = cap["event_path"]
                     target.extend(page_events)
                 capture_rows.append(record)
+            for cap in completed.get('auxiliary', []):
+                capture_rows.append({**cap['info'], 'template': deepcopy(cap['body']),
+                                     'event_path': cap['event_path']})
             metadata = {"manifest": completed["manifest"], "captures": capture_rows}
             sections = {"summary": summary, "events": _columns(events), "replay": _columns(replay), "metadata": metadata}
             return self.write_sections(path, sections, compression=self.compression)
@@ -632,7 +915,39 @@ class PackedFightReader:
 
     @classmethod
     def full_events_json(cls, path):
-        return _json_bytes(cls.read_raw_events(path))
+        return _json_bytes(cls.read_full_events(path))
+
+    @classmethod
+    def read_full_events(cls, path):
+        metadata = cls._read_section(path, 'metadata')
+        if 'hybrid' not in metadata['manifest']:
+            return cls.read_raw_events(path)
+        # Rebuild lightweight capture wrappers. Auxiliary templates already contain
+        # their complete bodies; primary event/replay payloads remain columnar.
+        raw, replay = cls.read_raw_events(path), cls._read_replay_events(path)
+        captures = {}
+        for record in metadata['captures']:
+            body = deepcopy(record['template'])
+            if 'slice' in record:
+                events = raw if record['kind'] == 'events' else replay
+                first, last = record['slice']
+                if not 0 <= first <= last <= len(events):
+                    raise ValueError('Corrupt source response slice')
+                _set(body, record['event_path'], events[first:last])
+            captures[record['id']] = {'info': {key: value for key, value in record.items()
+                                                if key not in ('template', 'slice', 'event_path')},
+                                      'body': body, 'event_path': record.get('event_path')}
+        try:
+            manifest = metadata['manifest']
+            completed = {'manifest': manifest, 'master': captures[manifest['master_capture']],
+                         'pages': [captures[cid] for cid in manifest['event_captures']],
+                         'replay': [captures[cid] for cid in manifest['supplemental_captures']],
+                         'auxiliary': [captures[cid] for cid in manifest['hybrid']['auxiliary_captures']]}
+            archive = FightArchive('.')
+            archive._completed[(manifest['report_code'], manifest['fight_id'])] = completed
+            return archive.full_fight_events(manifest['report_code'], manifest['fight_id'])
+        except (KeyError, TypeError, IndexError) as exc:
+            raise ValueError('Corrupt hybrid source metadata') from exc
 
     @classmethod
     def _read_replay_events(cls, path):
@@ -658,14 +973,28 @@ class PackedFightReader:
         from wcl_archiver.parser.combat_state_machine import CombatStateMachine
         summary = cls.read_summary_only(path)
         meta = {**summary, **cls.source_manifest(path)}
-        return CombatStateMachine.analyze_fight(meta, summary.get("actors", []), [], cls.read_raw_events(path))[1]
+        return CombatStateMachine.analyze_fight(meta, summary.get("actors", []), [], cls.read_full_events(path))[1]
 
     @classmethod
     def read_replay_only(cls, path):
         from wcl_archiver.parser.combat_state_machine import CombatStateMachine
         from wcl_archiver.codec.wclz_format import _derive_replay_frames_from_events
         summary = cls.read_summary_only(path)
+        manifest = cls.source_manifest(path)
         supplemental = cls._read_replay_events(path)
+        if 'hybrid' in manifest:
+            full = cls.read_full_events(path)
+            remaining = defaultdict(int)
+            for event in full:
+                remaining[_event_identity(event)] += 1
+            unmatched = []
+            for event in supplemental:
+                identity = _event_identity(event)
+                if remaining[identity]:
+                    remaining[identity] -= 1
+                else:
+                    unmatched.append(event)
+            supplemental = sorted([*full, *unmatched], key=lambda event: event['timestamp'])
         if supplemental:
             meta = {**summary, **cls.source_manifest(path)}
             frames = CombatStateMachine.analyze_fight(meta, summary.get("actors", []), [], supplemental)[2]["frames"]

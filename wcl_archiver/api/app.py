@@ -34,6 +34,7 @@ from wcl_archiver.harvester.pipeline import HarvesterPipeline
 from wcl_archiver.wcl_client.auth import WCLAuthManager
 from wcl_archiver.wcl_client.browser_client import BrowserClient
 from wcl_archiver.wcl_client.protocol_parser import WCLProtocolClient
+from wcl_archiver.wcl_client.hybrid_client import HybridClient
 
 REPORT_CODE_RE = re.compile(r"(?:reports/)?([A-Za-z0-9]{10,20})")
 
@@ -91,6 +92,9 @@ def create_app(
     raw_archive = FightArchive(data_dir, compression=cfg.archive_compression)
     protocol_client = WCLProtocolClient(auth_manager=auth_manager,raw_archive=raw_archive)
     browser_client_ref: Dict[str, Optional[BrowserClient]] = {"instance": None}
+    hybrid_browser_archive = FightArchive(data_dir, compression=cfg.archive_compression)
+    hybrid_browser_ref: Dict[str, Optional[BrowserClient]] = {"instance": None}
+    hybrid_client_ref = {"instance": None}
     harvester = HarvesterPipeline(
         data_dir=data_dir,
         index_db=index_db,
@@ -143,8 +147,9 @@ def create_app(
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
             harvester.download_concurrency = value
-            if browser_client_ref['instance'] is not None:
-                await browser_client_ref['instance'].set_request_concurrency(2 * value)
+            for reference in (browser_client_ref, hybrid_browser_ref):
+                if reference['instance'] is not None:
+                    await reference['instance'].set_request_concurrency(2 * value)
             _append_log(f'Download workers set to {value}; browser JSON request ceiling {2 * value}.')
 
     def _on_browser_status(b_state: str, b_msg: str) -> None:
@@ -166,6 +171,39 @@ def create_app(
                 raw_archive=raw_archive,
             )
         return browser_client_ref["instance"]
+
+    def _get_hybrid_browser() -> BrowserClient:
+        if hybrid_browser_ref['instance'] is None:
+            hybrid_browser_ref['instance'] = BrowserClient(
+                profile_dir=data_dir / 'browser_profile', on_status=_on_browser_status,
+                should_stop=lambda: not harvester_state['running'],
+                max_concurrent_requests=2 * harvester.download_concurrency,
+                scan_concurrency=cfg.scan_concurrency, raw_archive=hybrid_browser_archive)
+        return hybrid_browser_ref['instance']
+
+    def _select_collection_client(source):
+        if source == 'hybrid':
+            if not auth_manager.get_auth_status().get('has_user_oauth_token'):
+                raise HTTPException(status_code=409, detail='Connect your WCL account before using strict hybrid collection.')
+            if hybrid_client_ref['instance'] is None:
+                hybrid_client_ref['instance'] = HybridClient(protocol_client, _get_hybrid_browser(),
+                    raw_archive, hybrid_browser_archive)
+            return hybrid_client_ref['instance']
+        return _get_browser_client() if source == 'browser' else protocol_client
+
+    async def _close_collection_browsers():
+        try:
+            if browser_client_ref['instance'] is not None:
+                await browser_client_ref['instance'].stop()
+        finally:
+            try:
+                if hybrid_browser_ref['instance'] is not None:
+                    await hybrid_browser_ref['instance'].stop()
+            finally:
+                browser_client_ref['instance'] = hybrid_browser_ref['instance'] = None
+                hybrid_client_ref['instance'] = None
+                harvester_state['browser_state'] = 'not_started'
+                harvester_state['browser_message'] = 'Browser not started'
 
     def _on_progress(update: Dict[str, Any]) -> None:
         if "current_task" in update:
@@ -213,6 +251,8 @@ def create_app(
                 if job_task is asyncio.current_task():
                     harvester_state["running"] = False
                     raw_archive.clear()
+                    if hybrid_browser_ref['instance'] is not None:
+                        hybrid_browser_archive.clear()
                 if hasattr(work, 'close'):
                     work.close()
 
@@ -244,8 +284,7 @@ def create_app(
                 await _stop_job()
             finally:
                 try:
-                    if browser_client_ref["instance"] is not None:
-                        await browser_client_ref["instance"].stop()
+                    await _close_collection_browsers()
                 finally:
                     harvester.close()
 
@@ -427,7 +466,7 @@ def create_app(
         offset: int = Query(default=0, ge=0),
     ) -> Any:
         status = status.upper()
-        if status not in {"ALL", "PACKED", "QUEUED", "RETRY", "FAILED", "STAGED"}:
+        if status not in {"ALL", "PACKED", "QUEUED", "RETRY", "FAILED", "STAGED", "API_STAGED"}:
             raise HTTPException(status_code=400, detail="Invalid fight status")
         return index_db.search_fights(
             content_type=content_type,
@@ -780,9 +819,10 @@ def create_app(
             total_bytes = conn.execute(
                 "SELECT COALESCE(SUM(compressed_bytes), 0) AS b FROM fights WHERE status = 'PACKED'"
             ).fetchone()["b"]
-        if browser_client_ref["instance"] is not None:
-            harvester_state["browser_state"] = browser_client_ref["instance"].state
-            harvester_state["browser_message"] = browser_client_ref["instance"].status_message
+        active_browser = hybrid_browser_ref if harvester_state['rankings_source'] == 'hybrid' else browser_client_ref
+        if active_browser['instance'] is not None:
+            harvester_state['browser_state'] = active_browser['instance'].state
+            harvester_state['browser_message'] = active_browser['instance'].status_message
         db_scanned = index_db.get_scanned_pages_count()
         if db_scanned > int(harvester_state.get("pages_scanned", 0)):
             harvester_state["pages_scanned"] = db_scanned
@@ -797,6 +837,7 @@ def create_app(
             "download_concurrency": harvester.download_concurrency,
             "browser_request_concurrency": 2 * harvester.download_concurrency,
             "pack_workers": harvester.pack_workers,
+            "hybrid_strict": harvester_state['rankings_source'] == 'hybrid',
             "queued_fights": int(queued),
             "packed_fights": int(packed),
             **source_stats,
@@ -829,9 +870,8 @@ def create_app(
     @app.post("/api/browser/close")
     async def post_browser_close() -> Dict[str, Any]:
         _require_idle()
-        if browser_client_ref["instance"] is not None:
-            await browser_client_ref["instance"].stop()
-            _append_log("Closed visible browser window.")
+        await _close_collection_browsers()
+        _append_log("Closed visible browser window.")
         return get_harvester_status()
 
     @app.post("/api/harvester/import-report")
@@ -843,8 +883,9 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid WarcraftLogs report code or URL")
         code = m.group(1)
         source = req.rankings_source or harvester_state.get("rankings_source", "browser")
+        client = _select_collection_client(source)
         harvester_state["rankings_source"] = source
-        harvester.client = _get_browser_client() if source == "browser" else protocol_client
+        harvester.client = client
         harvester_state["running"] = True
         harvester_state["last_error"] = ""
         harvester_state["current_task"] = f"Importing report {code}..."
@@ -877,10 +918,14 @@ def create_app(
             while harvester_state["running"]:
                 attempt_started_at = time.monotonic()
                 try:
-                    if source == "browser":
+                    if source == 'browser':
                         b_client = _get_browser_client()
                         await b_client.start()
-                        harvester.client = b_client
+                        harvester.client = _select_collection_client(source)
+                    elif source == 'hybrid':
+                        # Browser startup and enrichment run in their own pool;
+                        # API admission must not wait for its browser session.
+                        harvester.client = _select_collection_client(source)
                     else:
                         harvester.client = protocol_client
 
@@ -913,6 +958,8 @@ def create_app(
                         pending = sum(counts.get(key, 0) for key in (
                             "pending_reports", "queued_fights", "retryable_reports", "retryable_fights", "staged_fights"
                         ))
+                        if source == 'hybrid':
+                            pending += counts.get('api_staged_fights', 0)
                         if packed == 0 and pending == 0:
                             break
                         await asyncio.sleep(0.2)
@@ -938,12 +985,13 @@ def create_app(
                     # Finish capture cleanup before closing/replacing its browser.
                     with suppress(Exception):
                         await harvester.stop_background_downloading()
-                    if source == "browser" and browser_client_ref["instance"] is not None:
+                    with suppress(Exception):
+                        await harvester.stop_background_enrichment(cancel=True)
+                    if source in ('browser', 'hybrid'):
                         try:
-                            await browser_client_ref["instance"].stop()
+                            await _close_collection_browsers()
                         except Exception:
                             pass
-                        browser_client_ref["instance"] = None
                     deadline = time.monotonic() + backoff_s
                     while harvester_state["running"] and time.monotonic() < deadline:
                         await asyncio.sleep(min(0.5, max(0.02, deadline - time.monotonic())))
@@ -952,8 +1000,12 @@ def create_app(
                 counts = index_db.get_queue_counts()
                 failed_pages = counts.get('failed_scan_pages',0)
                 failed = counts["failed_reports"] + counts["failed_fights"] + failed_pages
+                waiting_browser = counts.get('api_staged_fights', 0)
+                failed += waiting_browser
                 if failed:
                     message = f"Harvest incomplete: {counts['failed_reports']} failed reports, {counts['failed_fights']} failed fights, {failed_pages} failed ranking pages"
+                    if waiting_browser:
+                        message += f", {waiting_browser} hybrid fights await browser enrichment"
                     harvester_state["current_task"] = message
                     harvester_state["last_error"] = message
                     harvester_state["progress_pct"] = min(99.9, harvester_state["progress_pct"])
@@ -983,6 +1035,8 @@ def create_app(
         nonlocal job_task
         if req.mode not in {"mplus_s5", "raids"}:
             raise HTTPException(status_code=400, detail="Invalid harvest mode")
+        source = req.rankings_source or harvester_state.get('rankings_source', 'browser')
+        harvester.client = _select_collection_client(source)
         if req.download_concurrency is not None:
             await _apply_download_concurrency(req.download_concurrency)
         index_db.retry_failed_work()

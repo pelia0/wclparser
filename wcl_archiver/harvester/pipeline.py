@@ -130,10 +130,19 @@ class HarvesterPipeline:
         self._download_progress: Optional[asyncio.Event] = None
         self._download_completed = 0
         self._download_reported = 0
+        self._browser_manager_task: Optional[asyncio.Task] = None
+        self._browser_tasks: Dict[int, asyncio.Task] = {}
+        self._browser_claims: set = set()
+        self._browser_wakeup: Optional[asyncio.Event] = None
+        self._browser_finish = False
+        self._browser_stop = False
+        self._raw_executor: Optional[ThreadPoolExecutor] = None
 
     def get_staging_stats(self) -> Dict[str, int]:
         return {**self.staging_store.stats(), 'packing_fights': len(self._packing_claims),
                 'downloading_fights': len(self._download_claims),
+                'browser_enriching_fights': len(self._browser_claims),
+                'api_staged_fights': self.index_db.count_api_staged_fights(),
                 'preparing_reports': len(self._report_preparations)}
 
     def _pack_log(self, message: str) -> None:
@@ -144,6 +153,8 @@ class HarvesterPipeline:
         tasks = [*self._background_pack_tasks]
         if self._download_scheduler_task is not None:
             tasks.append(self._download_scheduler_task)
+        if self._browser_manager_task is not None:
+            tasks.append(self._browser_manager_task)
         for task in tasks:
             if task.done() and not task.cancelled() and task.exception() is not None:
                 error = task.exception()
@@ -160,11 +171,24 @@ class HarvesterPipeline:
     def _recover_staging(self) -> List[str]:
         """Recover the file-before-catalogue crash window without network access."""
         messages = []
+        snapshots = []
         for path in self.staging_store.list_jobs():
             try:
                 job, archive = self.staging_store.load(path)
                 archive.clear()
-                row = job['fight_row']
+                snapshots.append((path, job['fight_row'], job['manifest']))
+                del job
+            except Exception as exc:
+                messages.append(f'Raw retained at {path.name}: {exc}')
+        # A full replacement must win the crash window before its database link,
+        # independent of hashed filename order. Keep only lightweight identities.
+        snapshots.sort(key=lambda item: not bool(item[2].get('hybrid')))
+        identities = {path.relative_to(self.data_dir.resolve()).as_posix(): manifest
+                      for path, _, manifest in snapshots}
+        for path, row, manifest in snapshots:
+            try:
+                if not path.exists():  # A verified replacement already cleaned it.
+                    continue
                 code, fid = row['report_code'], int(row['fight_id'])
                 saved = self.index_db.get_fight(code, fid)
                 rel = path.relative_to(self.data_dir.resolve()).as_posix()
@@ -177,17 +201,41 @@ class HarvesterPipeline:
                 if saved['status'] == 'PACKED':
                     out = (self.data_dir / (saved['file_rel_path'] or '')).resolve()
                     out.relative_to(self.data_dir.resolve())
-                    self._verify_staged_archive(out, job)
+                    sections = PackedFightReader.read_sections(out)
+                    packed = sections['metadata']['manifest']
+                    if (packed != manifest and not self._hybrid_replaces(packed, manifest)
+                            or sections['events']['count'] != packed['event_count']):
+                        raise ValueError('Packed archive source fetch identity does not match durable raw')
                     self.staging_store.delete(path)
                     self.index_db.clear_fight_staging(code, fid, rel)
                 elif saved.get('staging_rel_path') and saved['staging_rel_path'] != rel:
-                    messages.append(f'Raw retained for {code}#{fid}: another source fetch is linked')
+                    linked = identities.get(saved['staging_rel_path'])
+                    if self._hybrid_replaces(manifest, linked):
+                        self.index_db.mark_fight_staged(code, fid, rel)
+                        self.index_db.mark_report_unarchived(code)
+                        try:
+                            self.staging_store.delete(self.data_dir / saved['staging_rel_path'])
+                        except Exception as exc:
+                            messages.append(f'API raw retained for {code}#{fid}: {exc}')
+                    elif self._hybrid_replaces(linked, manifest):
+                        self.staging_store.delete(path)
+                    else:
+                        messages.append(f'Raw retained for {code}#{fid}: another source fetch is linked')
                 elif saved['status'] != 'FAILED' or not saved.get('staging_rel_path'):
-                    self.index_db.mark_fight_staged(code, fid, rel)
+                    marker = (self.index_db.mark_fight_api_staged if manifest.get('hybrid_pending') is True
+                              else self.index_db.mark_fight_staged)
+                    marker(code, fid, rel)
                     self.index_db.mark_report_unarchived(code)
             except Exception as exc:
                 messages.append(f'Raw retained at {path.name}: {exc}')
         return messages
+
+    @staticmethod
+    def _hybrid_replaces(full, pending) -> bool:
+        return bool(isinstance(full, dict) and isinstance(pending, dict)
+                    and pending.get('hybrid_pending') is True
+                    and full.get('hybrid_pending') is not True
+                    and (full.get('hybrid') or {}).get('api_manifest') == pending)
 
     async def start_background_packing(self, on_progress=None) -> None:
         if not isinstance(self.raw_archive, FightArchive):
@@ -196,6 +244,7 @@ class HarvesterPipeline:
             self._packing_progress = on_progress
         if self._background_pack_tasks:
             self._raise_background_failure()
+            self._start_browser_enrichment()
             return
         self._packing_stop = self._packing_finish = False
         self._packing_wakeup = asyncio.Event()
@@ -203,6 +252,157 @@ class HarvesterPipeline:
             self._pack_log(message)
         self._background_pack_tasks = [asyncio.create_task(self._background_pack_worker())
                                        for _ in range(self.pack_workers)]
+        self._start_browser_enrichment()
+
+    def _start_browser_enrichment(self):
+        if (getattr(self.client, 'requires_browser_enrichment', False)
+                and self._browser_manager_task is None):
+            self._browser_finish = self._browser_stop = False
+            self._browser_wakeup = asyncio.Event()
+            self._browser_manager_task = asyncio.create_task(self._browser_manager())
+
+    def _get_raw_executor(self):
+        if self._raw_executor is None:
+            self._raw_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='wcl-raw')
+        return self._raw_executor
+
+    async def _raw_io(self, func, *args, **kwargs):
+        from functools import partial
+        future = asyncio.get_running_loop().run_in_executor(self._get_raw_executor(), partial(func, *args, **kwargs))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await _finish_cleanup(future)
+            raise
+
+    def _link_staging(self, path, code, fid, manifest):
+        rel = path.relative_to(self.data_dir.resolve()).as_posix()
+        if manifest.get('hybrid_pending') is True:
+            self.index_db.mark_fight_api_staged(code, fid, rel)
+            if self._browser_wakeup is not None:
+                self._browser_wakeup.set()
+        else:
+            self.index_db.mark_fight_staged(code, fid, rel)
+            self._packing_wakeup.set()
+
+    async def _enrich_one_staged(self, row, worker_id):
+        uid, code, fid = row['fight_uid'], row['report_code'], int(row['fight_id'])
+        self._browser_claims.add(uid)
+        archive = None
+        try:
+            self._pack_log(f'Started browser enrichment for {uid} (browser worker #{worker_id})')
+            path = self.data_dir / row['staging_rel_path']
+            job, archive = await self._raw_io(self.staging_store.load, path, compression=self.raw_archive.compression)
+            if job['fight_row']['fight_uid'] != uid or job['manifest'].get('hybrid_pending') is not True:
+                raise ValueError('Browser enrichment requires the matching pending API snapshot')
+            api_manifest = job['manifest']
+            master = await self.client.enrich_staged_fight(job, archive)
+            out, meta, actors, abilities, start, end = self._prepare_fight_payload(row, master)
+            if (start, end) != (api_manifest['start_time'], api_manifest['end_time']):
+                raise ValueError('Hybrid browser metadata boundaries differ from API snapshot')
+            # Hybrid conflict diagnostics can scale with the full event stream.
+            # Copying that manifest belongs with disk/restore work, outside the
+            # API workers' event loop, after this private archive's merge ends.
+            full_manifest = await self._raw_io(archive.fight_manifest, code, fid)
+            if not self._hybrid_replaces(full_manifest, api_manifest):
+                raise ValueError('Enriched sources do not replace this API snapshot')
+
+            async def publish():
+                new_path = await self._raw_io(self.staging_store.stage_fight,
+                                             archive, row, meta, actors, abilities, out)
+                self.index_db.mark_fight_staged(code, fid, new_path.relative_to(self.data_dir.resolve()).as_posix())
+                self._packing_wakeup.set()
+                try:
+                    await self._raw_io(self.staging_store.delete, path)
+                except Exception as exc:
+                    self._pack_log(f'Enriched {uid}; API raw retained for cleanup: {exc}')
+            task = asyncio.create_task(publish())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await _finish_cleanup(task)
+                raise
+            self._pack_log(f'Browser enrichment complete for {uid} (browser worker #{worker_id}); queued for packing')
+        except asyncio.CancelledError:
+            # Cancellation releases the provider, not the retry budget. A new
+            # browser manager can resume the same durable API snapshot directly.
+            # An already running atomic publisher may have advanced it to STAGED.
+            self._pack_log(f'Browser enrichment cancelled for {uid} (browser worker #{worker_id}); durable source retained')
+            raise
+        except Exception as exc:
+            self.index_db.mark_fight_failed(code, fid, str(exc))
+            self._pack_log(f'Browser enrichment failed for {uid} (browser worker #{worker_id}); API raw retained: {exc}')
+        finally:
+            if archive is not None:
+                archive.clear()
+            self._browser_claims.discard(uid)
+            self._browser_wakeup.set()
+
+    async def _browser_manager(self):
+        try:
+            while not self._browser_stop:
+                for slot, task in list(self._browser_tasks.items()):
+                    if task.done():
+                        task.result()
+                        del self._browser_tasks[slot]
+                limit = self.download_concurrency
+                rows = self.index_db.get_api_staged_fights(limit=limit + len(self._browser_tasks))
+                for row in rows:
+                    if row['fight_uid'] in self._browser_claims or len(self._browser_tasks) >= limit:
+                        continue
+                    slot = next(i for i in range(1, limit + 1) if i not in self._browser_tasks)
+                    # Claim before scheduling; an entire disk backlog never lives in RAM.
+                    self._browser_claims.add(row['fight_uid'])
+                    self._browser_tasks[slot] = asyncio.create_task(self._enrich_one_staged(row, slot))
+                if self._browser_finish and not self._browser_tasks and not rows:
+                    return
+                self._browser_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._browser_wakeup.wait(), timeout=.25)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            tasks = list(self._browser_tasks.values())
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await _finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+            self._browser_tasks.clear()
+            self._browser_claims.clear()
+
+    async def _finish_browser_enrichment(self, cancel):
+        if self._browser_manager_task is None:
+            return
+        task = self._browser_manager_task
+        self._browser_finish = True
+        self._browser_stop = cancel
+        self._browser_wakeup.set()
+        if cancel:
+            task.cancel()
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                task.cancel()
+                try:
+                    await _finish_cleanup(task)
+                except asyncio.CancelledError:
+                    pass
+                raise
+        finally:
+            self._browser_manager_task = None
+
+    async def stop_background_enrichment(self, cancel: bool = True) -> None:
+        """Quiesce browser-owned requests and durable writers before browser close."""
+        cleanup = asyncio.create_task(self._finish_browser_enrichment(cancel))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            self._browser_stop = True
+            if self._browser_manager_task is not None:
+                self._browser_manager_task.cancel()
+            await _finish_cleanup(cleanup)
+            raise
 
     async def stop_background_downloading(self) -> None:
         # Download cancellation may still be publishing a durable snapshot.
@@ -218,11 +418,28 @@ class HarvesterPipeline:
                 self._download_scheduler_task = None
 
     async def finish_background_packing(self, cancel: bool = False) -> None:
+        cleanup = asyncio.create_task(self._finish_background_packing(cancel))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            self._packing_stop = self._browser_stop = True
+            if self._browser_manager_task is not None:
+                self._browser_manager_task.cancel()
+            if self._packing_wakeup is not None:
+                self._packing_wakeup.set()
+            await _finish_cleanup(cleanup)
+            raise
+
+    async def _finish_background_packing(self, cancel: bool = False) -> None:
         download_error = None
         try:
             await self.stop_background_downloading()
         except Exception as exc:
             download_error = exc
+        try:
+            await self._finish_browser_enrichment(cancel)
+        except Exception as exc:
+            download_error = download_error or exc
         if not self._background_pack_tasks:
             if download_error:
                 raise download_error
@@ -310,10 +527,10 @@ class HarvesterPipeline:
                 return 0
             if uid in self._unlinked_staging:
                 path = self._unlinked_staging[uid]
-                rel = path.relative_to(self.data_dir.resolve()).as_posix()
-                self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
+                job, restored = await self._raw_io(self.staging_store.load, path)
+                restored.clear()
+                self._link_staging(path, row['report_code'], int(row['fight_id']), job['manifest'])
                 self._unlinked_staging.pop(uid)
-                self._packing_wakeup.set()
                 return 1
             self._pack_log(f'Started downloading {uid} (download worker #{worker_id}; '
                            f'{row.get("encounter_slug", "fight")})')
@@ -321,21 +538,21 @@ class HarvesterPipeline:
             out, meta, actors, abilities, start, end = self._prepare_fight_payload(row, master)
             events = await self.client.fetch_all_fight_events(row['report_code'], int(row['fight_id']), start, end)
             del events
+            manifest = self.raw_archive.fight_manifest(row['report_code'], int(row['fight_id']))
             async def stage_and_link():
                 path = await asyncio.to_thread(self.staging_store.stage_fight,
                     self.raw_archive, row, meta, actors, abilities, out)
                 self._unlinked_staging[uid] = path
-                rel = path.relative_to(self.data_dir.resolve()).as_posix()
-                self.index_db.mark_fight_staged(row['report_code'], int(row['fight_id']), rel)
+                self._link_staging(path, row['report_code'], int(row['fight_id']), manifest)
                 self._unlinked_staging.pop(uid)
-                self._packing_wakeup.set()
             task = asyncio.create_task(stage_and_link())
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 await _finish_cleanup(task)
                 raise
-            self._pack_log(f'Downloaded {uid} (download worker #{worker_id}); durable raw queued for packing')
+            next_phase = 'browser enrichment' if manifest.get('hybrid_pending') is True else 'packing'
+            self._pack_log(f'Downloaded {uid} (download worker #{worker_id}); durable raw queued for {next_phase}')
             return 1
         except Exception as exc:
             self.index_db.mark_fight_failed(row['report_code'], int(row['fight_id']), str(exc))
@@ -452,7 +669,8 @@ class HarvesterPipeline:
         return completed
 
     async def _wait_for_staged_rows(self, rows) -> List[Path]:
-        while any((self.index_db.get_fight(row['report_code'], int(row['fight_id'])) or {}).get('status') == 'STAGED'
+        waiting = ('STAGED', 'API_STAGED') if getattr(self.client, 'requires_browser_enrichment', False) else ('STAGED',)
+        while any((self.index_db.get_fight(row['report_code'], int(row['fight_id'])) or {}).get('status') in waiting
                   for row in rows):
             self._raise_background_failure()
             await asyncio.sleep(.05)
@@ -468,11 +686,14 @@ class HarvesterPipeline:
         return self._pack_executor
 
     def close(self) -> None:
-        if self._background_pack_tasks or self._download_scheduler_task is not None:
+        if self._background_pack_tasks or self._download_scheduler_task is not None or self._browser_manager_task is not None:
             raise RuntimeError('Await finish_background_packing() before closing the pipeline')
         if self._pack_executor is not None:
             self._pack_executor.shutdown(wait=True)
             self._pack_executor = None
+        if self._raw_executor is not None:
+            self._raw_executor.shutdown(wait=True)
+            self._raw_executor = None
         if isinstance(self.raw_archive,FightArchive):
             self.raw_archive.clear()
 
@@ -713,13 +934,17 @@ class HarvesterPipeline:
             return 0, []
         if isinstance(self.raw_archive, FightArchive):
             owns_workers = not self._background_pack_tasks
+            interrupted = False
             try:
                 await self._download_rows_to_staging(pending, on_progress, should_stop)
                 paths = await self._wait_for_staged_rows(pending)
                 return len(paths), paths
+            except asyncio.CancelledError:
+                interrupted = True
+                raise
             finally:
                 if owns_workers:
-                    await self.finish_background_packing(cancel=bool(should_stop and should_stop()))
+                    await self.finish_background_packing(cancel=interrupted or bool(should_stop and should_stop()))
 
         download_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
         for row in pending:
@@ -888,6 +1113,7 @@ class HarvesterPipeline:
 
         if isinstance(self.raw_archive, FightArchive):
             owns_workers = not self._background_pack_tasks
+            interrupted = False
             await self.start_background_packing()
             try:
                 while True:
@@ -904,9 +1130,12 @@ class HarvesterPipeline:
                 if failed:
                     raise ImportIncompleteError(report_code, paths, failed)
                 return paths
+            except asyncio.CancelledError:
+                interrupted = True
+                raise
             finally:
                 if owns_workers:
-                    await self.finish_background_packing()
+                    await self.finish_background_packing(cancel=interrupted)
 
         packed_paths: List[Path] = []
         while True:
@@ -1235,7 +1464,8 @@ class HarvesterPipeline:
                     counts = self.index_db.get_queue_counts()
                     if not any(counts[key] for key in (
                         "pending_reports", "queued_fights", "retryable_reports", "retryable_fights", "staged_fights"
-                    )):
+                    )) and not (getattr(self.client, 'requires_browser_enrichment', False)
+                                and counts['api_staged_fights']):
                         return
                 if packed == 0:
                     await asyncio.sleep(0.5)

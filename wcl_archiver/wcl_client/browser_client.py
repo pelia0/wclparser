@@ -1088,12 +1088,26 @@ class BrowserClient:
 
             inflight = asyncio.create_task(_fetch_one())
             self._master_inflight[report_code] = inflight
-            try:
-                return await inflight
-            finally:
-                if self._master_inflight.get(report_code) is inflight:
-                    self._master_inflight.pop(report_code, None)
-        return await inflight
+        try:
+            # A report master is shared by independent fight workers. Cancelling
+            # either waiter must not cancel another worker's source preparation.
+            return await asyncio.shield(inflight)
+        except asyncio.CancelledError:
+            # Keep ownership until source capture/cache mutations are quiescent;
+            # repeated cancellation cannot detach this shared network operation.
+            while not inflight.done():
+                try:
+                    await asyncio.shield(inflight)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not inflight.cancelled():
+                inflight.exception()
+            raise
+        finally:
+            if inflight.done() and self._master_inflight.get(report_code) is inflight:
+                self._master_inflight.pop(report_code, None)
 
     async def fetch_all_fight_events(
         self,

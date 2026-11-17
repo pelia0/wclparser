@@ -128,7 +128,8 @@ def test_persistent_bounded_retries_and_terminal_report_dependencies(tmp_path):
         db.mark_report_failed("bad", "upstream unavailable")
     counts = db.get_queue_counts()
     assert counts == dict(pending_reports=1, queued_fights=1, retryable_reports=0,
-                          retryable_fights=0, failed_reports=1, failed_fights=1, failed_scan_pages=0, staged_fights=0)
+                          retryable_fights=0, failed_reports=1, failed_fights=1, failed_scan_pages=0, staged_fights=0,
+                          api_staged_fights=0)
     row = db.search_fights(status="FAILED")[0]
     assert "upstream unavailable" in row["last_error"]
     assert db.get_pending_reports_for_unarchive() == ["fresh"]

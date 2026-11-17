@@ -351,7 +351,9 @@ function renderHarvesterState(st) {
   }
   const workerSummary = document.getElementById("download-worker-summary");
   if (workerSummary && downloadSettingsSupported) {
-    workerSummary.textContent = `${st.download_concurrency} downloads · ${st.browser_request_concurrency} request limit · ${st.pack_workers} pack workers`;
+    workerSummary.textContent = st.hybrid_strict
+      ? `${st.download_concurrency} API workers · ${st.download_concurrency} browser workers · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers`
+      : `${st.download_concurrency} downloads · ${st.browser_request_concurrency} request limit · ${st.pack_workers} pack workers`;
   }
   const staging = document.getElementById("stat-staging");
   if (staging) staging.textContent = `${st.staging_files || 0} files / ${(Number(st.staging_bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
@@ -359,10 +361,17 @@ function renderHarvesterState(st) {
   if (packing) packing.textContent = `${st.packing_fights || 0} / ${st.pack_workers || 4} workers`;
   const apiWait = document.getElementById("api-quota-wait");
   if (apiWait) {
-    const seconds = st.rankings_source === "api" ? Number(st.api_quota_wait_seconds || 0) : 0;
+    const seconds = ["api", "hybrid"].includes(st.rankings_source) ? Number(st.api_quota_wait_seconds || 0) : 0;
     apiWait.style.display = seconds > 0 ? "block" : "none";
-    apiWait.textContent = seconds > 0 ? `WCL API quota cooldown: ${seconds}s until retry. Active downloads wait for the quota reset.` : "";
+    apiWait.textContent = seconds > 0 ? `WCL API quota cooldown: ${seconds}s until retry. API workers wait; browser enrichment and packing can continue.` : "";
   }
+  const hybridNotice = document.getElementById("hybrid-source-notice");
+  if (hybridNotice) {
+    hybridNotice.style.display = st.hybrid_strict ? "block" : "none";
+    hybridNotice.textContent = st.hybrid_strict ? "Strict hybrid preserves API responses plus complete browser canonical and replay sources. API downloads queue on disk and continue without waiting for the browser. Browser verification still downloads all canonical pages; temporary disk usage can grow." : "";
+  }
+  const browserEnrichment = document.getElementById("stat-browser-enrichment");
+  if (browserEnrichment) browserEnrichment.textContent = `${st.browser_enriching_fights || 0} active / ${st.api_staged_fights || 0} queued`;
   const downloading = document.getElementById("stat-downloading");
   if (downloading) downloading.textContent = Number.isInteger(st.downloading_fights)
     ? `${st.downloading_fights} / ${st.download_concurrency || 4} workers`

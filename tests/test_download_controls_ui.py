@@ -66,6 +66,12 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'
   const start=calls[calls.length-1];
   assert.equal(start.url,'/api/harvester/start');
   assert.equal(JSON.parse(start.options.body).download_concurrency,10);
+  document.getElementById('harvest-source-mode').value='hybrid';
+  await vm.runInContext("startHarvest('raids')",context);
+  assert.equal(JSON.parse(calls[calls.length-1].options.body).rankings_source,'hybrid');
+  vm.runInContext('renderHarvesterState({hybrid_strict:true,download_concurrency:10,browser_request_concurrency:20,pack_workers:4})',context);
+  assert.equal(fields['hybrid-source-notice'].style.display,'block');
+  assert(fields['hybrid-source-notice'].textContent.includes('complete browser'));
   ok=false;response={detail:'Settings were not saved'};
   await vm.runInContext('applyDownloadConcurrency()',context);
   assert(fields['download-settings-feedback'].textContent.includes('Settings were not saved'));
