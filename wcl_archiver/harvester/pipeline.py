@@ -18,6 +18,7 @@ from wcl_archiver.config import (
     LEGION_SPECS,
 )
 from wcl_archiver.db.schema import IndexDB, MasterDictDB
+from wcl_archiver.db.selection import QueueSelection
 from wcl_archiver.parser.combat_state_machine import CombatStateMachine
 from wcl_archiver.wcl_client.protocol_parser import WCLProtocolClient
 from wcl_archiver.wcl_client.browser_client import BrowserClient
@@ -120,6 +121,7 @@ class HarvesterPipeline:
         self.index_db = index_db
         self.master_db = master_db
         self.client = protocol_client
+        self.queue_selection: QueueSelection | None = None
         self.raw_archive = raw_archive
         self.zstd_level = int(zstd_level)
         self.download_concurrency = max(0, int(download_concurrency))
@@ -180,6 +182,19 @@ class HarvesterPipeline:
         for event in (self._download_wakeup, self._browser_wakeup, self._packing_wakeup):
             if event is not None:
                 event.set()
+
+    def _queue_filters(self):
+        return {'selection': self.queue_selection} if self.queue_selection else {}
+
+    async def has_queue_work(self) -> bool:
+        uses_browser = getattr(self.client, 'requires_browser_enrichment', False)
+        if self.queue_selection:
+            return await self._db_read(self.index_db.has_selected_work, self.queue_selection,
+                                       include_browser=uses_browser)
+        counts = await self._db_read(self.index_db.get_queue_counts)
+        return any(counts.get(key) for key in (
+            'pending_reports', 'queued_fights', 'retryable_reports', 'retryable_fights', 'staged_fights'
+        )) or bool(uses_browser and counts.get('api_staged_fights'))
 
     def get_runtime_stats(self) -> Dict[str, int]:
         """In-memory counters only; safe for frequent status polling."""
@@ -612,7 +627,7 @@ class HarvesterPipeline:
                     self.browser_worker_limit + len(self._browser_claims)
                     if len(network) < self.browser_worker_limit else 0,
                     self.processing_concurrency + len(self._browser_claims)
-                    if len(cpu) < self.processing_concurrency else 0)
+                    if len(cpu) < self.processing_concurrency else 0, **self._queue_filters())
                 if self._browser_stop:
                     break
                 for row in rows:
@@ -657,7 +672,7 @@ class HarvesterPipeline:
                         del self._browser_tasks[slot]
                 limit = self.browser_worker_limit
                 rows = await self._db_read(self.index_db.get_api_staged_fights,
-                                           limit=limit + len(self._browser_tasks))
+                                           limit=limit + len(self._browser_tasks), **self._queue_filters())
                 if self._browser_stop:
                     return
                 for row in rows:
@@ -829,7 +844,7 @@ class HarvesterPipeline:
                 rows = []
                 if limit > len(tasks):
                     rows = await self._db_read(self.index_db.get_staged_fights, limit=limit,
-                                               _stop_when=lambda: self._packing_stop)
+                                               _stop_when=lambda: self._packing_stop, **self._queue_filters())
                 if self._packing_stop:
                     return
                 for row in rows:
@@ -973,7 +988,7 @@ class HarvesterPipeline:
 
                 limit = self._download_worker_limit()
                 ready = await self._db_read(self.index_db.get_unarchived_pending_fights,
-                    limit=max(2 * limit, len(self._continuous_downloads) + limit))
+                    limit=max(2 * limit, len(self._continuous_downloads) + limit), **self._queue_filters())
                 if self._download_stop or (should_stop and should_stop()):
                     return
                 limit = self._download_worker_limit()
@@ -991,7 +1006,7 @@ class HarvesterPipeline:
                 # without unarchiving the entire historical collection in RAM.
                 if len(ready) < max(1, 2 * limit) and len(self._report_preparations) < self.report_worker_limit:
                     codes = await self._db_read(self.index_db.get_pending_reports_for_unarchive,
-                        limit=self.report_worker_limit + len(self._report_preparations))
+                        limit=self.report_worker_limit + len(self._report_preparations), **self._queue_filters())
                     if self._download_stop or (should_stop and should_stop()):
                         return
                     for code in codes:
@@ -1113,7 +1128,8 @@ class HarvesterPipeline:
         limit: int = 25,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> int:
-        codes = await self._db_read(self.index_db.get_pending_reports_for_unarchive, limit=limit)
+        codes = await self._db_read(self.index_db.get_pending_reports_for_unarchive, limit=limit,
+                                    **self._queue_filters())
         if not codes:
             return 0
 
@@ -1836,13 +1852,8 @@ class HarvesterPipeline:
                     should_stop=should_stop,
                     continuous=True,
                 )
-                if scan_finished.is_set() and packed == 0:
-                    counts = await self._db_read(self.index_db.get_queue_counts)
-                    if not any(counts[key] for key in (
-                        "pending_reports", "queued_fights", "retryable_reports", "retryable_fights", "staged_fights"
-                    )) and not (getattr(self.client, 'requires_browser_enrichment', False)
-                                and counts['api_staged_fights']):
-                        return
+                if scan_finished.is_set() and packed == 0 and not await self.has_queue_work():
+                    return
                 if packed == 0:
                     await asyncio.sleep(0.5)
 
@@ -1902,16 +1913,7 @@ class HarvesterPipeline:
             pack_as_discovered=pack_as_discovered,
         )
 
-    async def discover_and_enqueue_raids(
-        self,
-        pages_per_spec: int = 0,
-        difficulties: Optional[List[int]] = None,
-        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
-        should_stop: Optional[Callable[[], bool]] = None,
-        pack_as_discovered: bool = False,
-    ) -> int:
-        if should_stop and should_stop():
-            return 0
+    def raid_scan_units(self, difficulties: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         target_diffs = [
             int(d)
             for d in (difficulties or [5, 4, 3, 1])
@@ -1929,6 +1931,9 @@ class HarvesterPipeline:
                     for boss_id, boss_slug in raid_info.get("bosses", {}).items():
                         boss_title = boss_slug.replace("-", " ").title()
                         for class_name, spec_name, role in LEGION_SPECS:
+                            if self.queue_selection and not self.queue_selection.ranking_matches(
+                                    zone_id, boss_id, diff_id, class_name, spec_name):
+                                continue
                             units.append(
                                 {
                                     "zone_id": zone_id,
@@ -1945,8 +1950,20 @@ class HarvesterPipeline:
                                     "log_empty_page1": False,
                                 }
                             )
+        return units
+
+    async def discover_and_enqueue_raids(
+        self,
+        pages_per_spec: int = 0,
+        difficulties: Optional[List[int]] = None,
+        on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        pack_as_discovered: bool = False,
+    ) -> int:
+        if should_stop and should_stop():
+            return 0
         return await self._run_discovery_pool(
-            units=units,
+            units=self.raid_scan_units(difficulties),
             pages_per_spec=pages_per_spec,
             on_progress=on_progress,
             should_stop=should_stop,
@@ -1968,7 +1985,8 @@ class HarvesterPipeline:
         await self.warm_unarchive_batch(limit=batch_size, should_stop=should_stop)
         if should_stop and should_stop():
             return 0
-        pending = await self._db_read(self.index_db.get_unarchived_pending_fights, limit=batch_size)
+        pending = await self._db_read(self.index_db.get_unarchived_pending_fights, limit=batch_size,
+                                      **self._queue_filters())
         if should_stop and should_stop():
             return 0
         if not pending:

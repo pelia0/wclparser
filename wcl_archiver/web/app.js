@@ -14,6 +14,7 @@ const workerFields = {
   processing_concurrency: "harvest-processing-workers",
   pack_workers: "harvest-pack-workers",
 };
+let raidCatalog = {};
 let independentWorkerSettings = false;
 let downloadSettingsSupported = false;
 let downloadSettingsApplying = false;
@@ -180,6 +181,21 @@ function switchView(viewName) {
 async function loadCatalog() {
   const res = await fetch("/api/meta/catalog");
   const cat = await res.json();
+  raidCatalog = cat.raids || {};
+  const raidSelect = document.getElementById("harvest-raid");
+  if (raidSelect) {
+    for (const [id, raid] of Object.entries(raidCatalog)) {
+      addSelectOption(raidSelect, id, raid.name || raid.slug);
+    }
+    raidSelect.addEventListener("change", updateHarvestBosses);
+    updateHarvestBosses();
+  }
+  const raidSpecs = document.getElementById("harvest-raid-spec");
+  if (raidSpecs) {
+    for (const spec of cat.specs || []) {
+      addSelectOption(raidSpecs, `${spec.class}:${spec.spec}`, `${spec.class} · ${spec.spec}`);
+    }
+  }
   const encSel = document.getElementById("filter-encounter");
   (cat.mplus_dungeons || []).forEach(d => {
     const opt = document.createElement("option");
@@ -204,6 +220,33 @@ async function loadCatalog() {
     opt.textContent = `${s.class} - ${s.spec}`;
     specSel.appendChild(opt);
   });
+}
+
+function addSelectOption(select, value, label) {
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = label;
+  select.appendChild(option);
+}
+
+function encounterName(slug) {
+  return slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function updateHarvestBosses() {
+  const raid = document.getElementById("harvest-raid");
+  const boss = document.getElementById("harvest-raid-boss");
+  if (!raid || !boss) return;
+  const previous = boss.value;
+  boss.replaceChildren();
+  addSelectOption(boss, "", "All bosses");
+  const selectedRaids = raid.value ? [raidCatalog[raid.value]].filter(Boolean) : Object.values(raidCatalog);
+  for (const info of selectedRaids) {
+    for (const [id, slug] of Object.entries(info.bosses || {})) {
+      addSelectOption(boss, id, raid.value ? encounterName(slug) : `${info.name} · ${encounterName(slug)}`);
+    }
+  }
+  if (Array.from(boss.options).some(option => option.value === previous)) boss.value = previous;
 }
 
 function renderAuthState(st) {
@@ -382,6 +425,21 @@ function renderHarvesterError() {
 function renderHarvesterState(st) {
   lastHarvesterState = st;
   renderHarvesterControls();
+  const activeQueue = document.getElementById("harvest-active-queue");
+  if (activeQueue) {
+    const selection = st.queue_selection;
+    activeQueue.textContent = "";
+    if (selection && (st.running || st.stopping)) {
+      const raid = raidCatalog[selection.zone_id];
+      const boss = raid?.bosses?.[selection.encounter_id] ||
+        Object.values(raidCatalog).find(info => info.bosses?.[selection.encounter_id])?.bosses[selection.encounter_id];
+      const difficulty = {5: "Mythic", 4: "Heroic", 3: "Normal", 1: "LFR"}[selection.difficulty];
+      const scope = selection.content_type === "mplus" ? "Mythic+ Season 5" : raid?.name || "Legion raids";
+      const parts = [scope, boss && encounterName(boss), selection.specialization?.join(" "),
+        difficulty, selection.order === "random" ? "Random" : "FIFO"];
+      activeQueue.textContent = `Active queue · ${parts.filter(Boolean).join(" · ")}`;
+    }
+  }
   const applyDownloads = document.getElementById("btn-apply-download-threads");
   const settingsFeedback = document.getElementById("download-settings-feedback");
   downloadSettingsSupported = Number.isInteger(st.download_concurrency);
@@ -640,6 +698,14 @@ async function startHarvest(mode) {
   const rankings_source = getSelectedSourceMode();
   const raidDiffEl = document.getElementById("harvest-raid-difficulty");
   const raid_difficulty = raidDiffEl ? Number(raidDiffEl.value || 0) : 0;
+  const queue_order = document.getElementById("harvest-queue-order")?.value || "fifo";
+  const raidSpec = document.getElementById("harvest-raid-spec")?.value;
+  const raidFilters = mode === "raids" ? {
+    raid_difficulty,
+    raid_zone_id: Number(document.getElementById("harvest-raid")?.value) || null,
+    raid_boss_id: Number(document.getElementById("harvest-raid-boss")?.value) || null,
+    raid_specialization: raidSpec ? raidSpec.split(":") : null,
+  } : {};
   const res = await fetch("/api/harvester/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -647,7 +713,8 @@ async function startHarvest(mode) {
       mode,
       pages_per_spec: isNaN(pages) ? 2 : pages,
       rankings_source,
-      raid_difficulty,
+      queue_order,
+      ...raidFilters,
       ...workerSettings,
     }),
   });

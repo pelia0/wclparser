@@ -1,8 +1,10 @@
 from contextlib import contextmanager
 import json
+import random
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+from wcl_archiver.db.selection import QueueSelection
 
 
 class IndexDB:
@@ -119,6 +121,12 @@ class IndexDB:
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_pending_mplus
                 ON fights(report_code)
                 WHERE content_type = 'mplus' AND status IN ('QUEUED', 'RETRY')""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_pending_type
+                ON fights(content_type) WHERE status IN ('QUEUED', 'RETRY')""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_pending_zone
+                ON fights(content_type, zone_id) WHERE status IN ('QUEUED', 'RETRY')""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_pending_boss
+                ON fights(content_type, encounter_id) WHERE status IN ('QUEUED', 'RETRY')""")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(fights)")}
             if "staging_rel_path" not in columns:
                 conn.execute("ALTER TABLE fights ADD COLUMN staging_rel_path TEXT DEFAULT NULL")
@@ -284,9 +292,12 @@ class IndexDB:
                 WHERE fight_uid = ? AND status != 'PACKED'""",
                 (staging_rel_path, self.make_fight_uid(report_code, fight_id)))
 
-    def get_api_staged_fights(self, limit: int = 100, report_code: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_api_staged_fights(self, limit: int = 100, report_code: Optional[str] = None, *,
+                             selection: QueueSelection | None = None) -> List[Dict[str, Any]]:
         if limit <= 0:
             return []
+        if selection is not None:
+            return self._get_selected_stage(selection, limit, 'API_STAGED', report_code=report_code)
         scope = " AND report_code = ?" if report_code is not None else ""
         params = [self.MAX_WORK_ATTEMPTS]
         if report_code is not None:
@@ -314,7 +325,10 @@ class IndexDB:
                 WHERE staging_rel_path = ?""", (path,)).fetchone()
             return dict(row) if row else None
 
-    def get_browser_dispatch(self, network_limit, cpu_limit):
+    def get_browser_dispatch(self, network_limit, cpu_limit, *, selection: QueueSelection | None = None):
+        if selection is not None:
+            return (self._get_selected_stage(selection, network_limit, 'API_STAGED', cpu=0)
+                    + self._get_selected_stage(selection, cpu_limit, 'API_STAGED', cpu=1))
         with self._connect() as conn:
             rows = []
             for cpu, limit in ((0, network_limit), (1, cpu_limit)):
@@ -336,9 +350,12 @@ class IndexDB:
                 AND staging_rel_path = ? AND status = 'PACKED'""",
                 (self.make_fight_uid(report_code, fight_id), staging_rel_path))
 
-    def get_staged_fights(self, limit: int = 100, report_code: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_staged_fights(self, limit: int = 100, report_code: Optional[str] = None, *,
+                         selection: QueueSelection | None = None) -> List[Dict[str, Any]]:
         if limit <= 0:
             return []
+        if selection is not None:
+            return self._get_selected_stage(selection, limit, 'STAGED', report_code=report_code)
         scope = " AND report_code = ?" if report_code is not None else ""
         params = [self.MAX_WORK_ATTEMPTS]
         if report_code is not None:
@@ -348,6 +365,59 @@ class IndexDB:
             return [dict(row) for row in conn.execute("""SELECT * FROM fights
                 WHERE status = 'STAGED' AND failure_count < ?""" + scope + """
                 ORDER BY CASE WHEN content_type = 'mplus' THEN 0 ELSE 1 END, rowid ASC LIMIT ?""", params)]
+
+    @staticmethod
+    def _dispatch_candidates(conn, base, params, limit, selection, *, distinct_reports=False):
+        """Seek from a random rowid and wrap, then shuffle only the dispatch batch."""
+        bounds = [('', ())]
+        if selection.order == 'random':
+            first = conn.execute('SELECT f.rowid ' + base + ' ORDER BY f.rowid LIMIT 1', params).fetchone()
+            if first is None:
+                return []
+            last = conn.execute('SELECT f.rowid ' + base + ' ORDER BY f.rowid DESC LIMIT 1', params).fetchone()
+            pivot = random.randrange(first[0], last[0] + 1)
+            bounds = [(' AND f.rowid >= ?', (pivot,)), (' AND f.rowid < ?', (pivot,))]
+        rows = []
+        seen = set()
+        projection = 'SELECT f.report_code ' if distinct_reports else 'SELECT f.* '
+        for bound, bound_args in bounds:
+            query = projection + base + bound + ' ORDER BY f.rowid'
+            args = (*params, *bound_args)
+            if not distinct_reports:
+                query += ' LIMIT ?'
+                args += (limit - len(rows),)
+            for row in conn.execute(query, args):
+                if distinct_reports:
+                    code = row['report_code']
+                    if code in seen:
+                        continue
+                    seen.add(code)
+                    rows.append(code)
+                else:
+                    rows.append(dict(row))
+                if len(rows) == limit:
+                    break
+            if len(rows) == limit:
+                break
+        if selection.order == 'random':
+            random.shuffle(rows)
+        return rows
+
+    def _get_selected_stage(self, selection, limit, status, cpu=None, report_code=None):
+        if limit <= 0:
+            return []
+        scope, values = selection.fight_filter()
+        sql = f"FROM fights f WHERE f.status = ? AND f.failure_count < ? AND {scope}"
+        params = [status, self.MAX_WORK_ATTEMPTS, *values]
+        if cpu is not None:
+            sql += " AND f.browser_cpu = ?"
+            params.append(cpu)
+        if report_code is not None:
+            sql += " AND f.report_code = ?"
+            params.append(report_code)
+        with self._connect() as conn:
+            conn.execute('BEGIN')
+            return self._dispatch_candidates(conn, sql, params, limit, selection)
 
     def mark_fight_failed(self, report_code: str, fight_id: int, reason: str = "") -> None:
         fight_uid = self.make_fight_uid(report_code, fight_id)
@@ -406,9 +476,32 @@ class IndexDB:
         with self._connect() as conn:
             return self._has_pending_mplus(conn)
 
-    def get_pending_reports_for_unarchive(self, limit: int = 30) -> List[str]:
+    @staticmethod
+    def _selected_pending_sql(selection):
+        # Each index fixes the equality prefix, leaving rowid as an indexed
+        # ordering key. The general encounter index would sort the full queue.
+        if selection.encounter_id is not None:
+            index = 'idx_fights_pending_boss'
+        elif selection.zone_id is not None:
+            index = 'idx_fights_pending_zone'
+        else:
+            index = 'idx_fights_pending_type'
+        scope, args = selection.fight_filter()
+        return f"""FROM fights f INDEXED BY {index} JOIN reports r ON r.report_code = f.report_code
+            WHERE f.status IN ('QUEUED', 'RETRY') AND f.failure_count < ? AND {scope}""", args
+
+    def get_pending_reports_for_unarchive(self, limit: int = 30, *,
+                                         selection: QueueSelection | None = None) -> List[str]:
         if limit <= 0:
             return []
+        if selection is not None:
+            base, args = self._selected_pending_sql(selection)
+            with self._connect() as conn:
+                conn.execute('BEGIN')
+                return self._dispatch_candidates(conn, base
+                    + " AND r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?",
+                    (self.MAX_WORK_ATTEMPTS, *args, self.MAX_WORK_ATTEMPTS), limit, selection,
+                    distinct_reports=True)
         with self._connect() as conn:
             mplus_first = self._has_pending_mplus(conn)
             scope = " AND f.content_type = 'mplus'" if mplus_first else ""
@@ -445,9 +538,12 @@ class IndexDB:
             ).fetchall()
             return codes + [row["report_code"] for row in rows]
 
-    def get_unarchived_pending_fights(self, limit: int = 20, report_code: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_unarchived_pending_fights(self, limit: int = 20, report_code: Optional[str] = None, *,
+                                     selection: QueueSelection | None = None) -> List[Dict[str, Any]]:
         if limit <= 0:
             return []
+        if selection is not None:
+            return self._get_selected_pending_fights(selection, limit, report_code)
         with self._connect() as conn:
             scope = " AND f.report_code = ?" if report_code is not None else ""
             if report_code is None and self._has_pending_mplus(conn):
@@ -483,6 +579,72 @@ class IndexDB:
                 params,
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def _get_selected_pending_fights(self, selection, limit, report_code):
+        base, args = self._selected_pending_sql(selection)
+        params = [self.MAX_WORK_ATTEMPTS, *args]
+        with self._connect() as conn:
+            conn.execute('BEGIN')
+            ready = base + " AND r.archive_status = 'UNARCHIVED'"
+            if report_code is not None:
+                ready += " AND f.report_code = ?"
+                params.append(report_code)
+            elif selection.order == 'fifo':
+                blocker = conn.execute("SELECT f.rowid " + base +
+                    " AND r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?"
+                    " ORDER BY f.rowid LIMIT 1", (*params, self.MAX_WORK_ATTEMPTS)).fetchone()
+                if blocker is not None:
+                    ready += " AND f.rowid < ?"
+                    params.append(blocker[0])
+            return self._dispatch_candidates(conn, ready, params, limit, selection)
+
+    def has_selected_work(self, selection, *, include_browser):
+        scope, args = selection.fight_filter()
+        stages = "'STAGED', 'API_STAGED'" if include_browser else "'STAGED'"
+        with self._connect() as conn:
+            return conn.execute(f"""SELECT 1 FROM fights f
+                JOIN reports r ON r.report_code = f.report_code
+                WHERE {scope} AND f.failure_count < ? AND (f.status IN ({stages}) OR
+                    (f.status IN ('QUEUED', 'RETRY') AND (r.archive_status = 'UNARCHIVED' OR
+                        (r.archive_status IN ('PENDING', 'RETRY') AND r.failure_count < ?))))
+                LIMIT 1""", (*args, self.MAX_WORK_ATTEMPTS, self.MAX_WORK_ATTEMPTS)).fetchone() is not None
+
+    def retry_selected_work(self, selection):
+        scope, args = selection.fight_filter()
+        with self._connect() as conn:
+            conn.execute(f"""UPDATE reports SET archive_status = 'PENDING', failure_count = 0
+                WHERE archive_status IN ('RETRY', 'FAILED') AND EXISTS (
+                    SELECT 1 FROM fights f WHERE f.report_code = reports.report_code AND {scope}
+                    AND f.status IN ('RETRY', 'FAILED', 'QUEUED') AND f.staging_rel_path IS NULL)""", args)
+            conn.execute(f"""UPDATE fights AS f SET status = CASE
+                    WHEN staging_rel_path IS NOT NULL AND needs_browser = 1 THEN 'API_STAGED'
+                    WHEN staging_rel_path IS NOT NULL THEN 'STAGED' ELSE 'QUEUED' END, failure_count = 0
+                WHERE {scope} AND f.status IN ('RETRY', 'FAILED')""", args)
+
+    def get_selected_failures(self, selection, pages_per_spec):
+        scope, args = selection.fight_filter()
+        page_clauses, page_args = selection.ranking_filter('s')
+        if selection.content_type == 'raid':
+            page_clauses.append('s.difficulty > 0')
+        if selection.specialization:
+            page_clauses.extend(['s.class_name = ?', 's.spec_name = ?'])
+            page_args.extend(selection.specialization)
+        if pages_per_spec > 0:
+            page_clauses.append('s.page <= ?')
+            page_args.append(pages_per_spec)
+        page_filter = ' AND '.join(page_clauses) or '1'
+        with self._connect() as conn:
+            row = conn.execute(f"""SELECT
+                    COUNT(CASE WHEN f.status = 'FAILED' THEN 1 END) AS failed_fights,
+                    COUNT(DISTINCT CASE WHEN f.status = 'FAILED' AND r.archive_status = 'FAILED'
+                                        THEN f.report_code END) AS failed_reports,
+                    COUNT(CASE WHEN f.status = 'API_STAGED' THEN 1 END) AS api_staged_fights
+                FROM fights f JOIN reports r ON r.report_code = f.report_code
+                WHERE f.status IN ('FAILED', 'API_STAGED') AND {scope}""", args).fetchone()
+            counts = dict(row)
+            counts['failed_scan_pages'] = conn.execute(f"""SELECT COUNT(*) FROM scan_failures s
+                WHERE {page_filter}""", page_args).fetchone()[0]
+            return counts
 
     def is_page_scanned(
         self,

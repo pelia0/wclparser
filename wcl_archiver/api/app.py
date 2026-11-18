@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict
 from datetime import datetime
 import re
 import time
@@ -8,7 +9,7 @@ import os
 import tempfile
 import secrets
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlencode, urlsplit
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -30,6 +31,7 @@ from wcl_archiver.config import (
     LEGION_SPECS,
 )
 from wcl_archiver.db.schema import IndexDB, MasterDictDB
+from wcl_archiver.db.selection import QueueSelection
 from wcl_archiver.harvester.pipeline import HarvesterPipeline
 from wcl_archiver.wcl_client.auth import WCLAuthManager
 from wcl_archiver.wcl_client.browser_client import BrowserClient
@@ -76,6 +78,10 @@ class StartHarvestRequest(HarvesterSettingsRequest):
     pages_per_spec: int = 2
     rankings_source: str = "browser"
     raid_difficulty: int = 0
+    queue_order: Literal['fifo', 'random'] | None = None
+    raid_zone_id: WorkerCount | None = None
+    raid_boss_id: WorkerCount | None = None
+    raid_specialization: tuple[str, str] | None = None
 
 
 def create_app(
@@ -959,6 +965,8 @@ def create_app(
         client = _select_collection_client(source)
         harvester_state["rankings_source"] = source
         harvester.client = client
+        harvester.queue_selection = None
+        harvester_state['queue_selection'] = None
         harvester_state["running"] = True
         harvester_state["last_error"] = ""
         harvester_state["current_task"] = f"Importing report {code}..."
@@ -1027,13 +1035,7 @@ def create_app(
                         packed = await harvester.drain_queue_batch(
                             batch_size=40, on_progress=_on_progress, should_stop=should_stop, continuous=True
                         )
-                        counts = await harvester._db_read(index_db.get_queue_counts)
-                        pending = sum(counts.get(key, 0) for key in (
-                            "pending_reports", "queued_fights", "retryable_reports", "retryable_fights", "staged_fights"
-                        ))
-                        if source == 'hybrid':
-                            pending += counts.get('api_staged_fights', 0)
-                        if packed == 0 and pending == 0:
+                        if packed == 0 and not await harvester.has_queue_work():
                             break
                         await asyncio.sleep(0.2)
 
@@ -1070,7 +1072,10 @@ def create_app(
                         await asyncio.sleep(min(0.5, max(0.02, deadline - time.monotonic())))
 
             if harvester_state["running"]:
-                counts = await harvester._db_read(index_db.get_queue_counts)
+                if harvester.queue_selection:
+                    counts = await harvester._db_read(index_db.get_selected_failures, harvester.queue_selection, pages_per_spec)
+                else:
+                    counts = await harvester._db_read(index_db.get_queue_counts)
                 failed_pages = counts.get('failed_scan_pages',0)
                 failed = counts["failed_reports"] + counts["failed_fights"] + failed_pages
                 waiting_browser = counts.get('api_staged_fights', 0)
@@ -1084,7 +1089,8 @@ def create_app(
                     harvester_state["progress_pct"] = min(99.9, harvester_state["progress_pct"])
                     _append_log(message)
                 else:
-                    harvester_state["current_task"] = "Harvest completed"
+                    harvester_state["current_task"] = ("Harvest completed for the selected queue"
+                                                       if harvester.queue_selection else "Harvest completed")
                     harvester_state["last_error"] = ""
                     harvester_state["progress_pct"] = 100.0
                     _append_log("Harvest completed successfully.")
@@ -1109,10 +1115,16 @@ def create_app(
         nonlocal job_task
         if req.mode not in {"mplus_s5", "raids"}:
             raise HTTPException(status_code=400, detail="Invalid harvest mode")
+        selection = _resolve_queue_selection(req)
         source = req.rankings_source or harvester_state.get('rankings_source', 'browser')
         harvester.client = _select_collection_client(source)
         await _apply_worker_settings(req.worker_updates())
-        index_db.retry_failed_work()
+        harvester.queue_selection = selection
+        harvester_state['queue_selection'] = asdict(selection) if selection else None
+        if selection:
+            index_db.retry_selected_work(selection)
+        else:
+            index_db.retry_failed_work()
         if not harvester_state["running"]:
             source = req.rankings_source or harvester_state.get("rankings_source", "browser")
             harvester_state["rankings_source"] = source
@@ -1123,12 +1135,13 @@ def create_app(
             if req.mode == "mplus_s5":
                 harvester_state["specs_total"] = 468
             else:
-                diff_mult = 1 if req.raid_difficulty > 0 else 4
-                harvester_state["specs_total"] = 2880 * diff_mult
+                difficulties = [req.raid_difficulty] if req.raid_difficulty else None
+                harvester_state["specs_total"] = len(harvester.raid_scan_units(difficulties))
             harvester_state["pages_scanned"] = index_db.get_scanned_pages_count()
             harvester_state["progress_pct"] = 0.0
             harvester_state["current_task"] = f"Starting {req.mode} harvest ({pages_desc}, source={source})..."
-            _append_log(f"Started {req.mode} harvest ({pages_desc}, source={source}).")
+            order = f", queue={selection.order}" if selection else ""
+            _append_log(f"Started {req.mode} harvest ({pages_desc}, source={source}{order}).")
             job_task = asyncio.create_task(
                 _run_job(_background_harvest_worker(req.mode, req.pages_per_spec, source, req.raid_difficulty))
             )
@@ -1153,3 +1166,31 @@ def create_app(
         app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
 
     return app
+
+
+def _resolve_queue_selection(req: StartHarvestRequest) -> QueueSelection | None:
+    raid_filters = (req.raid_zone_id, req.raid_boss_id, req.raid_specialization)
+    if req.mode == 'mplus_s5':
+        if any(value is not None for value in raid_filters):
+            raise HTTPException(status_code=422, detail='Raid filters apply only to raid harvests.')
+        if req.queue_order:
+            return QueueSelection('mplus', req.queue_order, zone_id=LEGION_MPLUS_ZONE_ID,
+                                  partition=LEGION_MPLUS_S5_PARTITION)
+        return None
+
+    if req.raid_zone_id is not None and req.raid_zone_id not in LEGION_RAIDS:
+        raise HTTPException(status_code=422, detail='Unknown Legion raid.')
+    if req.raid_boss_id is not None:
+        raids = [raid for zone, raid in LEGION_RAIDS.items()
+                 if req.raid_zone_id is None or req.raid_zone_id == zone]
+        if not any(req.raid_boss_id in raid['bosses'] for raid in raids):
+            raise HTTPException(status_code=422, detail='The boss does not belong to the selected raid.')
+    if req.raid_specialization is not None and not any(
+            req.raid_specialization == (cls, spec) for cls, spec, _ in LEGION_SPECS):
+        raise HTTPException(status_code=422, detail='Unknown Legion specialization.')
+    if req.raid_difficulty and req.raid_difficulty not in LEGION_RAID_DIFFICULTIES:
+        raise HTTPException(status_code=422, detail='Unknown raid difficulty.')
+    if not (any(value is not None for value in raid_filters) or req.raid_difficulty or req.queue_order):
+        return None
+    return QueueSelection('raid', req.queue_order or 'fifo', req.raid_zone_id, req.raid_boss_id,
+                          req.raid_difficulty or None, req.raid_specialization)

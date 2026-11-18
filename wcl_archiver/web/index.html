@@ -178,19 +178,42 @@
           <label>Pages per Spec (<strong>default 2</strong>; 0 = all available pages):
             <input type="number" id="harvest-pages" value="2" min="0" max="1000" style="width: 90px; margin-left: 6px;" />
           </label>
-          <label>Raid Difficulty:
-            <select id="harvest-raid-difficulty" style="margin-left: 6px;">
-              <option value="0" selected>All (Mythic + Heroic + Normal + LFR)</option>
-              <option value="5">Mythic Only</option>
-              <option value="4">Heroic Only</option>
-              <option value="3">Normal Only</option>
-              <option value="1">LFR Only</option>
+          <label>Queue order
+            <select id="harvest-queue-order">
+              <option value="fifo">FIFO (oldest queued first)</option>
+              <option value="random">Random</option>
             </select>
           </label>
+        </div>
+        <fieldset class="worker-settings">
+          <legend>Raid filters</legend>
+          <div class="filter-bar">
+            <label>Raid
+              <select id="harvest-raid"><option value="">All raids</option></select>
+            </label>
+            <label>Boss
+              <select id="harvest-raid-boss"><option value="">All bosses</option></select>
+            </label>
+            <label>Specialization
+              <select id="harvest-raid-spec"><option value="">All specializations</option></select>
+            </label>
+            <label>Difficulty
+              <select id="harvest-raid-difficulty" style="margin-left: 6px;">
+                <option value="0" selected>All (Mythic + Heroic + Normal + LFR)</option>
+                <option value="5">Mythic Only</option>
+                <option value="4">Heroic Only</option>
+                <option value="3">Normal Only</option>
+                <option value="1">LFR Only</option>
+              </select>
+            </label>
+          </div>
+        </fieldset>
+        <div class="filter-bar">
           <button id="btn-harvest-mplus" class="btn-primary">Start Mythic+ Season 5 (7.3.5) Harvest</button>
-          <button id="btn-harvest-raids" class="btn-primary">Start All 5 Legion Raids Harvest</button>
+          <button id="btn-harvest-raids" class="btn-primary">Start raid harvest</button>
           <button id="btn-harvest-stop" class="nav-btn">Stop Harvester</button>
         </div>
+        <div id="harvest-active-queue" class="worker-settings-note"></div>
         <fieldset class="worker-settings">
           <legend>Worker limits</legend>
           <div class="worker-settings-grid">
@@ -275,6 +298,6 @@
   </main>
 
   <script src="/replay2d.js?v=6"></script>
-  <script src="/app.js?v=15"></script>
+  <script src="/app.js?v=16"></script>
 </body>
 </html>
