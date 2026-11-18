@@ -55,19 +55,27 @@ class ImportReportRequest(BaseModel):
     rankings_source: str = "browser"
 
 
-DownloadConcurrency = conint(strict=True, ge=1)
+WorkerCount = conint(strict=True, ge=0)
 
 
 class HarvesterSettingsRequest(BaseModel):
-    download_concurrency: DownloadConcurrency
+    download_concurrency: WorkerCount = 0
+    browser_download_concurrency: WorkerCount = 0
+    browser_request_concurrency: WorkerCount = 0
+    report_workers: WorkerCount = 0
+    scan_concurrency: WorkerCount = 0
+    pack_workers: WorkerCount = 0
+    processing_concurrency: WorkerCount = 0
+
+    def worker_updates(self) -> dict[str, int]:
+        return self.model_dump(include=set(HarvesterSettingsRequest.model_fields), exclude_unset=True)
 
 
-class StartHarvestRequest(BaseModel):
+class StartHarvestRequest(HarvesterSettingsRequest):
     mode: str = "mplus_s5"
     pages_per_spec: int = 2
     rankings_source: str = "browser"
     raid_difficulty: int = 0
-    download_concurrency: Optional[DownloadConcurrency] = None
 
 
 def create_app(
@@ -80,13 +88,28 @@ def create_app(
     data_dir.mkdir(parents=True, exist_ok=True)
     settings_path = data_dir / 'harvester_settings.json'
     settings_error = ''
+    overrides: dict[str, int] = {}
     try:
         saved_settings = json.loads(settings_path.read_text(encoding='utf-8'))
-        cfg.download_concurrency = HarvesterSettingsRequest.model_validate(saved_settings).download_concurrency
+        overrides = HarvesterSettingsRequest.model_validate(saved_settings).worker_updates()
     except FileNotFoundError:
         pass
     except (ValueError, TypeError, OSError) as exc:
         settings_error = f'Invalid harvester settings; using {cfg.download_concurrency} download workers: {exc}'
+
+    def resolve_workers(values):
+        download = values.get('download_concurrency', cfg.download_concurrency)
+        return {
+            'download_concurrency': download,
+            'browser_download_concurrency': values.get('browser_download_concurrency', download),
+            'browser_request_concurrency': values.get('browser_request_concurrency', 2 * download),
+            'report_workers': values.get('report_workers', download),
+            'scan_concurrency': values.get('scan_concurrency', cfg.scan_concurrency),
+            'pack_workers': values.get('pack_workers', cfg.pack_workers),
+            'processing_concurrency': values.get('processing_concurrency', cfg.processing_concurrency),
+        }
+
+    workers = resolve_workers(overrides)
     index_db = IndexDB(data_dir / "index.db")
     master_db = MasterDictDB(data_dir / "master_dict.db")
     auth_manager = WCLAuthManager(data_dir / "auth_session.json")
@@ -102,10 +125,12 @@ def create_app(
         master_db=master_db,
         protocol_client=protocol_client,
         zstd_level=cfg.zstd_level,
-        download_concurrency=cfg.download_concurrency,
-        pack_workers=cfg.pack_workers,
-        processing_concurrency=cfg.processing_concurrency,
-        scan_concurrency=cfg.scan_concurrency,
+        download_concurrency=workers['download_concurrency'],
+        browser_download_concurrency=workers['browser_download_concurrency'],
+        report_workers=workers['report_workers'],
+        pack_workers=workers['pack_workers'],
+        processing_concurrency=workers['processing_concurrency'],
+        scan_concurrency=workers['scan_concurrency'],
         raw_archive=raw_archive,
     )
     harvester_logs: List[str] = []
@@ -134,25 +159,40 @@ def create_app(
 
     settings_lock = asyncio.Lock()
 
-    async def _apply_download_concurrency(value: int) -> None:
+    async def _apply_worker_settings(updates: dict[str, int]) -> None:
+        nonlocal workers
+        if not updates:
+            return
         async with settings_lock:
+            # The old single-field file has already been expanded on load.
+            updated = {**workers, **updates}
             temp_path = None
             try:
                 with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=data_dir,
                                                  prefix='.harvester_settings-', suffix='.tmp', delete=False) as handle:
                     temp_path = Path(handle.name)
-                    json.dump({'download_concurrency': value}, handle)
+                    json.dump(updated, handle)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temp_path, settings_path)
             finally:
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
-            harvester.download_concurrency = value
+            old = workers
+            workers = updated
+            for attr, value in updated.items():
+                if attr != 'browser_request_concurrency':
+                    setattr(harvester, attr, value)
+            harvester.wake_workers()
             for reference in (browser_client_ref, hybrid_browser_ref):
-                if reference['instance'] is not None:
-                    await reference['instance'].set_request_concurrency(2 * value)
-            _append_log(f'Download workers set to {value}; browser JSON request ceiling {2 * value}.')
+                browser = reference['instance']
+                if browser is not None:
+                    browser.scan_concurrency = updated['scan_concurrency']
+                    if old['browser_request_concurrency'] != updated['browser_request_concurrency']:
+                        await browser.set_request_concurrency(updated['browser_request_concurrency'])
+            changes = [f'{name}={value}' for name, value in updated.items() if value != old[name]]
+            if changes:
+                _append_log('Worker limits updated: ' + ', '.join(changes))
 
     def _on_browser_status(b_state: str, b_msg: str) -> None:
         prev_state = harvester_state.get("browser_state")
@@ -168,8 +208,8 @@ def create_app(
                 profile_dir=data_dir / "browser_profile",
                 on_status=_on_browser_status,
                 should_stop=lambda: not harvester_state["running"],
-                max_concurrent_requests=2 * harvester.download_concurrency,
-                scan_concurrency=cfg.scan_concurrency,
+                max_concurrent_requests=workers['browser_request_concurrency'],
+                scan_concurrency=workers['scan_concurrency'],
                 raw_archive=raw_archive,
             )
         return browser_client_ref["instance"]
@@ -179,8 +219,8 @@ def create_app(
             hybrid_browser_ref['instance'] = BrowserClient(
                 profile_dir=data_dir / 'browser_profile', on_status=_on_browser_status,
                 should_stop=lambda: not harvester_state['running'],
-                max_concurrent_requests=2 * harvester.download_concurrency,
-                scan_concurrency=cfg.scan_concurrency, raw_archive=hybrid_browser_archive)
+                max_concurrent_requests=workers['browser_request_concurrency'],
+                scan_concurrency=workers['scan_concurrency'], raw_archive=hybrid_browser_archive)
         return hybrid_browser_ref['instance']
 
     def _select_collection_client(source):
@@ -869,7 +909,8 @@ def create_app(
             **harvester.get_runtime_stats(),
             **protocol_client.get_quota_status(),
             'download_concurrency': harvester.download_concurrency,
-            'browser_request_concurrency': 2 * harvester.download_concurrency,
+            'browser_request_concurrency': workers['browser_request_concurrency'],
+            'worker_settings': dict(workers),
             'pack_workers': harvester.pack_workers,
             'hybrid_strict': harvester_state['rankings_source'] == 'hybrid',
             'hybrid_strategy': 'selective' if harvester_state['rankings_source'] == 'hybrid' else None,
@@ -883,7 +924,7 @@ def create_app(
 
     @app.post('/api/harvester/settings')
     async def post_harvester_settings(req: HarvesterSettingsRequest) -> Dict[str, Any]:
-        await _apply_download_concurrency(req.download_concurrency)
+        await _apply_worker_settings(req.worker_updates())
         return await get_harvester_status()
 
     @app.post("/api/browser/open")
@@ -980,7 +1021,7 @@ def create_app(
 
                     while harvester_state["running"]:
                         harvester_state["current_task"] = (
-                            f"Unarchiving & packing queued fights ({harvester.download_concurrency}x DL, "
+                            f"Unarchiving & packing queued fights ({harvester._download_worker_limit()}x DL, "
                             f"{harvester.pack_workers}x CPU)..."
                         )
                         packed = await harvester.drain_queue_batch(
@@ -1070,8 +1111,7 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid harvest mode")
         source = req.rankings_source or harvester_state.get('rankings_source', 'browser')
         harvester.client = _select_collection_client(source)
-        if req.download_concurrency is not None:
-            await _apply_download_concurrency(req.download_concurrency)
+        await _apply_worker_settings(req.worker_updates())
         index_db.retry_failed_work()
         if not harvester_state["running"]:
             source = req.rankings_source or harvester_state.get("rankings_source", "browser")

@@ -20,6 +20,7 @@ from wcl_archiver.config import (
 from wcl_archiver.db.schema import IndexDB, MasterDictDB
 from wcl_archiver.parser.combat_state_machine import CombatStateMachine
 from wcl_archiver.wcl_client.protocol_parser import WCLProtocolClient
+from wcl_archiver.wcl_client.browser_client import BrowserClient
 from wcl_archiver.wcl_client.async_tasks import run_owned_thread
 
 
@@ -105,11 +106,12 @@ class HarvesterPipeline:
         scan_concurrency: int = 1,
         raw_archive=None,
         processing_concurrency: int = 2,
+        browser_download_concurrency: Optional[int] = None,
+        report_workers: Optional[int] = None,
     ):
         self.processing_concurrency = int(processing_concurrency)
-        if self.processing_concurrency < 1:
-            raise ValueError('processing_concurrency must be positive')
-        self._processing_slots = asyncio.Semaphore(self.processing_concurrency)
+        if self.processing_concurrency < 0:
+            raise ValueError('processing_concurrency cannot be negative')
         self._processing_waiting = 0
         self._processing_active = 0
         self._packing_active: set = set()
@@ -120,10 +122,13 @@ class HarvesterPipeline:
         self.client = protocol_client
         self.raw_archive = raw_archive
         self.zstd_level = int(zstd_level)
-        self.download_concurrency = max(1, int(download_concurrency))
+        self.download_concurrency = max(0, int(download_concurrency))
+        self.browser_download_concurrency = browser_download_concurrency
+        self.report_workers = report_workers
         default_pack = 4
-        self.pack_workers = max(1, int(pack_workers if pack_workers is not None else default_pack))
-        self.scan_concurrency = max(1, int(scan_concurrency))
+        self.pack_workers = max(0, int(pack_workers if pack_workers is not None else default_pack))
+        self.scan_concurrency = max(0, int(scan_concurrency))
+        self._scan_active = 0
         self._master_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._master_cache_limit = 128
         self._master_inflight: Dict[str, asyncio.Task[Dict[str, Any]]] = {}
@@ -132,7 +137,6 @@ class HarvesterPipeline:
         self._pack_executor: Optional[ThreadPoolExecutor] = None
         self.staging_store = StagingStore(self.data_dir)
         self._background_pack_tasks: List[asyncio.Task] = []
-        self._packing_claims: set = set()
         self._download_claims: set = set()
         self._unlinked_staging: Dict[str, Path] = {}
         self._packing_stop = False
@@ -142,6 +146,7 @@ class HarvesterPipeline:
         self._download_scheduler_task: Optional[asyncio.Task] = None
         self._continuous_downloads: Dict[int, Tuple[str, asyncio.Task]] = {}
         self._report_preparations: Dict[str, asyncio.Task] = {}
+        self._manual_report_preparing = False
         self._download_wakeup: Optional[asyncio.Event] = None
         self._download_progress: Optional[asyncio.Event] = None
         self._download_completed = 0
@@ -160,6 +165,22 @@ class HarvesterPipeline:
         self._db_reads = 0
         self._download_stop = False
 
+    @property
+    def browser_worker_limit(self) -> int:
+        return self.download_concurrency if self.browser_download_concurrency is None else self.browser_download_concurrency
+
+    @property
+    def report_worker_limit(self) -> int:
+        return self.download_concurrency if self.report_workers is None else self.report_workers
+
+    def _download_worker_limit(self) -> int:
+        return self.browser_worker_limit if isinstance(self.client, BrowserClient) else self.download_concurrency
+
+    def wake_workers(self) -> None:
+        for event in (self._download_wakeup, self._browser_wakeup, self._packing_wakeup):
+            if event is not None:
+                event.set()
+
     def get_runtime_stats(self) -> Dict[str, int]:
         """In-memory counters only; safe for frequent status polling."""
         return {'processing_concurrency': self.processing_concurrency,
@@ -168,8 +189,10 @@ class HarvesterPipeline:
                 'packing_fights': len(self._packing_active),
                 'downloading_fights': len(self._download_claims),
                 'browser_enriching_fights': len(self._browser_active),
-                'browser_network_limit': self.download_concurrency,
-                'preparing_reports': len(self._report_preparations)}
+                'active_download_limit': self._download_worker_limit(),
+                'browser_network_limit': self.browser_worker_limit,
+                'scanning_workers': self._scan_active,
+                'preparing_reports': len(self._report_preparations) + int(self._manual_report_preparing)}
 
     def get_staging_stats(self) -> Dict[str, int]:
         return {**self.staging_store.stats(), **self.get_runtime_stats(),
@@ -180,19 +203,13 @@ class HarvesterPipeline:
     async def _processing_admission(self, active, uid, should_stop):
         # Claims prevent duplicate selection, while admission bounds resident
         # snapshot work. Stop abandons waiters without restoring their events.
-        acquired = False
         self._processing_waiting += 1
         try:
-            while not should_stop():
-                try:
-                    await asyncio.wait_for(self._processing_slots.acquire(), .1)
-                    acquired = True
-                    break
-                except asyncio.TimeoutError:
-                    continue
+            while not should_stop() and self._processing_active >= self.processing_concurrency:
+                await asyncio.sleep(.05)
         finally:
             self._processing_waiting -= 1
-        admitted = acquired and not should_stop()
+        admitted = not should_stop()
         if admitted:
             self._processing_active += 1
             active.add(uid)
@@ -202,8 +219,6 @@ class HarvesterPipeline:
             if admitted:
                 active.discard(uid)
                 self._processing_active -= 1
-            if acquired:
-                self._processing_slots.release()
 
     def _pack_log(self, message: str) -> None:
         if self._packing_progress:
@@ -329,8 +344,7 @@ class HarvesterPipeline:
             self._pack_log(message)
         if self._packing_stop:
             return
-        self._background_pack_tasks = [asyncio.create_task(self._background_pack_worker())
-                                       for _ in range(self.pack_workers)]
+        self._background_pack_tasks = [asyncio.create_task(self._background_pack_worker())]
         self._start_browser_enrichment()
 
     def _start_browser_enrichment(self):
@@ -343,8 +357,13 @@ class HarvesterPipeline:
             self._browser_manager_task = asyncio.create_task(manager())
 
     def _get_raw_executor(self):
+        limit = max(2, self.processing_concurrency)
+        if self._raw_executor is not None and limit != self._raw_executor_limit:
+            self._raw_executor.shutdown(wait=False)
+            self._raw_executor = None
         if self._raw_executor is None:
-            self._raw_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='wcl-raw')
+            self._raw_executor = ThreadPoolExecutor(max_workers=limit, thread_name_prefix='wcl-raw')
+            self._raw_executor_limit = limit
         return self._raw_executor
 
     async def _raw_io(self, func, *args, **kwargs):
@@ -590,8 +609,8 @@ class HarvesterPipeline:
                 # independent of the size of the other pool's on-disk backlog.
                 rows = await self._db_read(
                     self.index_db.get_browser_dispatch,
-                    self.download_concurrency + len(self._browser_claims)
-                    if len(network) < self.download_concurrency else 0,
+                    self.browser_worker_limit + len(self._browser_claims)
+                    if len(network) < self.browser_worker_limit else 0,
                     self.processing_concurrency + len(self._browser_claims)
                     if len(cpu) < self.processing_concurrency else 0)
                 if self._browser_stop:
@@ -601,7 +620,7 @@ class HarvesterPipeline:
                     if uid in self._browser_claims:
                         continue
                     if not row['browser_cpu']:
-                        pool, limit = network, self.download_concurrency
+                        pool, limit = network, self.browser_worker_limit
                     else:
                         pool, limit = cpu, self.processing_concurrency
                     if len(pool) >= limit:
@@ -636,12 +655,13 @@ class HarvesterPipeline:
                     if task.done():
                         task.result()
                         del self._browser_tasks[slot]
-                limit = self.download_concurrency
+                limit = self.browser_worker_limit
                 rows = await self._db_read(self.index_db.get_api_staged_fights,
                                            limit=limit + len(self._browser_tasks))
                 if self._browser_stop:
                     return
                 for row in rows:
+                    limit = self.browser_worker_limit
                     if row['fight_uid'] in self._browser_claims or len(self._browser_tasks) >= limit:
                         continue
                     fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
@@ -797,36 +817,47 @@ class HarvesterPipeline:
             self._pack_log(f'Packing failed for {code}#{fid}; durable raw retained: {exc}')
 
     async def _background_pack_worker(self) -> None:
-        while not self._packing_stop:
-            rows = await self._db_read(self.index_db.get_staged_fights, limit=self.pack_workers + 1,
-                                       _stop_when=lambda: self._packing_stop)
-            if self._packing_stop:
-                return
-            row = next((row for row in rows if row['fight_uid'] not in self._packing_claims), None)
-            if row is not None:
-                fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
-                if not fresh or fresh['status'] != 'STAGED' or fresh['staging_rel_path'] != row['staging_rel_path']:
-                    continue
-            if row is None:
-                if self._packing_finish:
-                    return
+        tasks = {}
+        try:
+            while not self._packing_stop:
                 self._packing_wakeup.clear()
+                for uid, task in list(tasks.items()):
+                    if task.done():
+                        del tasks[uid]
+                        task.result()
+                limit = self.pack_workers
+                rows = []
+                if limit > len(tasks):
+                    rows = await self._db_read(self.index_db.get_staged_fights, limit=limit,
+                                               _stop_when=lambda: self._packing_stop)
+                if self._packing_stop:
+                    return
+                for row in rows:
+                    uid = row['fight_uid']
+                    if uid in tasks or len(tasks) >= self.pack_workers:
+                        continue
+                    fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
+                    if fresh and fresh['status'] == 'STAGED' and fresh['staging_rel_path'] == row['staging_rel_path']:
+                        tasks[uid] = asyncio.create_task(self._run_pack_job(uid, row))
+                if self._packing_finish and not tasks and not rows:
+                    return
                 try:
                     await asyncio.wait_for(self._packing_wakeup.wait(), timeout=.25)
                 except asyncio.TimeoutError:
                     pass
-                continue
-            uid = row['fight_uid']
-            self._packing_claims.add(uid)
-            try:
-                async with self._processing_admission(
-                        self._packing_active, uid, lambda: self._packing_stop) as admitted:
-                    if not admitted:
-                        return
-                    await self._pack_admitted_staged(row)
-            finally:
-                self._packing_claims.discard(uid)
-                self._packing_wakeup.set()
+        finally:
+            results = await _finish_cleanup(asyncio.gather(*tasks.values(), return_exceptions=True))
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def _run_pack_job(self, uid, row):
+        self._packing_active.add(uid)
+        try:
+            await self._pack_admitted_staged(row)
+        finally:
+            self._packing_active.discard(uid)
+            self._packing_wakeup.set()
 
     async def _download_one_to_staging(self, row, worker_id, should_stop=None) -> int:
         uid = row['fight_uid']
@@ -879,23 +910,42 @@ class HarvesterPipeline:
 
     async def _download_rows_to_staging(self, pending, on_progress=None, should_stop=None) -> int:
         await self.start_background_packing(on_progress=on_progress)
-        rows = iter(pending)
-        async def worker(worker_id):
-            completed = 0
-            for row in rows:
-                completed += await self._download_one_to_staging(row, worker_id, should_stop)
-            return completed
-        tasks = [asyncio.create_task(worker(i + 1))
-                 for i in range(min(self.download_concurrency, len(pending)))]
+        async def download(row, worker_id):
+            return await self._download_one_to_staging(row, worker_id, should_stop)
+
+        return await self._run_finite_pool(
+            pending, self._download_worker_limit, download,
+            lambda: self._download_stop or (should_stop and should_stop()),
+        )
+
+    async def _run_finite_pool(self, items, get_limit, run, should_stop):
+        """Resize at job boundaries and retain ownership of every admitted job."""
+        pending = iter(items)
+        next_item = next(pending, None)
+        tasks = {}
+        completed = 0
         try:
-            return sum(await asyncio.gather(*tasks))
+            while (next_item is not None or tasks) and not should_stop():
+                for slot, task in list(tasks.items()):
+                    if task.done():
+                        del tasks[slot]
+                        completed += task.result() or 0
+                limit = get_limit()
+                for slot in range(1, min(limit, len(items)) + 1):
+                    if next_item is None or len(tasks) >= limit:
+                        break
+                    if slot not in tasks:
+                        tasks[slot] = asyncio.create_task(run(next_item, slot))
+                        next_item = next(pending, None)
+                if tasks:
+                    await asyncio.wait(tasks.values(), timeout=.1, return_when=asyncio.FIRST_COMPLETED)
+                elif next_item is not None:
+                    await asyncio.sleep(.1)
+            return completed
         finally:
-            # gather may deliver one child's cancellation before its siblings'
-            # shielded staging writes finish. Never let capture clear race them.
-            for task in tasks:
-                if not task.done() and not task.cancelling():
-                    task.cancel()
-            await _finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+            for task in tasks.values():
+                _cancel_once(task)
+            await _finish_cleanup(asyncio.gather(*tasks.values(), return_exceptions=True))
 
     async def _prepare_download_report(self, code):
         try:
@@ -921,11 +971,12 @@ class HarvesterPipeline:
                         del self._report_preparations[code]
                         self._download_progress.set()
 
-                limit = self.download_concurrency
+                limit = self._download_worker_limit()
                 ready = await self._db_read(self.index_db.get_unarchived_pending_fights,
                     limit=max(2 * limit, len(self._continuous_downloads) + limit))
                 if self._download_stop or (should_stop and should_stop()):
                     return
+                limit = self._download_worker_limit()
                 claimed = {uid for uid, task in self._continuous_downloads.values()}
                 free_slots = iter(i for i in range(1, limit + 1) if i not in self._continuous_downloads)
                 for row in ready:
@@ -938,13 +989,13 @@ class HarvesterPipeline:
 
                 # Bound metadata lookahead: keep enough prepared fights ahead
                 # without unarchiving the entire historical collection in RAM.
-                if len(ready) < 2 * limit and len(self._report_preparations) < limit:
+                if len(ready) < max(1, 2 * limit) and len(self._report_preparations) < self.report_worker_limit:
                     codes = await self._db_read(self.index_db.get_pending_reports_for_unarchive,
-                        limit=limit + len(self._report_preparations))
+                        limit=self.report_worker_limit + len(self._report_preparations))
                     if self._download_stop or (should_stop and should_stop()):
                         return
                     for code in codes:
-                        if len(self._report_preparations) >= limit:
+                        if len(self._report_preparations) >= self.report_worker_limit:
                             break
                         if code not in self._report_preparations:
                             self._report_preparations[code] = asyncio.create_task(self._prepare_download_report(code))
@@ -999,11 +1050,16 @@ class HarvesterPipeline:
         return [self.data_dir / row['file_rel_path'] for row in saved if row and row['status'] == 'PACKED']
 
     def _get_pack_executor(self) -> ThreadPoolExecutor:
+        limit = max(1, self.pack_workers)
+        if self._pack_executor is not None and limit != self._pack_executor_limit:
+            self._pack_executor.shutdown(wait=False)
+            self._pack_executor = None
         if self._pack_executor is None:
             self._pack_executor = ThreadPoolExecutor(
-                max_workers=self.pack_workers,
+                max_workers=limit,
                 thread_name_prefix="wclz-pack",
             )
+            self._pack_executor_limit = limit
         return self._pack_executor
 
     def close(self) -> None:
@@ -1061,27 +1117,23 @@ class HarvesterPipeline:
         if not codes:
             return 0
 
-        sem = asyncio.Semaphore(self.download_concurrency)
+        if self.report_worker_limit == 0:
+            return 0
 
-        async def _warm_one(code: str) -> bool:
-            if should_stop and should_stop():
+        async def _warm_one(code: str, _slot: int) -> bool:
+            try:
+                ok = await self.client.unarchive_report(code)
+            except Exception as exc:
+                self.index_db.mark_report_failed(code, str(exc))
                 return False
-            async with sem:
-                if should_stop and should_stop():
-                    return False
-                try:
-                    ok = await self.client.unarchive_report(code)
-                except Exception as exc:
-                    self.index_db.mark_report_failed(code, str(exc))
-                    return False
-                if ok:
-                    self.index_db.mark_report_unarchived(code, "UNARCHIVED")
-                    return True
-                self.index_db.mark_report_failed(code, "Unarchive request was not successful")
-                return False
+            if ok:
+                self.index_db.mark_report_unarchived(code, "UNARCHIVED")
+                return True
+            self.index_db.mark_report_failed(code, "Unarchive request was not successful")
+            return False
 
-        results = await asyncio.gather(*[_warm_one(code) for code in codes])
-        return sum(1 for r in results if r)
+        return await self._run_finite_pool(
+            codes, lambda: self.report_worker_limit, _warm_one, lambda: should_stop and should_stop())
 
     def _prepare_fight_payload(
         self,
@@ -1404,6 +1456,9 @@ class HarvesterPipeline:
         partition: int = 5,
     ) -> List[Path]:
         self.index_db.retry_failed_work(report_code=report_code)
+        while self.report_worker_limit == 0:
+            await asyncio.sleep(.1)
+        self._manual_report_preparing = True
         try:
             if not await self.client.unarchive_report(report_code):
                 raise RuntimeError("Unarchive request was not successful")
@@ -1411,6 +1466,8 @@ class HarvesterPipeline:
         except Exception as exc:
             self.index_db.mark_report_failed(report_code, str(exc))
             raise
+        finally:
+            self._manual_report_preparing = False
         target_fight_ids = set()
         for f in master.get("fights", []):
             boss_id = int(f.get("boss", 0) or 0)
@@ -1542,25 +1599,12 @@ class HarvesterPipeline:
                 should_stop=should_stop,
             )
 
-        work_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
-        for unit in units:
-            work_queue.put_nowait(unit)
-
-        num_workers = max(1, min(self.scan_concurrency, len(units)))
-        for _ in range(num_workers):
-            work_queue.put_nowait(None)
-
         scan_finished = asyncio.Event()
 
-        async def _scan_worker() -> None:
+        async def _scan_unit(unit, _slot) -> None:
             nonlocal enqueued, specs_done, pages_scanned
-            while True:
-                unit = await work_queue.get()
-                if unit is None:
-                    return
-                if should_stop and should_stop():
-                    continue
-
+            self._scan_active += 1
+            try:
                 zone_id = int(unit["zone_id"])
                 encounter_id = int(unit["encounter_id"])
                 encounter_slug = str(unit["encounter_slug"])
@@ -1779,6 +1823,9 @@ class HarvesterPipeline:
                 if on_progress:
                     on_progress({"specs_done": specs_done, "specs_total": specs_total})
 
+            finally:
+                self._scan_active -= 1
+
         async def _concurrent_drain_loop() -> None:
             while True:
                 if should_stop and should_stop():
@@ -1800,15 +1847,11 @@ class HarvesterPipeline:
                     await asyncio.sleep(0.5)
 
         async def _run_scans() -> None:
-            workers = [asyncio.create_task(_scan_worker()) for _ in range(num_workers)]
             try:
-                await asyncio.gather(*workers)
+                await self._run_finite_pool(units, lambda: self.scan_concurrency, _scan_unit,
+                                            lambda: should_stop and should_stop())
             finally:
                 scan_finished.set()
-                for worker in workers:
-                    if not worker.done():
-                        worker.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
 
         if concurrent_pack:
             tasks = [asyncio.create_task(_run_scans()), asyncio.create_task(_concurrent_drain_loop())]

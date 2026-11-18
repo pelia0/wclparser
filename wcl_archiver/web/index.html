@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>WCL Legion 7.3.5 Archiver &amp; Offline Viewer</title>
-  <link rel="stylesheet" href="/styles.css?v=5" />
+  <link rel="stylesheet" href="/styles.css?v=6" />
   <script>
     const whTooltips = { colorLinks: true, iconizeLinks: true, renameLinks: true };
   </script>
@@ -187,19 +187,28 @@
               <option value="1">LFR Only</option>
             </select>
           </label>
-          <label>Download workers:
-            <input type="number" id="harvest-download-threads" value="4" min="1" step="1" style="width: 90px; margin-left: 6px;" />
-          </label>
-          <button id="btn-apply-download-threads" class="nav-btn" type="button">Apply workers</button>
           <button id="btn-harvest-mplus" class="btn-primary">Start Mythic+ Season 5 (7.3.5) Harvest</button>
           <button id="btn-harvest-raids" class="btn-primary">Start All 5 Legion Raids Harvest</button>
           <button id="btn-harvest-stop" class="nav-btn">Stop Harvester</button>
         </div>
-        <div style="margin-top: 8px; font-size: 13px; color: #94a3b8;">
-          <span id="download-worker-summary">Loading worker and processing limits...</span>
-          <span id="download-settings-feedback" role="status" aria-live="polite" style="margin-left: 10px;"></span>
-          <div style="margin-top: 4px;">Apply changes without stopping discovery. Active downloads finish normally; free workers immediately take the next fight.</div>
-        </div>
+        <fieldset class="worker-settings">
+          <legend>Worker limits</legend>
+          <div class="worker-settings-grid">
+            <label>API downloads <input type="number" id="harvest-download-threads" min="0" step="1" disabled /></label>
+            <label>Browser downloads <input type="number" id="harvest-browser-workers" min="0" step="1" disabled /></label>
+            <label>Browser request limit <input type="number" id="harvest-browser-requests" min="0" step="1" disabled /></label>
+            <label>Report preparation <input type="number" id="harvest-report-workers" min="0" step="1" disabled /></label>
+            <label>Ranking scans <input type="number" id="harvest-scan-workers" min="0" step="1" disabled /></label>
+            <label>Browser data processing <input type="number" id="harvest-processing-workers" min="0" step="1" disabled /></label>
+            <label>Packing <input type="number" id="harvest-pack-workers" min="0" step="1" disabled /></label>
+          </div>
+          <div class="filter-bar">
+            <button id="btn-apply-download-threads" class="nav-btn" type="button" disabled>Apply workers</button>
+            <span id="download-settings-feedback" role="status" aria-live="polite"></span>
+          </div>
+          <div class="worker-settings-note">Set a limit to 0 to pause new work for that stage. Active tasks can finish.</div>
+          <div id="download-worker-summary" class="worker-settings-note"></div>
+        </fieldset>
         <div class="filter-bar" style="margin-top: 12px;">
           <input type="text" id="import-report-input" placeholder="Paste WCL Report URL or Code (e.g. aBcDeFg123)" style="min-width: 340px;" />
           <button id="btn-import-report" class="btn-primary">Import Single Report Now</button>
@@ -249,10 +258,11 @@
             <div style="margin-top: 5px;">
               Downloading: <span id="stat-downloading">0 / 4 workers</span> |
               Preparing reports: <span id="stat-preparing">0</span> |
+              Ranking scans: <span id="stat-scanning">0</span> |
               Browser downloads: <span id="stat-browser-enrichment">0 downloading</span> |
               Raw on disk: <span id="stat-staging">0 files / 0.00 MB</span> |
               Packing: <span id="stat-packing">0 / 4 workers</span> |
-              Shared processing: <span id="stat-processing">Loading...</span>
+              Browser data processing: <span id="stat-processing">Loading...</span>
               <div id="status-counter-freshness"></div>
             </div>
           </div>
@@ -265,6 +275,6 @@
   </main>
 
   <script src="/replay2d.js?v=6"></script>
-  <script src="/app.js?v=14"></script>
+  <script src="/app.js?v=15"></script>
 </body>
 </html>

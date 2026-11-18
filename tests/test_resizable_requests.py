@@ -16,7 +16,7 @@ async def test_live_resize_preserves_active_slots_and_waiters(tmp_path):
         cache = client._report_master_cache
         waiter = asyncio.create_task(limiter.acquire())
         await asyncio.sleep(0)
-        await client.set_request_concurrency(1)
+        await client.set_request_concurrency(0)
         assert client._req_sem is limiter
         assert client._nav_lock is nav and client._eval_cond is cond
         assert client._cooldown_until == 12345 and client._report_master_cache is cache
@@ -24,6 +24,9 @@ async def test_live_resize_preserves_active_slots_and_waiters(tmp_path):
         await asyncio.sleep(0)
         assert not waiter.done()
         limiter.release()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        await client.set_request_concurrency(1)
         await asyncio.wait_for(waiter, 1)
         waiting = asyncio.create_task(limiter.acquire())
         await asyncio.sleep(0)
@@ -45,7 +48,7 @@ async def test_live_resize_preserves_active_slots_and_waiters(tmp_path):
     await client._run_in_browser_loop(scenario())
 
 
-@pytest.mark.parametrize('invalid', [0, -1, True, 1.5, '2', None])
+@pytest.mark.parametrize('invalid', [-1, True, 1.5, '2', None])
 async def test_resize_rejects_invalid_before_mutation(tmp_path, invalid):
     client = BrowserClient(tmp_path, max_concurrent_requests=4)
     with pytest.raises((TypeError, ValueError)):

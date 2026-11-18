@@ -55,6 +55,9 @@ async def test_hybrid_client_selection_resize_and_shutdown(tmp_path, monkeypatch
             response=await client.post('/api/harvester/settings',json={'download_concurrency':32})
             assert response.json()['hybrid_strict'] is True
             assert response.json()['hybrid_strategy'] == 'selective'
+            assert resizes == []
+            response = await client.post('/api/harvester/settings', json={'browser_request_concurrency': 64})
+            assert response.json()['worker_settings']['download_concurrency'] == 32
             assert resizes==[(hybrids[0].browser_client,64)]
             assert starts==[], 'API scheduling must not wait for browser startup'
             await client.post('/api/harvester/stop')

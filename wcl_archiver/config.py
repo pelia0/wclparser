@@ -167,5 +167,5 @@ class AppConfig:
 
     def __post_init__(self):
         self.processing_concurrency = int(self.processing_concurrency)
-        if self.processing_concurrency < 1:
-            raise ValueError('processing_concurrency must be positive')
+        if self.processing_concurrency < 0:
+            raise ValueError('processing_concurrency cannot be negative')

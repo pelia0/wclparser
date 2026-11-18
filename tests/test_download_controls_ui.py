@@ -108,3 +108,27 @@ assert(fields['stat-processing'].textContent.includes('unavailable'));
 assert(fields['download-worker-summary'].textContent.includes('unavailable'));
 assert.equal(fields['api-retry-wait'].style.display,'none');
 ''')
+
+
+def test_independent_worker_inputs_submit_zero_and_show_paused_limits():
+    from test_stop_controls_ui import run_ui
+    run_ui(r'''
+const settings = { download_concurrency: 32, browser_download_concurrency: 9, browser_request_concurrency: 20,
+  report_workers: 3, scan_concurrency: 2, processing_concurrency: 7, pack_workers: 4 };
+const current = {...state, worker_settings: settings, active_download_limit: 32, packing_fights: 0};
+render(current);
+assert.equal(fields['harvest-browser-workers'].value, '9');
+fields['harvest-pack-workers'].value = '0';
+fields['harvest-pack-workers'].dataset.dirty = '1';
+render(current);
+assert.equal(fields['harvest-pack-workers'].value, '0');
+network = (url, options) => {
+  const saved = JSON.parse(options.body);
+  assert.deepEqual(saved, {...settings, pack_workers: 0});
+  return Promise.resolve(response({...current, worker_settings: saved, pack_workers: 0}));
+};
+await run('applyDownloadConcurrency()');
+assert.equal(fields['stat-packing'].textContent, '0 / 0 workers');
+assert.equal(fields['harvest-browser-workers'].value, '9');
+assert.equal(fields['harvest-pack-workers'].disabled, false);
+''')

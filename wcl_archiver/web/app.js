@@ -5,6 +5,16 @@ let replayPlayer = null;
 let fightsOffset = 0;
 const fightsPageSize = 100;
 let fightsRequest = 0;
+const workerFields = {
+  download_concurrency: "harvest-download-threads",
+  browser_download_concurrency: "harvest-browser-workers",
+  browser_request_concurrency: "harvest-browser-requests",
+  report_workers: "harvest-report-workers",
+  scan_concurrency: "harvest-scan-workers",
+  processing_concurrency: "harvest-processing-workers",
+  pack_workers: "harvest-pack-workers",
+};
+let independentWorkerSettings = false;
 let downloadSettingsSupported = false;
 let downloadSettingsApplying = false;
 let oauthPollingTimer = null;
@@ -134,11 +144,13 @@ async function initApp() {
   document.getElementById("btn-harvest-stop").addEventListener("click", stopHarvest);
   const applyDownloads = document.getElementById("btn-apply-download-threads");
   if (applyDownloads) applyDownloads.addEventListener("click", applyDownloadConcurrency);
-  const downloadThreads = document.getElementById("harvest-download-threads");
-  if (downloadThreads) downloadThreads.addEventListener("input", () => {
-    downloadThreads.dataset.dirty = "1";
-    downloadThreads.setCustomValidity("");
-  });
+  for (const id of Object.values(workerFields)) {
+    const input = document.getElementById(id);
+    if (input) input.addEventListener("input", () => {
+      input.dataset.dirty = "1";
+      input.setCustomValidity("");
+    });
+  }
   document.getElementById("btn-import-report").addEventListener("click", importSingleReport);
   const btnBrowserOpen = document.getElementById("btn-browser-open");
   if (btnBrowserOpen) btnBrowserOpen.addEventListener("click", openBrowserWindow);
@@ -370,28 +382,33 @@ function renderHarvesterError() {
 function renderHarvesterState(st) {
   lastHarvesterState = st;
   renderHarvesterControls();
-  const downloadThreads = document.getElementById("harvest-download-threads");
   const applyDownloads = document.getElementById("btn-apply-download-threads");
   const settingsFeedback = document.getElementById("download-settings-feedback");
   downloadSettingsSupported = Number.isInteger(st.download_concurrency);
-  if (downloadThreads) {
-    downloadThreads.disabled = !downloadSettingsSupported;
-    if (downloadSettingsSupported && document.activeElement !== downloadThreads && !downloadThreads.dataset.dirty) {
-      downloadThreads.value = String(st.download_concurrency);
+  independentWorkerSettings = Boolean(st.worker_settings);
+  for (const [key, id] of Object.entries(workerFields)) {
+    const input = document.getElementById(id);
+    if (!input) continue;
+    const value = independentWorkerSettings ? st.worker_settings[key] : key === "download_concurrency" ? st[key] : undefined;
+    input.disabled = !Number.isInteger(value) || downloadSettingsApplying;
+    if (Number.isInteger(value) && document.activeElement !== input && !input.dataset.dirty) {
+      input.value = String(value);
     }
   }
   if (applyDownloads) applyDownloads.disabled = downloadSettingsApplying || !downloadSettingsSupported;
   if (!downloadSettingsSupported && settingsFeedback) {
-    settingsFeedback.textContent = "Restart server to enable download controls.";
+    settingsFeedback.textContent = "Restart server to enable worker controls.";
   }
   const workerSummary = document.getElementById("download-worker-summary");
   if (workerSummary && downloadSettingsSupported) {
     const processing = Number.isInteger(st.processing_concurrency)
-      ? `${st.processing_concurrency} shared processing slots (planning, merge, packing)`
+      ? `${st.processing_concurrency} ${independentWorkerSettings ? 'browser processing slots' : 'shared processing slots'}`
       : "Processing cap unavailable on this server";
     const browserSlots = st.hybrid_strict && Number.isInteger(st.browser_network_limit)
       ? ` · ${st.browser_network_limit} browser download slots` : "";
-    workerSummary.textContent = `${st.download_concurrency} ${st.hybrid_strict ? 'API workers' : 'downloads'}${browserSlots} · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers · ${processing}`;
+    workerSummary.textContent = independentWorkerSettings
+      ? ""
+      : `${st.download_concurrency} ${st.hybrid_strict ? 'API workers' : 'downloads'}${browserSlots} · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers · ${processing}`;
   }
   const processing = document.getElementById("stat-processing");
   if (processing) processing.textContent = Number.isInteger(st.processing_concurrency)
@@ -404,7 +421,7 @@ function renderHarvesterState(st) {
   const staging = document.getElementById("stat-staging");
   if (staging) staging.textContent = `${st.staging_files || 0} files / ${(Number(st.staging_bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
   const packing = document.getElementById("stat-packing");
-  if (packing) packing.textContent = `${st.packing_fights || 0} / ${st.pack_workers || 4} workers`;
+  if (packing) packing.textContent = `${st.packing_fights || 0} / ${st.pack_workers ?? 4} workers`;
   const apiWait = document.getElementById("api-quota-wait");
   if (apiWait) {
     const seconds = ["api", "hybrid"].includes(st.rankings_source) ? Number(st.api_quota_wait_seconds || 0) : 0;
@@ -430,10 +447,15 @@ function renderHarvesterState(st) {
   if (browserEnrichment) browserEnrichment.textContent = `${st.browser_enriching_fights || 0} downloading / ${st.browser_network_limit ?? '—'} slots · ${st.browser_disk_ready || 0} ready for processing · ${st.api_staged_fights || 0} API staged`;
   const downloading = document.getElementById("stat-downloading");
   if (downloading) downloading.textContent = Number.isInteger(st.downloading_fights)
-    ? `${st.downloading_fights} / ${st.download_concurrency || 4} workers`
+    ? `${st.downloading_fights} / ${st.active_download_limit ?? st.download_concurrency ?? 4} workers`
     : "Restart server for active count";
   const preparing = document.getElementById("stat-preparing");
-  if (preparing) preparing.textContent = Number.isInteger(st.preparing_reports) ? String(st.preparing_reports) : "—";
+  if (preparing) preparing.textContent = independentWorkerSettings
+    ? `${st.preparing_reports ?? 0} / ${st.worker_settings.report_workers}`
+    : Number.isInteger(st.preparing_reports) ? String(st.preparing_reports) : "—";
+  const scanning = document.getElementById("stat-scanning");
+  if (scanning) scanning.textContent = independentWorkerSettings
+    ? `${st.scanning_workers ?? 0} / ${st.worker_settings.scan_concurrency}` : "—";
   renderHarvesterError();
 
   const bState = st.browser_state || "not_started";
@@ -610,9 +632,9 @@ async function closeBrowserWindow() {
 }
 
 async function startHarvest(mode) {
-  if (harvesterIsStopping()) return;
-  const downloadConcurrency = downloadSettingsSupported ? readDownloadConcurrency() : undefined;
-  if (downloadConcurrency === null) return;
+  if (harvesterIsStopping() || downloadSettingsApplying) return;
+  const workerSettings = downloadSettingsSupported ? readWorkerSettings() : {};
+  if (workerSettings === null) return;
   const rawVal = document.getElementById("harvest-pages").value.trim();
   const pages = rawVal === "" ? 2 : Math.max(0, parseInt(rawVal, 10));
   const rankings_source = getSelectedSourceMode();
@@ -626,7 +648,7 @@ async function startHarvest(mode) {
       pages_per_spec: isNaN(pages) ? 2 : pages,
       rankings_source,
       raid_difficulty,
-      download_concurrency: downloadConcurrency,
+      ...workerSettings,
     }),
   });
   const st = await res.json();
@@ -636,27 +658,39 @@ async function startHarvest(mode) {
     banner.textContent = st.detail || "Unable to start harvest";
     return;
   }
-  const threads = document.getElementById("harvest-download-threads");
-  if (threads) threads.dataset.dirty = "";
+  clearWorkerEdits();
   renderHarvesterState(st);
 }
 
-function readDownloadConcurrency() {
-  const input = document.getElementById("harvest-download-threads");
-  const raw = input ? input.value.trim() : "";
-  const value = Number(raw);
-  const valid = /^\d+$/.test(raw) && Number.isSafeInteger(value) && value >= 1;
-  if (input) {
-    input.setCustomValidity(valid ? "" : "Enter a positive whole number.");
-    if (!valid) input.reportValidity();
+function clearWorkerEdits() {
+  for (const id of Object.values(workerFields)) {
+    const input = document.getElementById(id);
+    if (input) input.dataset.dirty = "";
   }
-  return valid ? value : null;
+}
+
+function readWorkerSettings() {
+  const keys = independentWorkerSettings ? Object.keys(workerFields) : ["download_concurrency"];
+  const settings = {};
+  for (const key of keys) {
+    const input = document.getElementById(workerFields[key]);
+    const raw = input?.value.trim() ?? "";
+    const value = Number(raw);
+    const valid = /^\d+$/.test(raw) && Number.isSafeInteger(value) && value >= (independentWorkerSettings ? 0 : 1);
+    if (input) {
+      input.setCustomValidity(valid ? "" : independentWorkerSettings ? "Enter a whole number of 0 or more." : "Enter a positive whole number.");
+      if (!valid) input.reportValidity();
+    }
+    if (!valid) return null;
+    settings[key] = value;
+  }
+  return settings;
 }
 
 async function applyDownloadConcurrency() {
   if (!downloadSettingsSupported || downloadSettingsApplying) return;
-  const value = readDownloadConcurrency();
-  if (value === null) return;
+  const settings = readWorkerSettings();
+  if (settings === null) return;
   const button = document.getElementById("btn-apply-download-threads");
   const feedback = document.getElementById("download-settings-feedback");
   downloadSettingsApplying = true;
@@ -665,13 +699,15 @@ async function applyDownloadConcurrency() {
   try {
     const response = await fetch("/api/harvester/settings", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ download_concurrency: value }),
+      body: JSON.stringify(settings),
     });
     const state = await response.json();
     if (!response.ok) throw new Error(typeof state.detail === "string" ? state.detail : "Unable to apply download workers");
-    document.getElementById("harvest-download-threads").dataset.dirty = "";
+    invalidateHarvesterStatus();
+    clearWorkerEdits();
+    if (feedback) feedback.textContent = "Worker limits saved and applied.";
+    downloadSettingsApplying = false;
     renderHarvesterState(state);
-    if (feedback) feedback.textContent = "Applied. Free download slots use this worker count.";
   } catch (error) {
     if (feedback) feedback.textContent = String(error.message || error);
   } finally {

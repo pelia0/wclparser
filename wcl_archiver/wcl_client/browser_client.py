@@ -311,7 +311,7 @@ class BrowserClient:
         self.on_status = on_status
         self.should_stop = should_stop
         self.cdp_port = int(cdp_port)
-        self.max_concurrent_requests = max(1, int(max_concurrent_requests))
+        self.max_concurrent_requests = max(0, int(max_concurrent_requests))
         self.scan_concurrency = max(1, int(scan_concurrency))
         self.raw_archive = raw_archive
 
@@ -354,8 +354,11 @@ class BrowserClient:
         return self._req_sem, self._nav_lock, self._eval_cond
 
     async def set_request_concurrency(self, limit: int) -> None:
-        if type(limit) is not int or limit < 1:
-            raise ValueError("Request concurrency must be a positive integer")
+        if type(limit) is not int or limit < 0:
+            raise ValueError("Request concurrency must be a non-negative integer")
+        if self._bg_loop is None:
+            self.max_concurrent_requests = limit
+            return
         async def resize():
             limiter, _, _ = self._ensure_bg_sync()
             await limiter.resize(limit)
@@ -625,10 +628,14 @@ class BrowserClient:
             return None
         self._ensure_bg_sync()
         assert self._start_lock is not None
-        if self._scan_tab_queue is not None:
+        if self._scan_tab_queue is not None and len(self._scan_tabs) >= self.scan_concurrency:
             return self._scan_tab_queue
         async with self._start_lock:
             if self._scan_tab_queue is not None:
+                while len(self._scan_tabs) < self.scan_concurrency:
+                    tab = await self._context.new_page()
+                    self._scan_tabs.append(tab)
+                    self._scan_tab_queue.put_nowait(tab)
                 return self._scan_tab_queue
             q: asyncio.Queue[Any] = asyncio.Queue()
             existing = [p for p in getattr(self._context, "pages", []) if p is not self._page]
@@ -963,12 +970,12 @@ class BrowserClient:
         for _ in range(7):
             await self._wait_for_cooldown()
 
-            await self._ensure_on_wcl_origin()
-            seq_before = self._challenge_cleared_seq
             retry_after_raw = ""
-            try:
-                async with self._eval_shared():
-                    async with req_sem:
+            async with req_sem:
+                await self._ensure_on_wcl_origin()
+                seq_before = self._challenge_cleared_seq
+                try:
+                    async with self._eval_shared():
                         await self._wait_for_cooldown()
                         res = await self._page.evaluate(
                             """async ({url, method}) => {
@@ -991,9 +998,9 @@ class BrowserClient:
                         status = int(res.get("status", 0))
                         text = str(res.get("text", ""))
                         retry_after_raw = str(res.get("retryAfter", "") or "")
-            except Exception as exc:
-                status = 0
-                text = str(exc)
+                except Exception as exc:
+                    status = 0
+                    text = str(exc)
 
             capture_id = None
             if disk_work is None and self.raw_archive is not None and status:

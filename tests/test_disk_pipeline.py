@@ -51,6 +51,91 @@ async def until(predicate):
     await asyncio.wait_for(wait(), 5)
 
 
+async def test_zero_pack_workers_pause_new_packs_without_pausing_downloads(tmp_path, monkeypatch):
+    db, pipeline, client = setup(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    packed = []
+    original = pipeline._pack_staged_cpu
+
+    def pack(path, row):
+        packed.append(row['fight_id'])
+        started.set()
+        assert release.wait(5)
+        return original(path, row)
+
+    monkeypatch.setattr(pipeline, '_pack_staged_cpu', pack)
+    pipeline.processing_concurrency = 0
+    enqueue(db, 1)
+    enqueue(db, 2)
+    try:
+        assert await pipeline.drain_queue_batch(batch_size=1) == 1
+        await until(started.is_set)
+        pipeline.pack_workers = 0
+        pipeline.wake_workers()
+        assert await pipeline.drain_queue_batch(batch_size=1) == 1
+        release.set()
+        await until(lambda: db.get_fight('Report', 1)['status'] == 'PACKED')
+        assert db.get_fight('Report', 2)['status'] == 'STAGED'
+        assert packed == [1]
+        pipeline.pack_workers = 2
+        pipeline.wake_workers()
+        await until(lambda: db.get_fight('Report', 2)['status'] == 'PACKED')
+        assert packed == [1, 2]
+        assert client.downloads == [('Report', 1), ('Report', 2)]
+    finally:
+        release.set()
+        await pipeline.finish_background_packing(cancel=True)
+        pipeline.close()
+
+
+async def test_paused_scans_leave_ready_fights_running_and_resume_live(tmp_path, monkeypatch):
+    db, pipeline, client = setup(tmp_path)
+    pipeline.scan_concurrency = 0
+    first_scan = asyncio.Event()
+    enqueue(db, 1)
+
+    async def rankings(**kwargs):
+        first_scan.set()
+        return []
+
+    monkeypatch.setattr(pipeline, '_fetch_rankings_refs', rankings)
+    unit = dict(zone_id=9, encounter_id=42, encounter_slug='boss', partition=5,
+                difficulty=0, content_type='mplus', class_name='Mage', spec_name='Fire',
+                role='dps', label_prefix='M+', title='Boss')
+    scan = asyncio.create_task(pipeline._run_discovery_pool([unit], pack_as_discovered=True))
+    try:
+        await until(lambda: db.get_fight('Report', 1)['status'] == 'PACKED')
+        assert not first_scan.is_set() and not scan.done()
+        pipeline.scan_concurrency = 1
+        await asyncio.wait_for(scan, 5)
+        assert first_scan.is_set()
+        assert client.downloads == [('Report', 1)]
+    finally:
+        scan.cancel()
+        await asyncio.gather(scan, return_exceptions=True)
+        await pipeline.finish_background_packing(cancel=True)
+        pipeline.close()
+
+
+async def test_paused_api_downloads_allow_report_preparation_then_resume(tmp_path):
+    db, pipeline, client = setup(tmp_path)
+    pipeline.download_concurrency = 0
+    pipeline.report_workers = 1
+    db.enqueue_fight('Report', 1, 'mplus', 9, 5, 42, 'boss')
+    try:
+        await pipeline.drain_queue_batch(continuous=True)
+        await until(lambda: bool(db.get_unarchived_pending_fights(report_code='Report')))
+        assert client.downloads == []
+        pipeline.download_concurrency = 1
+        pipeline.report_workers = 0
+        pipeline.wake_workers()
+        await until(lambda: db.get_fight('Report', 1)['status'] == 'PACKED')
+        assert client.downloads == [('Report', 1)]
+    finally:
+        await pipeline.finish_background_packing(cancel=True)
+        pipeline.close()
+
+
 async def test_blocked_pack_does_not_block_next_download_batch(tmp_path, monkeypatch):
     db, pipeline, client = setup(tmp_path)
     entered, release = threading.Event(), threading.Event()

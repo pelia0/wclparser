@@ -15,12 +15,12 @@ from wcl_archiver.config import AppConfig
 from wcl_archiver.harvester.pipeline import HarvesterPipeline
 
 
-def test_positive_processing_budget(tmp_path):
+def test_non_negative_processing_budget(tmp_path):
     assert AppConfig().processing_concurrency == 2
     with pytest.raises(ValueError, match='processing_concurrency'):
-        HarvesterPipeline(tmp_path, None, None, None, processing_concurrency=0)
+        HarvesterPipeline(tmp_path, None, None, None, processing_concurrency=-1)
     with pytest.raises(ValueError, match='processing_concurrency'):
-        AppConfig(processing_concurrency=0)
+        AppConfig(processing_concurrency=-1)
 
 
 def test_lean_load_preserves_exact_archive_without_event_view(tmp_path, monkeypatch):
@@ -77,9 +77,9 @@ async def test_recovery_and_unlinked_restore_do_not_materialize_events(tmp_path,
         pipeline.close()
 
 
-async def test_shared_budget_waiters_stop_without_loading_and_api_progresses(tmp_path, monkeypatch):
+async def test_browser_budget_waiters_stop_without_loading_and_api_progresses(tmp_path, monkeypatch):
     db, pipeline, client = setup(tmp_path, concurrency=8)
-    # One browser and one pack occupy the default shared budget of two.
+    # Packing owns a separate pool and cannot consume a browser processing slot.
     first = await stage_pending(db, pipeline, client, 1)
     full = await stage_full(pipeline, client, first)
     pipeline.staging_store.delete(first)
@@ -102,8 +102,6 @@ async def test_shared_budget_waiters_stop_without_loading_and_api_progresses(tmp
     try:
         await pipeline.start_background_packing()
         await until(entered.is_set)
-        # Establish the pack admission before exposing browser rows. Otherwise
-        # two browser workers may legitimately take both slots first.
         assert pipeline.get_runtime_stats()['packing_fights'] == 1
         assert loaded == []  # the linked snapshot only needs a header check at startup
         browser_paths = []
@@ -113,14 +111,14 @@ async def test_shared_budget_waiters_stop_without_loading_and_api_progresses(tmp
             db.mark_fight_api_staged('Report', fid, path.relative_to(tmp_path).as_posix())
         pipeline._browser_wakeup.set()
         await asyncio.wait_for(client.entered.wait(), 2)
-        await until(lambda: pipeline.get_runtime_stats()['processing_waiting'] >= 2)
+        await until(lambda: pipeline.get_runtime_stats()['processing_waiting'] >= 1 and len(loaded) == 2)
         stats = pipeline.get_runtime_stats()
         assert stats['processing_active'] == 2
         assert stats['processing_concurrency'] == 2
-        assert stats['packing_fights'] == 1 and stats['browser_enriching_fights'] == 1
-        # Only the admitted browser restores a snapshot. Waiting rows stay on disk.
-        assert len(loaded) == 1
-        assert loaded[0] in browser_paths
+        assert stats['packing_fights'] == 1 and stats['browser_enriching_fights'] == 2
+        # Only admitted browser work restores snapshots. Waiting rows stay on disk.
+        assert len(loaded) == 2
+        assert set(loaded).issubset(browser_paths)
         enqueue(db, 5)
         assert await asyncio.wait_for(pipeline.drain_queue_batch(batch_size=1), 2) == 1
         assert db.get_fight('Report', 5)['status'] == 'API_STAGED'
