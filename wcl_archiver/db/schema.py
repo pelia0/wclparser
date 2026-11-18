@@ -124,6 +124,13 @@ class IndexDB:
                 conn.execute("ALTER TABLE fights ADD COLUMN staging_rel_path TEXT DEFAULT NULL")
             if "needs_browser" not in columns:
                 conn.execute("ALTER TABLE fights ADD COLUMN needs_browser INTEGER NOT NULL DEFAULT 0")
+            if "browser_cpu" not in columns:
+                conn.execute("ALTER TABLE fights ADD COLUMN browser_cpu INTEGER NOT NULL DEFAULT 0")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_staging_path ON fights(staging_rel_path)
+                WHERE staging_rel_path IS NOT NULL""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_browser_phase_dispatch
+                ON fights(browser_cpu, CASE WHEN content_type = 'mplus' THEN 0 ELSE 1 END)
+                WHERE status = 'API_STAGED'""")
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_fights_api_staged_dispatch
                 ON fights(CASE WHEN content_type = 'mplus' THEN 0 ELSE 1 END)
                 WHERE status = 'API_STAGED'""")
@@ -272,7 +279,8 @@ class IndexDB:
 
     def mark_fight_api_staged(self, report_code: str, fight_id: int, staging_rel_path: str) -> None:
         with self._connect() as conn:
-            conn.execute("""UPDATE fights SET status = 'API_STAGED', staging_rel_path = ?, needs_browser = 1, last_error = ''
+            conn.execute("""UPDATE fights SET status = 'API_STAGED', staging_rel_path = ?, needs_browser = 1,
+                browser_cpu = 0, last_error = ''
                 WHERE fight_uid = ? AND status != 'PACKED'""",
                 (staging_rel_path, self.make_fight_uid(report_code, fight_id)))
 
@@ -294,6 +302,33 @@ class IndexDB:
             scope = " AND report_code = ?" if report_code is not None else ""
             return int(conn.execute("SELECT COUNT(*) FROM fights WHERE status = 'API_STAGED'" + scope,
                                     (report_code,) if report_code is not None else ()).fetchone()[0])
+
+    def set_browser_queue(self, uid, path, *, cpu):
+        with self._connect() as conn:
+            conn.execute("""UPDATE fights SET browser_cpu = ? WHERE fight_uid = ?
+                AND staging_rel_path = ? AND status = 'API_STAGED'""", (int(cpu), uid, path))
+
+    def get_linked_stage(self, path):
+        with self._connect() as conn:
+            row = conn.execute("""SELECT fight_uid, status, browser_cpu FROM fights
+                WHERE staging_rel_path = ?""", (path,)).fetchone()
+            return dict(row) if row else None
+
+    def get_browser_dispatch(self, network_limit, cpu_limit):
+        with self._connect() as conn:
+            rows = []
+            for cpu, limit in ((0, network_limit), (1, cpu_limit)):
+                if limit:
+                    rows.extend(dict(row) for row in conn.execute("""SELECT * FROM fights
+                        WHERE status = 'API_STAGED' AND browser_cpu = ? AND failure_count < ?
+                        ORDER BY CASE WHEN content_type = 'mplus' THEN 0 ELSE 1 END, rowid ASC
+                        LIMIT ?""", (cpu, self.MAX_WORK_ATTEMPTS, limit)))
+            return rows
+
+    def count_browser_cpu_jobs(self):
+        with self._connect() as conn:
+            return conn.execute("""SELECT COUNT(*) FROM fights WHERE status = 'API_STAGED'
+                AND browser_cpu = 1 AND failure_count < ?""", (self.MAX_WORK_ATTEMPTS,)).fetchone()[0]
 
     def clear_fight_staging(self, report_code: str, fight_id: int, staging_rel_path: str) -> None:
         with self._connect() as conn:

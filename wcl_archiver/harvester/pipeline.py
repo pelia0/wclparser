@@ -20,6 +20,7 @@ from wcl_archiver.config import (
 from wcl_archiver.db.schema import IndexDB, MasterDictDB
 from wcl_archiver.parser.combat_state_machine import CombatStateMachine
 from wcl_archiver.wcl_client.protocol_parser import WCLProtocolClient
+from wcl_archiver.wcl_client.async_tasks import run_owned_thread
 
 
 def _analyze_and_pack_cpu(
@@ -147,6 +148,8 @@ class HarvesterPipeline:
         self._download_reported = 0
         self._browser_manager_task: Optional[asyncio.Task] = None
         self._browser_tasks: Dict[int, asyncio.Task] = {}
+        self._browser_cpu_tasks = {}
+        self._browser_cpu_active = set()
         self._browser_claims: set = set()
         self._browser_wakeup: Optional[asyncio.Event] = None
         self._browser_finish = False
@@ -165,10 +168,12 @@ class HarvesterPipeline:
                 'packing_fights': len(self._packing_active),
                 'downloading_fights': len(self._download_claims),
                 'browser_enriching_fights': len(self._browser_active),
+                'browser_network_limit': self.download_concurrency,
                 'preparing_reports': len(self._report_preparations)}
 
     def get_staging_stats(self) -> Dict[str, int]:
         return {**self.staging_store.stats(), **self.get_runtime_stats(),
+                'browser_disk_ready': max(0, self.index_db.count_browser_cpu_jobs() - len(self._browser_cpu_active)),
                 'api_staged_fights': self.index_db.count_api_staged_fights()}
 
     @asynccontextmanager
@@ -228,27 +233,29 @@ class HarvesterPipeline:
     def _recover_staging(self) -> List[str]:
         """Recover the file-before-catalogue crash window without network access."""
         messages = []
-        snapshots = []
-        for path in self.staging_store.list_jobs():
-            try:
-                job, archive = self.staging_store.load(path, include_events=False)
-                archive.clear()
-                snapshots.append((path, job['fight_row'], job['manifest']))
-                del job
-            except Exception as exc:
-                messages.append(f'Raw retained at {path.name}: {exc}')
-        # A full replacement must win the crash window before its database link,
-        # independent of hashed filename order. Keep only lightweight identities.
-        snapshots.sort(key=lambda item: not bool(item[2].get('hybrid')))
-        identities = {path.relative_to(self.data_dir.resolve()).as_posix(): manifest
-                      for path, _, manifest in snapshots}
-        for path, row, manifest in snapshots:
+        # Check already linked files without decoding all queued fights. Orphan
+        # replacements must be validated before an older pending file is linked.
+        paths = sorted(self.staging_store.list_jobs(), key=lambda path: not path.name.endswith('-hybrid.wcls'))
+        for path in paths:
+            if self._packing_stop:
+                break
             try:
                 if not path.exists():  # A verified replacement already cleaned it.
                     continue
+                rel = path.relative_to(self.data_dir.resolve()).as_posix()
+                linked_row = self.index_db.get_linked_stage(rel)
+                if linked_row and linked_row['status'] in ('STAGED', 'API_STAGED'):
+                    work = self.staging_store.browser_work(path)
+                    if linked_row['status'] == 'API_STAGED' and hasattr(self.client, 'download_supplement_phase'):
+                        cpu = work.phase() not in ('replay', 'canonical')
+                        if cpu != bool(linked_row['browser_cpu']):
+                            self.index_db.set_browser_queue(linked_row['fight_uid'], rel, cpu=cpu)
+                    continue
+                job, archive = self.staging_store.load(path, include_events=False)
+                archive.clear()
+                row, manifest = job['fight_row'], job['manifest']
                 code, fid = row['report_code'], int(row['fight_id'])
                 saved = self.index_db.get_fight(code, fid)
-                rel = path.relative_to(self.data_dir.resolve()).as_posix()
                 if saved is None:
                     self.index_db.enqueue_fight(code, fid, row['content_type'], row['zone_id'], row['partition'],
                         row['encounter_id'], row['encounter_slug'], keystone_level=row.get('keystone_level', 0),
@@ -263,29 +270,42 @@ class HarvesterPipeline:
                     if (packed != manifest and not self._hybrid_replaces(packed, manifest)
                             or sections['events']['count'] != packed['event_count']):
                         raise ValueError('Packed archive source fetch identity does not match durable raw')
-                    self.staging_store.delete(path)
+                    self._delete_replaced_snapshot(path, manifest)
                     self.index_db.clear_fight_staging(code, fid, rel)
                 elif saved.get('staging_rel_path') and saved['staging_rel_path'] != rel:
-                    linked = identities.get(saved['staging_rel_path'])
+                    other_job, other_archive = self.staging_store.load(
+                        self.data_dir / saved['staging_rel_path'], include_events=False)
+                    other_archive.clear()
+                    linked = other_job['manifest']
                     if self._hybrid_replaces(manifest, linked):
                         self.index_db.mark_fight_staged(code, fid, rel)
                         self.index_db.mark_report_unarchived(code)
                         try:
-                            self.staging_store.delete(self.data_dir / saved['staging_rel_path'])
+                            self._delete_replaced_snapshot(self.data_dir / saved['staging_rel_path'], linked)
                         except Exception as exc:
                             messages.append(f'API raw retained for {code}#{fid}: {exc}')
                     elif self._hybrid_replaces(linked, manifest):
-                        self.staging_store.delete(path)
+                        self._delete_replaced_snapshot(path, manifest)
                     else:
                         messages.append(f'Raw retained for {code}#{fid}: another source fetch is linked')
                 elif saved['status'] != 'FAILED' or not saved.get('staging_rel_path'):
                     marker = (self.index_db.mark_fight_api_staged if manifest.get('hybrid_pending') is True
                               else self.index_db.mark_fight_staged)
                     marker(code, fid, rel)
+                    if manifest.get('hybrid_pending') and hasattr(self.client, 'download_supplement_phase'):
+                        work = self._initialize_browser_work(path, manifest)
+                        self.index_db.set_browser_queue(row['fight_uid'], rel, cpu=work.phase() in ('plan', 'merge'))
                     self.index_db.mark_report_unarchived(code)
             except Exception as exc:
                 messages.append(f'Raw retained at {path.name}: {exc}')
         return messages
+
+    def _delete_replaced_snapshot(self, path, manifest):
+        if manifest.get('hybrid_pending'):
+            work = self.staging_store.browser_work(path)
+            if work.root.exists():
+                work.cleanup()
+        self.staging_store.delete(path)
 
     @staticmethod
     def _hybrid_replaces(full, pending) -> bool:
@@ -305,8 +325,10 @@ class HarvesterPipeline:
             return
         self._packing_stop = self._packing_finish = self._download_stop = False
         self._packing_wakeup = asyncio.Event()
-        for message in await asyncio.to_thread(self._recover_staging):
+        for message in await run_owned_thread(self._recover_staging):
             self._pack_log(message)
+        if self._packing_stop:
+            return
         self._background_pack_tasks = [asyncio.create_task(self._background_pack_worker())
                                        for _ in range(self.pack_workers)]
         self._start_browser_enrichment()
@@ -316,7 +338,9 @@ class HarvesterPipeline:
                 and self._browser_manager_task is None):
             self._browser_finish = self._browser_stop = False
             self._browser_wakeup = asyncio.Event()
-            self._browser_manager_task = asyncio.create_task(self._browser_manager())
+            manager = (self._browser_disk_manager if hasattr(self.client, 'download_supplement_phase')
+                       else self._browser_manager)
+            self._browser_manager_task = asyncio.create_task(manager())
 
     def _get_raw_executor(self):
         if self._raw_executor is None:
@@ -360,7 +384,7 @@ class HarvesterPipeline:
         _cancel_once(self._browser_manager_task)
         # The manager can itself be waiting on an owned DB read or publisher.
         # Cancel network children immediately instead of waiting for that work.
-        for task in self._browser_tasks.values():
+        for task in (*self._browser_tasks.values(), *self._browser_cpu_tasks.values()):
             _cancel_once(task)
         if self._browser_wakeup is not None:
             self._browser_wakeup.set()
@@ -458,6 +482,152 @@ class HarvesterPipeline:
         finally:
             if archive is not None:
                 archive.clear()
+
+    def _initialize_browser_work(self, path, manifest):
+        work = self.staging_store.browser_work(path)
+        work.initialize(*(manifest[key] for key in
+                          ('report_code', 'fight_id', 'start_time', 'end_time', 'fetch_id')))
+        return work
+
+    def _browser_disk_state(self, path):
+        work = self.staging_store.browser_work(path)
+        return work, work.phase()
+
+    async def _run_browser_phase(self, row, slot):
+        uid, code, fid = row['fight_uid'], row['report_code'], int(row['fight_id'])
+        key = row['staging_rel_path']
+        path = self.data_dir / key
+        phase = 'inspect'
+        activity = None
+        try:
+            work, phase = await run_owned_thread(self._browser_disk_state, path)
+            cpu = phase not in ('replay', 'canonical')
+            if cpu != bool(row['browser_cpu']):
+                # A crash or Stop can leave the catalogue one disk marker behind.
+                self.index_db.set_browser_queue(uid, key, cpu=cpu)
+                return
+            if phase in ('replay', 'canonical'):
+                activity = f'browser {phase} for {uid} (browser worker #{slot})'
+                self._browser_active.add(uid)
+                self._pack_log(f'Started {activity}')
+                await self.client.download_supplement_phase(work, phase)
+            else:
+                async with self._processing_admission(
+                        self._browser_cpu_active, uid, lambda: self._browser_stop) as admitted:
+                    if not admitted:
+                        return
+                    job, archive = await self._raw_io(
+                        self.staging_store.load, path, compression=self.raw_archive.compression,
+                        include_events=phase != 'initialize')
+                    try:
+                        manifest = job['manifest']
+                        if job['fight_row']['fight_uid'] != uid or not manifest.get('hybrid_pending'):
+                            raise ValueError('Browser work does not match pending API snapshot')
+                        parent = await self._raw_io(self.staging_store.browser_work, path)
+                        if parent.parent != work.parent:
+                            raise ValueError('Browser work parent checksum changed')
+                        if phase == 'initialize':
+                            await self._raw_io(self._initialize_browser_work, path, manifest)
+                        elif phase == 'plan':
+                            await self._raw_io(work.process, job, archive, merge=False)
+                        elif phase == 'merge':
+                            master = await self._raw_io(work.process, job, archive, merge=True)
+                            out, meta, actors, abilities, start, end = self._prepare_fight_payload(row, master)
+                            if (start, end) != (manifest['start_time'], manifest['end_time']):
+                                raise ValueError('Browser fight bounds changed')
+                            async def publish():
+                                merged = await self._raw_io(archive.fight_manifest, code, fid)
+                                if not self._hybrid_replaces(merged, manifest):
+                                    raise ValueError('Browser merged source parent mismatch')
+                                dest = await self._raw_io(self.staging_store.stage_fight,
+                                                          archive, row, meta, actors, abilities, out)
+                                self.index_db.mark_fight_staged(code, fid, dest.relative_to(self.data_dir.resolve()).as_posix())
+                                self._packing_wakeup.set()
+                                try:
+                                    await self._raw_io(work.cleanup)
+                                    await self._raw_io(self.staging_store.delete, path)
+                                except Exception as exc:
+                                    self._pack_log(f'Published {uid}; temporary sources retained: {exc}')
+                            publisher = asyncio.create_task(publish())
+                            try:
+                                await asyncio.shield(publisher)
+                            except asyncio.CancelledError:
+                                await _finish_cleanup(publisher)
+                                raise
+                        else:
+                            raise ValueError('Unknown browser staging phase')
+                    finally:
+                        job.pop('raw_events', None)
+                        archive.clear()
+            if phase != 'merge':
+                self.index_db.set_browser_queue(uid, key, cpu=phase in ('replay', 'canonical'))
+            if activity:
+                self._pack_log(f'Completed {activity}')
+        except asyncio.CancelledError:
+            if activity:
+                self._pack_log(f'Cancelled {activity}; source retained')
+            raise
+        except Exception as exc:
+            self.index_db.mark_fight_failed(code, fid, str(exc))
+            detail = activity or f'browser processing phase {phase} for {uid}'
+            self._pack_log(f'Failed {detail}; source retained: {exc}')
+        finally:
+            self._browser_active.discard(uid)
+            self._browser_claims.discard(uid)
+            self._browser_wakeup.set()
+
+    async def _browser_disk_manager(self):
+        network, cpu = self._browser_tasks, self._browser_cpu_tasks
+        try:
+            while not self._browser_stop:
+                self._browser_wakeup.clear()
+                for pool in (network, cpu):
+                    for slot, task in list(pool.items()):
+                        if task.done():
+                            del pool[slot]
+                            task.result()
+                # The partial dispatch index keeps each pool's M+/FIFO selection
+                # independent of the size of the other pool's on-disk backlog.
+                rows = await self._db_read(
+                    self.index_db.get_browser_dispatch,
+                    self.download_concurrency + len(self._browser_claims)
+                    if len(network) < self.download_concurrency else 0,
+                    self.processing_concurrency + len(self._browser_claims)
+                    if len(cpu) < self.processing_concurrency else 0)
+                if self._browser_stop:
+                    break
+                for row in rows:
+                    uid = row['fight_uid']
+                    if uid in self._browser_claims:
+                        continue
+                    if not row['browser_cpu']:
+                        pool, limit = network, self.download_concurrency
+                    else:
+                        pool, limit = cpu, self.processing_concurrency
+                    if len(pool) >= limit:
+                        continue
+                    fresh = self.index_db.get_fight(row['report_code'], int(row['fight_id']))
+                    if (not fresh or fresh['status'] != 'API_STAGED'
+                            or fresh['staging_rel_path'] != row['staging_rel_path']
+                            or fresh['browser_cpu'] != row['browser_cpu']):
+                        continue
+                    slot = next(i for i in range(1, limit+1) if i not in pool)
+                    self._browser_claims.add(uid)
+                    pool[slot] = asyncio.create_task(self._run_browser_phase(row, slot))
+                if self._browser_finish and not rows and not cpu and not network:
+                    return
+                try:
+                    await asyncio.wait_for(self._browser_wakeup.wait(), timeout=.25)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            tasks = [*network.values(), *cpu.values()]
+            for task in tasks:
+                _cancel_once(task)
+            await _finish_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+            network.clear()
+            cpu.clear()
+            self._browser_claims.clear()
 
     async def _browser_manager(self):
         try:
@@ -687,6 +857,8 @@ class HarvesterPipeline:
                 path = await asyncio.to_thread(self.staging_store.stage_fight,
                     self.raw_archive, row, meta, actors, abilities, out)
                 self._unlinked_staging[uid] = path
+                if manifest.get('hybrid_pending') and hasattr(self.client, 'download_supplement_phase'):
+                    await asyncio.to_thread(self._initialize_browser_work, path, manifest)
                 self._link_staging(path, row['report_code'], int(row['fight_id']), manifest)
                 self._unlinked_staging.pop(uid)
             task = asyncio.create_task(stage_and_link())

@@ -105,7 +105,7 @@ async def test_shared_budget_waiters_stop_without_loading_and_api_progresses(tmp
         # Establish the pack admission before exposing browser rows. Otherwise
         # two browser workers may legitimately take both slots first.
         assert pipeline.get_runtime_stats()['packing_fights'] == 1
-        assert loaded == [full]  # lean recovery only; pack load is blocked
+        assert loaded == []  # the linked snapshot only needs a header check at startup
         browser_paths = []
         for fid in (2, 3, 4):
             path = await stage_pending(db, pipeline, client, fid)
@@ -119,8 +119,8 @@ async def test_shared_budget_waiters_stop_without_loading_and_api_progresses(tmp
         assert stats['processing_concurrency'] == 2
         assert stats['packing_fights'] == 1 and stats['browser_enriching_fights'] == 1
         # Only the admitted browser restores a snapshot. Waiting rows stay on disk.
-        assert len(loaded) == 2
-        assert loaded[0] == full and loaded[1] in browser_paths
+        assert len(loaded) == 1
+        assert loaded[0] in browser_paths
         enqueue(db, 5)
         assert await asyncio.wait_for(pipeline.drain_queue_batch(batch_size=1), 2) == 1
         assert db.get_fight('Report', 5)['status'] == 'API_STAGED'

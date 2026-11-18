@@ -949,7 +949,11 @@ class BrowserClient:
     async def _request_json(self, method: str, path: str) -> tuple[int, Any]:
         return await self._run_in_browser_loop(self._request_json_impl(method, path))
 
-    async def _request_json_impl(self, method: str, path: str) -> tuple[int, Any]:
+    async def _request_json_impl(self, method: str, path: str, *, disk_work=None) -> tuple[int, Any]:
+        if disk_work is not None:
+            cached = await run_owned_thread(disk_work.response, path)
+            if cached is not None:
+                return 200, cached
         req_sem, _, _ = self._ensure_bg_sync()
         rel_path = path if path.startswith("/") else f"/{path}"
         full_url = path if path.startswith("http") else f"{self.BASE_URL}{rel_path}"
@@ -992,7 +996,7 @@ class BrowserClient:
                 text = str(exc)
 
             capture_id = None
-            if self.raw_archive is not None and status:
+            if disk_work is None and self.raw_archive is not None and status:
                 capture_id = self.raw_archive.capture(method,full_url,text.encode('utf-8'),status=status,
                                                       source='browser_fetch_text')
 
@@ -1017,6 +1021,15 @@ class BrowserClient:
                 continue
 
             if status == 200:
+                if disk_work is not None:
+                    def persist():
+                        raw = text.encode("utf-8")
+                        body = json.loads(raw, parse_float=Decimal)
+                        if not isinstance(body, dict) or body.get("errors"):
+                            raise ValueError("Invalid browser source response")
+                        disk_work.save_response(path, raw)
+                        return body
+                    return status, await run_owned_thread(persist)
                 try:
                     get_body = getattr(self.raw_archive, "get_capture_body", None)
                     if capture_id is not None and callable(get_body):
@@ -1130,6 +1143,54 @@ class BrowserClient:
                 raise asyncio.CancelledError()
             self.raw_archive.complete_fight(report_code,fight_id,fetch_id,start_time,end_time,len(events))
             return events
+
+    async def download_supplement_phase(self, work, phase):
+        await self._run_in_browser_loop(self._download_supplement_phase(work, phase))
+
+    async def _download_supplement_phase(self, work, phase):
+        async def request(path):
+            if self.should_stop and self.should_stop():
+                raise asyncio.CancelledError()
+            status, body = await self._request_json_impl("GET", path, disk_work=work)
+            if status != 200:
+                raise RuntimeError(f"Failed browser supplement download (HTTP {status})")
+            return body
+
+        if phase == "replay":
+            master_path = await run_owned_thread(lambda: work.master_path)
+            master = await request(master_path)
+            paths = await run_owned_thread(work.replay_paths, master)
+            del master
+            for path in paths:
+                body = await request(path)
+                if not isinstance(body.get("events"), list):
+                    raise ValueError("Incomplete browser replay response")
+                del body
+            await run_owned_thread(work.write, "replay", paths)
+        elif phase == "canonical":
+            code, fid, _, _, _ = await run_owned_thread(work.read, "descriptor")
+            windows = await run_owned_thread(work.read, "windows")
+            paths = []
+            for start, end in windows:
+                cursor = start
+                while True:
+                    path = (f"/reports/summary-events/{code}/{fid}/{cursor}/{end}"
+                            "/0/0/Any/0/-1.0.-1.-1/0")
+                    body = await request(path)
+                    batch = _validated_canonical_rows(body, cursor, end)
+                    next_page = body.get("nextPageTimestamp")
+                    if next_page is not None and (
+                            type(next_page) not in (int, Decimal) or next_page != int(next_page)
+                            or not cursor < next_page <= end or batch and next_page <= batch[-1]["timestamp"]):
+                        raise ValueError("Invalid browser canonical pagination cursor")
+                    paths.append(path)
+                    del body, batch
+                    if next_page is None:
+                        break
+                    cursor = int(next_page)
+            await run_owned_thread(work.write, "canonical", paths)
+        else:
+            raise ValueError("Invalid browser network phase")
 
     async def fetch_fight_supplement(
         self, report_code: str, fight_id: int, start_time: int, end_time: int,

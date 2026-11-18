@@ -157,6 +157,16 @@ class StagingStore:
         except (KeyError, TypeError, IndexError, AttributeError) as exc:
             raise ValueError("Invalid staging snapshot structure") from exc
 
+    def browser_work(self, path):
+        from .browser_staging import BrowserWork
+        path = self._path(path)
+        with path.open("rb") as stream:
+            header = stream.read(_HEADER_SIZE)
+            if (len(header) != _HEADER_SIZE or not header.startswith(MAGIC)
+                    or struct.unpack("<Q", header[len(MAGIC):-32])[0] != os.fstat(stream.fileno()).st_size - _HEADER_SIZE):
+                raise ValueError("Invalid browser staging parent header")
+        return BrowserWork(self.data_dir, path.name, header[-32:].hex())
+
     def _read(self, path, *, check_filename=True):
         try:
             _plain_path(path)
@@ -254,7 +264,23 @@ class StagingStore:
                 # A verified packer may remove a snapshot after the directory
                 # listing. That normal race must not break the status endpoint.
                 continue
-        return {"staging_files": len(sizes), "staging_bytes": sum(sizes)}
+        spool = self.data_dir / "browser-staging"
+        _plain_path(spool)
+        files, total_bytes = len(sizes), sum(sizes)
+        if spool.exists():
+            for directory in spool.iterdir():
+                _plain_path(directory)
+                try:
+                    for part in directory.iterdir():
+                        _plain_path(part)
+                        try:
+                            total_bytes += part.stat().st_size
+                            files += 1
+                        except FileNotFoundError:
+                            continue
+                except FileNotFoundError:
+                    continue
+        return {"staging_files": files, "staging_bytes": total_bytes}
 
     def delete(self, path):
         path = self._path(path)

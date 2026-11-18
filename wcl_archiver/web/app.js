@@ -387,9 +387,11 @@ function renderHarvesterState(st) {
   const workerSummary = document.getElementById("download-worker-summary");
   if (workerSummary && downloadSettingsSupported) {
     const processing = Number.isInteger(st.processing_concurrency)
-      ? `${st.processing_concurrency} shared processing slots (browser + packing)`
+      ? `${st.processing_concurrency} shared processing slots (planning, merge, packing)`
       : "Processing cap unavailable on this server";
-    workerSummary.textContent = `${st.download_concurrency} ${st.hybrid_strict ? 'API workers' : 'downloads'} · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers · ${processing}`;
+    const browserSlots = st.hybrid_strict && Number.isInteger(st.browser_network_limit)
+      ? ` · ${st.browser_network_limit} browser download slots` : "";
+    workerSummary.textContent = `${st.download_concurrency} ${st.hybrid_strict ? 'API workers' : 'downloads'}${browserSlots} · ${st.browser_request_concurrency} browser request limit · ${st.pack_workers} pack workers · ${processing}`;
   }
   const processing = document.getElementById("stat-processing");
   if (processing) processing.textContent = Number.isInteger(st.processing_concurrency)
@@ -425,7 +427,7 @@ function renderHarvesterState(st) {
       : "";
   }
   const browserEnrichment = document.getElementById("stat-browser-enrichment");
-  if (browserEnrichment) browserEnrichment.textContent = `${st.browser_enriching_fights || 0} active / ${st.api_staged_fights || 0} queued`;
+  if (browserEnrichment) browserEnrichment.textContent = `${st.browser_enriching_fights || 0} downloading / ${st.browser_network_limit ?? '—'} slots · ${st.browser_disk_ready || 0} ready for processing · ${st.api_staged_fights || 0} API staged`;
   const downloading = document.getElementById("stat-downloading");
   if (downloading) downloading.textContent = Number.isInteger(st.downloading_fights)
     ? `${st.downloading_fights} / ${st.download_concurrency || 4} workers`

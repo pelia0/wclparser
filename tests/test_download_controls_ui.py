@@ -95,10 +95,10 @@ def test_resource_and_retry_labels_and_old_server_fallback():
     from test_stop_controls_ui import run_ui
     run_ui(r'''
 render({...state,hybrid_strict:true,processing_concurrency:2,processing_active:1,
- processing_waiting:11,packing_fights:1,rankings_source:'hybrid',
+ processing_waiting:11,packing_fights:1,rankings_source:'hybrid',browser_network_limit:32,
  api_quota_wait_seconds:50,api_retry_wait_seconds:3});
 assert(fields['download-worker-summary'].textContent.includes('2 shared processing slots'));
-assert(!fields['download-worker-summary'].textContent.includes('32 browser workers'));
+assert(fields['download-worker-summary'].textContent.includes('32 browser download slots'));
 assert.equal(fields['stat-processing'].textContent,'1 / 2 active · 11 waiting');
 assert(fields['api-quota-wait'].textContent.includes('quota'));
 assert(fields['api-retry-wait'].textContent.includes('server/network'));

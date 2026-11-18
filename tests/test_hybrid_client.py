@@ -397,7 +397,8 @@ async def test_enrichment_rejects_global_api_archive_without_discarding_it():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('retry_browser', [False, True])
-async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_path, retry_browser):
+@pytest.mark.parametrize('disk', [False, True])
+async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_path, retry_browser, disk):
     class UserAuth:
         def get_headers_and_cookies(self):
             return {}, {}
@@ -472,7 +473,23 @@ async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_
         original_hash = hashlib.sha256(pending.read_bytes()).hexdigest()
         assert primary.stats()['buffered_complete_fights'] == 0
         job, restored = store.load(pending)
-        if retry_browser:
+        if disk:
+            work = store.browser_work(pending)
+            work.initialize('Report1234', 1, 0, 10, job['fetch_id'])
+            del job, restored
+            await client.download_supplement_phase(work, 'replay')
+            job, restored = store.load(pending)
+            work.process(job, restored, merge=False)
+            del job, restored
+            if retry_browser:
+                with pytest.raises(RuntimeError, match='browser'):
+                    await client.download_supplement_phase(work, 'canonical')
+                assert store.browser_work(pending).phase() == 'canonical'
+            await client.download_supplement_phase(work, 'canonical')
+            assert secondary._captures == {}
+            job, restored = store.load(pending)
+            browser_metadata = work.process(job, restored, merge=True)
+        elif retry_browser:
             with pytest.raises(RuntimeError, match='browser'):
                 await client.enrich_staged_fight(job, restored)
             assert hashlib.sha256(pending.read_bytes()).hexdigest() == original_hash
@@ -483,7 +500,8 @@ async def test_real_providers_preserve_independent_complete_decimal_sources(tmp_
             # released. Compare final responses against that retained source.
             captured_browser[:] = [browser_master.decode()]
             job, restored = store.load(pending)
-        browser_metadata = await client.enrich_staged_fight(job, restored)
+        if not disk:
+            browser_metadata = await client.enrich_staged_fight(job, restored)
         assert browser_metadata['browserUnknown']['precision'] == Decimal('1.0000000000000000001')
         events = restored.full_fight_events('Report1234', 1)
         assert events == [

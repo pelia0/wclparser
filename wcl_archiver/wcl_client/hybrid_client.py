@@ -98,6 +98,9 @@ class HybridClient:
             self.raw_archive.discard_fight(report_code, fight_id)
             raise
 
+    async def download_supplement_phase(self, work, phase):
+        await self._source_call('browser', self.browser_client, 'download_supplement_phase', work, phase)
+
     async def enrich_staged_fight(self, job, restored_api_archive) -> Dict[str, Any]:
         """Enrich a private restored capture, preserving its durable API original."""
         if restored_api_archive is self.raw_archive or restored_api_archive is self.browser_archive:
